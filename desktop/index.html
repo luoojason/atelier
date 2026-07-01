@@ -127,6 +127,11 @@
         <span id="status-text">connecting…</span>
       </div>
     </div>
-    <script src="renderer.js"></script>
+    <!-- Atelier core first (creates window.Atelier), then feature modules. -->
+    <script defer src="app/core.js"></script>
+    <script defer src="app/widgets.js"></script>
+    <script defer src="app/apps.js"></script>
+    <script defer src="app/palette.js"></script>
+    <script defer src="app/customization.js"></script>
   </body>
 </html>
