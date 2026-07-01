@@ -7,7 +7,7 @@ from agency_swarm.tools import (
     IPythonInterpreter,
     LoadFileAttachment,
 )
-from shared_tools import CopyFile, ExecuteTool, FindTools, ManageConnections, SearchTools
+from shared_tools import CopyFile, ExecuteTool, FindTools, ManageConnections, SearchTools, VaultSearch, VaultRead, VaultWrite, RecallMemory, RememberFact
 
 from config import get_default_model, is_openai_provider
 
@@ -32,6 +32,11 @@ def create_data_analyst() -> Agent:
             FindTools,
             ManageConnections,
             SearchTools,
+            VaultSearch,
+            VaultRead,
+            VaultWrite,
+            RecallMemory,
+            RememberFact,
         ],
         model_settings=ModelSettings(
             reasoning=Reasoning(effort="medium", summary="auto") if is_openai_provider() else None,

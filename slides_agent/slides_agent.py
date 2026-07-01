@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from openai.types.shared import Reasoning
 from pathlib import Path
 from virtual_assistant.tools.ReadFile import ReadFile
-from shared_tools import CopyFile
+from shared_tools import CopyFile, VaultSearch, VaultRead, VaultWrite, RecallMemory, RememberFact
 
 from config import get_default_model, is_openai_provider
 
@@ -56,6 +56,11 @@ def create_slides_agent() -> Agent:
         description="PowerPoint presentation specialist for creating, editing, and analyzing .pptx files",
         instructions=_build_instructions(),
         tools=[
+            VaultSearch,
+            VaultRead,
+            VaultWrite,
+            RecallMemory,
+            RememberFact,
             # Slide creation and management: InsertNewSlides then ModifySlide
             InsertNewSlides,
             ModifySlide,

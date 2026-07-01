@@ -12,6 +12,7 @@ Anything under `Sources/` is immutable and must never be written to.
 from __future__ import annotations
 
 import os
+import re
 from datetime import date
 from pathlib import Path
 
@@ -229,12 +230,151 @@ def resolve_write_dir(root: Path, folder: str) -> Path:
     return target
 
 
-def write_note(folder: str, title: str, body: str, tags=None) -> str:
+# ── Convention-honoring catalog writeback (log.md + index.md) ────────────────
+# The vault's own CLAUDE.md rule: after creating a page, append to log.md and
+# update index.md so notes are never orphaned. These are PURE helpers (stdlib
+# only) so they unit-test without agency_swarm / pydantic.
+
+_WIKILINK_TARGET_RE = re.compile(r"\[\[([^\[\]|\\]+)")
+_HEADER_RE = re.compile(r"^\s*#{1,6}\s+(\S.*?)\s*$")
+
+
+def append_log(vault_root, line: str, date: str) -> str:
+    """Append one ``- {date} — {line}`` bullet to the vault's log.md.
+
+    Creates log.md when missing and guarantees the file ends with a trailing
+    newline so the next append lands on its own line. Returns the log path.
+    """
+    log_path = Path(vault_root) / "log.md"
+    existing = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    log_path.write_text(f"{existing}- {date} — {line}\n", encoding="utf-8")
+    return str(log_path)
+
+
+def _row_wikilink_target(line: str):
+    """Return the wikilink target (`[[target|name]]` -> `target`) in a row, or None."""
+    m = _WIKILINK_TARGET_RE.search(line)
+    return m.group(1).strip() if m else None
+
+
+def upsert_index_row(index_text: str, section: str, wikilink: str,
+                     name: str, summary: str) -> str:
+    """Idempotently insert/update a ``| [[wikilink\\|name]] | summary |`` index row.
+
+    The row is keyed by ``wikilink`` (the note's path/target). If a row for that
+    wikilink already exists under the ``## {section}`` table its summary is
+    replaced in place (running twice makes no duplicate); otherwise the row is
+    appended to that section's table, creating the header + table when the
+    section is absent. All other rows and surrounding formatting are preserved.
+    Returns the new index text and performs no file IO.
+    """
+    wikilink = (wikilink or "").strip()
+    name = (name or "").strip() or wikilink
+    summary = " ".join((summary or "").split())
+    new_row = f"| [[{wikilink}\\|{name}]] | {summary} |"
+
+    lines = index_text.split("\n")
+
+    # Locate the section header (any heading level whose text == section).
+    section_idx = None
+    for i, line in enumerate(lines):
+        m = _HEADER_RE.match(line)
+        if m and m.group(1).strip() == section:
+            section_idx = i
+            break
+
+    if section_idx is not None:
+        # Bound the section: up to the next heading (any level) or end of file.
+        end = len(lines)
+        for j in range(section_idx + 1, len(lines)):
+            if _HEADER_RE.match(lines[j]):
+                end = j
+                break
+
+        # 1) Replace an existing row for this wikilink (dedupe-safe update).
+        for j in range(section_idx + 1, end):
+            row = lines[j]
+            if row.lstrip().startswith("|") and _row_wikilink_target(row) == wikilink:
+                lines[j] = new_row
+                return "\n".join(lines)
+
+        # 2) Append after the last existing table row in the section.
+        last_row = None
+        for j in range(section_idx + 1, end):
+            if lines[j].lstrip().startswith("|"):
+                last_row = j
+        if last_row is not None:
+            lines.insert(last_row + 1, new_row)
+            return "\n".join(lines)
+
+        # 3) Section exists but has no table — insert one before the next header.
+        table = ["| Page | Summary |", "|------|---------|", new_row]
+        block = table if (end > 0 and lines[end - 1].strip() == "") else [""] + table
+        lines[end:end] = block
+        return "\n".join(lines)
+
+    # 4) Section absent — append a new section + table at the end of the file.
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    block = []
+    if lines:
+        block.append("")
+    block += [f"## {section}", "", "| Page | Summary |", "|------|---------|", new_row]
+    lines.extend(block)
+    return "\n".join(lines) + "\n"
+
+
+def _first_line(text: str) -> str:
+    """First non-empty, non-heading line of a body (used as a default summary)."""
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if s and not s.startswith("#"):
+            return s
+    return ""
+
+
+def _catalog_note(root: Path, folder: str, title: str, *, section=None,
+                  name=None, summary=None, when=None) -> None:
+    """Honor the vault convention: upsert an index.md row + append a log.md line.
+
+    Section defaults to the note's folder; the display name defaults to the
+    title; the summary defaults to the note's first body line (else the title).
+    Best-effort: a filesystem hiccup on the catalog files must not fail the note
+    write itself.
+    """
+    when = when or date.today().isoformat()
+    section = (section or folder).strip("/") or folder
+    display = name or title
+    wikilink = f"{folder}/{title}"
+    summary = summary or display
+    try:
+        index_path = root / "index.md"
+        index_text = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+        index_path.write_text(
+            upsert_index_row(index_text, section, wikilink, display, summary),
+            encoding="utf-8",
+        )
+        # log bullets are prose, not table cells, so the wikilink pipe is bare.
+        append_log(root, f"Created note [[{wikilink}|{display}]]", when)
+    except OSError:
+        pass
+
+
+def write_note(folder: str, title: str, body: str, tags=None, *,
+               catalog: bool = True, section=None, name=None, summary=None) -> str:
     """Write a note with proper frontmatter into a vault subfolder.
 
     Returns the absolute path of the written file. Refuses to write anywhere
     under Sources/ (immutable) or outside the vault. Creates the target folder
     if needed.
+
+    When ``catalog`` is True (default) the vault convention is honored after the
+    write: a dated bullet is appended to log.md and a table row is upserted into
+    index.md (section defaults to ``folder``, the row name to ``title``, and the
+    summary to the note's first body line). Pass ``catalog=False`` for ephemeral
+    or memory-style writes that should not be catalogued.
     """
     folder = (folder or "Analysis").strip().strip("/")
     root = vault_root()
@@ -242,7 +382,12 @@ def write_note(folder: str, title: str, body: str, tags=None) -> str:
 
     target_dir.mkdir(parents=True, exist_ok=True)
     path = target_dir / _safe_filename(title)
-    frontmatter = _format_frontmatter(title, tags, date.today().isoformat())
+    today = date.today().isoformat()
+    frontmatter = _format_frontmatter(title, tags, today)
     content = f"{frontmatter}\n{body.rstrip()}\n" if body else f"{frontmatter}\n"
     path.write_text(content, encoding="utf-8")
+
+    if catalog:
+        _catalog_note(root, folder, title, section=section, name=name,
+                      summary=summary or _first_line(body), when=today)
     return str(path)

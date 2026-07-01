@@ -8,5 +8,7 @@ from shared_tools.VaultRead import VaultRead
 from shared_tools.VaultWrite import VaultWrite
 from shared_tools.RememberFact import RememberFact
 from shared_tools.RecallMemory import RecallMemory
+from shared_tools.CaptureBrief import CaptureBrief
+from shared_tools.ReadBrief import ReadBrief
 
-__all__ = ["CopyFile", "ExecuteTool", "FindTools", "ManageConnections", "SearchTools", "VaultSearch", "VaultRead", "VaultWrite", "RememberFact", "RecallMemory"]
+__all__ = ["CopyFile", "ExecuteTool", "FindTools", "ManageConnections", "SearchTools", "VaultSearch", "VaultRead", "VaultWrite", "RememberFact", "RecallMemory", "CaptureBrief", "ReadBrief"]

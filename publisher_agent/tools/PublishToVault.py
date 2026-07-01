@@ -73,7 +73,139 @@ def build_note(title, body, tags=None, updated=None):
     return f"{frontmatter}\n{body.rstrip()}\n"
 
 
-def publish_to_vault(title, body, folder="Analysis", tags=None, vault_root=None, updated=None):
+# ── Convention-honoring catalog writeback (log.md + index.md) ────────────────
+# The vault's own CLAUDE.md rule: after creating a page, append to log.md and
+# update index.md so notes are never orphaned. These mirror the pure helpers in
+# shared_tools/vault_core.py; they are duplicated (not imported) so this file
+# stays self-contained and importable under a bare system python3 for tests.
+
+_WIKILINK_TARGET_RE = re.compile(r"\[\[([^\[\]|\\]+)")
+_HEADER_RE = re.compile(r"^\s*#{1,6}\s+(\S.*?)\s*$")
+
+
+def append_log(vault_root, line, date):
+    """Append one ``- {date} — {line}`` bullet to the vault's log.md.
+
+    Creates log.md when missing and guarantees a trailing newline so the next
+    append lands on its own line. Returns the log path.
+    """
+    log_path = Path(vault_root) / "log.md"
+    existing = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    log_path.write_text(f"{existing}- {date} — {line}\n", encoding="utf-8")
+    return str(log_path)
+
+
+def _row_wikilink_target(line):
+    """Return the wikilink target (`[[target|name]]` -> `target`) in a row, or None."""
+    m = _WIKILINK_TARGET_RE.search(line)
+    return m.group(1).strip() if m else None
+
+
+def _escape_table_cell(value):
+    """Collapse whitespace and escape ``|`` so a value is safe in a Markdown table cell.
+
+    A raw pipe inside a table cell starts a new column, so a summary such as
+    ``'multi space | pipe'`` (realistic: the summary is the note's first body
+    line) would otherwise inject a spurious column and corrupt the two-column
+    index row. GFM / Obsidian render ``\\|`` as a literal pipe, so every pipe is
+    escaped to keep the cell — and the row's column count — intact. This mirrors
+    the rigor of ``_yaml_scalar`` on the frontmatter path, where the same class
+    of format-breaking character is escaped rather than passed through raw.
+    """
+    return " ".join((value or "").split()).replace("|", "\\|")
+
+
+def upsert_index_row(index_text, section, wikilink, name, summary):
+    """Idempotently insert/update a ``| [[wikilink\\|name]] | summary |`` index row.
+
+    Keyed by ``wikilink``: an existing row for that wikilink under ``## {section}``
+    has its summary replaced in place (running twice makes no duplicate);
+    otherwise the row is appended to that section's table, creating the header +
+    table when the section is absent. Other rows and formatting are preserved.
+    Returns the new index text and does no file IO.
+    """
+    wikilink = (wikilink or "").strip()
+    name = (name or "").strip() or wikilink
+    summary = _escape_table_cell(summary)
+    new_row = f"| [[{wikilink}\\|{name}]] | {summary} |"
+
+    lines = index_text.split("\n")
+
+    section_idx = None
+    for i, line in enumerate(lines):
+        m = _HEADER_RE.match(line)
+        if m and m.group(1).strip() == section:
+            section_idx = i
+            break
+
+    if section_idx is not None:
+        end = len(lines)
+        for j in range(section_idx + 1, len(lines)):
+            if _HEADER_RE.match(lines[j]):
+                end = j
+                break
+
+        for j in range(section_idx + 1, end):
+            row = lines[j]
+            if row.lstrip().startswith("|") and _row_wikilink_target(row) == wikilink:
+                lines[j] = new_row
+                return "\n".join(lines)
+
+        last_row = None
+        for j in range(section_idx + 1, end):
+            if lines[j].lstrip().startswith("|"):
+                last_row = j
+        if last_row is not None:
+            lines.insert(last_row + 1, new_row)
+            return "\n".join(lines)
+
+        table = ["| Page | Summary |", "|------|---------|", new_row]
+        block = table if (end > 0 and lines[end - 1].strip() == "") else [""] + table
+        lines[end:end] = block
+        return "\n".join(lines)
+
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    block = []
+    if lines:
+        block.append("")
+    block += [f"## {section}", "", "| Page | Summary |", "|------|---------|", new_row]
+    lines.extend(block)
+    return "\n".join(lines) + "\n"
+
+
+def _first_line(text):
+    """First non-empty, non-heading line of a body (used as a default summary)."""
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if s and not s.startswith("#"):
+            return s
+    return ""
+
+
+def _catalog_note(root, folder, title, section=None, name=None, summary=None, when=None):
+    """Upsert an index.md row + append a log.md line; best-effort (never fatal)."""
+    when = when or date.today().isoformat()
+    section = (section or folder).strip("/") or folder
+    display = name or title
+    wikilink = f"{folder}/{title}"
+    summary = summary or display
+    try:
+        index_path = root / "index.md"
+        index_text = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+        index_path.write_text(
+            upsert_index_row(index_text, section, wikilink, display, summary),
+            encoding="utf-8",
+        )
+        append_log(root, f"Created note [[{wikilink}|{display}]]", when)
+    except OSError:
+        pass
+
+
+def publish_to_vault(title, body, folder="Analysis", tags=None, vault_root=None,
+                     updated=None, catalog=True, section=None, name=None, summary=None):
     """Write a note into the Obsidian vault and return the absolute path written.
 
     Args:
@@ -83,6 +215,11 @@ def publish_to_vault(title, body, folder="Analysis", tags=None, vault_root=None,
         tags: list of tag strings.
         vault_root: override the vault root (defaults to env OBSIDIAN_VAULT).
         updated: ISO date string for ``last_updated`` (defaults to today).
+        catalog: when True (default) honor the vault convention after the write —
+            append a dated bullet to log.md and upsert a row into index.md
+            (section defaults to ``folder``, row name to ``title``, summary to the
+            first body line). Pass False for ephemeral writes.
+        section / name / summary: overrides for the catalog row.
 
     Raises ValueError when writing would escape the vault or target the
     immutable ``Sources/`` tree.
@@ -115,6 +252,10 @@ def publish_to_vault(title, body, folder="Analysis", tags=None, vault_root=None,
     filename = slugify_filename(title) + ".md"
     path = target_dir / filename
     path.write_text(build_note(title, body, tags, updated), encoding="utf-8")
+
+    if catalog:
+        _catalog_note(root, folder, title, section=section, name=name,
+                      summary=summary or _first_line(body), when=updated)
     return str(path)
 
 
@@ -150,6 +291,14 @@ try:
             default_factory=list,
             description="List of tag strings for the note's YAML frontmatter.",
         )
+        catalog: bool = Field(
+            True,
+            description=(
+                "When true (default) honor the vault convention: append a dated "
+                "bullet to log.md and upsert a row into index.md so the note is "
+                "catalogued, not orphaned. Set false for ephemeral writes."
+            ),
+        )
 
         def run(self) -> str:
             try:
@@ -158,6 +307,7 @@ try:
                     body=self.body,
                     folder=self.folder,
                     tags=self.tags,
+                    catalog=self.catalog,
                 )
             except ValueError as exc:
                 return f"Error: {exc}"

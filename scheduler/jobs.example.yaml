@@ -23,3 +23,29 @@
 - name: hourly-inbox-sweep
   schedule: "30m"                # interval: every 30 minutes
   prompt: "Check for anything new that needs attention and triage what is urgent."
+
+# --- Overnight run digest (commented example) -------------------------------
+# Files a dated summary of the last window's scheduled runs into the Obsidian
+# vault (counts, cost, slowest runs, failures), cataloged into index.md/log.md.
+#
+# The digest is produced by scheduler/digest.py:run_digest over the JSONL run
+# ledger (SWARM_RUNS_JSONL, default ~/.openswarm/runs.jsonl) that every job
+# writes to via scheduler/run_store.py — it is a LOCAL vault write, not an HTTP
+# prompt. Two ways to schedule it:
+#
+#   1. As an agent prompt (matches the job schema below): have an agent whose
+#      instructions call run_digest read the ledger and file the note.
+#
+# - name: overnight-run-digest
+#   schedule: "0 7 * * *"        # cron: every day at 07:00 local time
+#   prompt: "Summarize the last 24h of scheduled runs (counts, cost, slowest, failures) and file the digest note into the vault."
+#   agent: orchestrator
+#
+#   2. Directly, without an agent, from a controller/cron hook:
+#
+#      from scheduler.run_store import read_records
+#      from scheduler.digest import run_digest
+#      from datetime import date, datetime, timedelta
+#      records = read_records(None)          # None -> SWARM_RUNS_JSONL ledger
+#      since = (datetime.now() - timedelta(days=1)).isoformat()
+#      run_digest(vault_root, records, date.today().isoformat(), since_ts=since)

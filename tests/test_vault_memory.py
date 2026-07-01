@@ -32,6 +32,28 @@ read_note = _vault.read_note
 search_vault = _vault.search_vault
 write_note = _vault.write_note
 vault_root = _vault.vault_root
+append_log = _vault.append_log
+upsert_index_row = _vault.upsert_index_row
+
+# Fixtures that mirror the real vault's log.md / index.md formats.
+_FIXTURE_LOG = (
+    "---\ntitle: Log\ntags: [meta, log]\nlast_updated: \"2026-07-01\"\n---\n\n"
+    "# Wiki Log\n\n"
+    "- 2026-06-30 — Seeded an earlier operation.\n"
+)
+_FIXTURE_INDEX = (
+    "---\ntitle: Index\ntags: [meta, index]\nlast_updated: \"2026-07-01\"\n---\n\n"
+    "# Wiki Index\n\n"
+    "## Projects\n\n"
+    "| Page | Summary |\n"
+    "|------|---------|\n"
+    "| [[Projects/Alpha\\|Alpha]] | First project |\n"
+    "| [[Projects/Beta\\|Beta]] | Second project |\n\n"
+    "## Analysis\n\n"
+    "| Page | Summary |\n"
+    "|------|---------|\n"
+    "| [[Analysis/Existing\\|Existing]] | An existing analysis |\n"
+)
 
 memory_path = _memory.memory_path
 recall = _memory.recall
@@ -249,6 +271,127 @@ def test_memory_autocreates_and_roundtrips():
     print("ok test_memory_autocreates_and_roundtrips")
 
 
+def test_append_log_creates_and_appends():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        # 1) missing log.md is created with the dated bullet.
+        append_log(root, "First operation happened.", "2026-07-01")
+        log = (root / "log.md").read_text(encoding="utf-8")
+        assert log == "- 2026-07-01 — First operation happened.\n", repr(log)
+
+        # 2) a second append adds another bullet, preserving the first.
+        append_log(root, "Second operation.", "2026-07-02")
+        log = (root / "log.md").read_text(encoding="utf-8")
+        assert log == (
+            "- 2026-07-01 — First operation happened.\n"
+            "- 2026-07-02 — Second operation.\n"
+        ), repr(log)
+
+        # 3) appending to a fixture that lacks a trailing newline still lands the
+        #    new bullet on its own line (no gluing).
+        (root / "log.md").write_text("# Wiki Log\n\n- 2026-06-30 — seed", encoding="utf-8")
+        append_log(root, "New line.", "2026-07-03")
+        log = (root / "log.md").read_text(encoding="utf-8")
+        assert log.endswith(
+            "- 2026-06-30 — seed\n- 2026-07-03 — New line.\n"
+        ), repr(log)
+    print("ok test_append_log_creates_and_appends")
+
+
+def test_upsert_index_row_add_update_dedupe():
+    # New row appended to an existing section, other rows preserved.
+    text = upsert_index_row(_FIXTURE_INDEX, "Projects", "Projects/Gamma", "Gamma", "A new project")
+    assert "| [[Projects/Gamma\\|Gamma]] | A new project |" in text
+    # existing rows untouched
+    assert "| [[Projects/Alpha\\|Alpha]] | First project |" in text
+    assert "| [[Projects/Beta\\|Beta]] | Second project |" in text
+    assert "| [[Analysis/Existing\\|Existing]] | An existing analysis |" in text
+    # the new row is under the Projects table (before the Analysis header)
+    assert text.index("Projects/Gamma") < text.index("## Analysis")
+
+    # Re-running with the SAME wikilink updates in place (no duplicate row).
+    text2 = upsert_index_row(text, "Projects", "Projects/Gamma", "Gamma", "Updated summary")
+    assert text2.count("[[Projects/Gamma\\|") == 1, "wikilink row must not duplicate"
+    assert "Updated summary" in text2
+    assert "A new project" not in text2
+    # other rows still preserved through the update
+    assert "| [[Projects/Alpha\\|Alpha]] | First project |" in text2
+    assert "| [[Projects/Beta\\|Beta]] | Second project |" in text2
+
+    # Idempotent: identical inputs twice = byte-for-byte stable, no dup.
+    text3 = upsert_index_row(text2, "Projects", "Projects/Gamma", "Gamma", "Updated summary")
+    assert text3 == text2, "re-running with identical data must be a no-op"
+
+    # A brand-new section is created with its own table when absent.
+    text4 = upsert_index_row(_FIXTURE_INDEX, "Concepts", "Concepts/New Idea", "New Idea", "A concept")
+    assert "## Concepts" in text4
+    assert "| Page | Summary |" in text4.split("## Concepts", 1)[1]
+    assert "| [[Concepts/New Idea\\|New Idea]] | A concept |" in text4
+    # original sections still present
+    assert "## Projects" in text4 and "## Analysis" in text4
+    print("ok test_upsert_index_row_add_update_dedupe")
+
+
+def test_write_note_catalog_true_appends_log_and_index_row():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["OBSIDIAN_VAULT"] = tmp
+        root = Path(tmp)
+        (root / "index.md").write_text(_FIXTURE_INDEX, encoding="utf-8")
+        (root / "log.md").write_text(_FIXTURE_LOG, encoding="utf-8")
+
+        write_note(
+            folder="Projects",
+            title="Catalogued Note",
+            body="This is the summary line.\nMore detail follows.",
+            tags=["x"],
+            catalog=True,
+        )
+
+        # index.md gained a row for the new note, under Projects, dedupe-keyed.
+        index = (root / "index.md").read_text(encoding="utf-8")
+        assert "[[Projects/Catalogued Note\\|Catalogued Note]]" in index
+        assert "This is the summary line." in index
+        assert index.index("Catalogued Note") < index.index("## Analysis")
+        # fixture rows preserved
+        assert "| [[Projects/Alpha\\|Alpha]] | First project |" in index
+
+        # log.md gained a dated bullet referencing the note (fixture seed kept).
+        log = (root / "log.md").read_text(encoding="utf-8")
+        assert "- 2026-06-30 — Seeded an earlier operation." in log
+        assert "[[Projects/Catalogued Note|Catalogued Note]]" in log
+        # newest bullet is last and the file ends with a newline.
+        assert log.rstrip("\n").splitlines()[-1].startswith("- ")
+        assert log.endswith("\n")
+
+        # Re-writing the same note does NOT duplicate the index row.
+        write_note("Projects", "Catalogued Note", "Changed body.", catalog=True)
+        index2 = (root / "index.md").read_text(encoding="utf-8")
+        assert index2.count("[[Projects/Catalogued Note\\|") == 1
+    print("ok test_write_note_catalog_true_appends_log_and_index_row")
+
+
+def test_write_note_catalog_false_skips_catalog():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["OBSIDIAN_VAULT"] = tmp
+        root = Path(tmp)
+        (root / "index.md").write_text(_FIXTURE_INDEX, encoding="utf-8")
+        (root / "log.md").write_text(_FIXTURE_LOG, encoding="utf-8")
+
+        path = write_note(
+            folder="Analysis",
+            title="Ephemeral Note",
+            body="scratch",
+            catalog=False,
+        )
+        assert Path(path).is_file(), "the note itself is still written"
+
+        # neither catalog file was touched.
+        assert (root / "index.md").read_text(encoding="utf-8") == _FIXTURE_INDEX
+        assert (root / "log.md").read_text(encoding="utf-8") == _FIXTURE_LOG
+    print("ok test_write_note_catalog_false_skips_catalog")
+
+
 def _run():
     tests = [
         test_write_then_read_roundtrip_and_frontmatter,
@@ -260,6 +403,10 @@ def _run():
         test_search_finds_note_and_skips_sources,
         test_search_no_match_returns_empty,
         test_memory_autocreates_and_roundtrips,
+        test_append_log_creates_and_appends,
+        test_upsert_index_row_add_update_dedupe,
+        test_write_note_catalog_true_appends_log_and_index_row,
+        test_write_note_catalog_false_skips_catalog,
     ]
     for t in tests:
         t()

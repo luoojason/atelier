@@ -28,10 +28,32 @@ from youtube_core import (  # noqa: E402
     upload_video,
 )
 from PublishToVault import (  # noqa: E402
+    append_log,
     build_note,
     publish_to_vault,
     resolve_vault_root,
     slugify_filename,
+    upsert_index_row,
+)
+
+# Fixtures mirroring the real vault's log.md / index.md formats.
+_FIXTURE_LOG = (
+    "---\ntitle: Log\ntags: [meta, log]\nlast_updated: \"2026-07-01\"\n---\n\n"
+    "# Wiki Log\n\n"
+    "- 2026-06-30 — Seeded an earlier operation.\n"
+)
+_FIXTURE_INDEX = (
+    "---\ntitle: Index\ntags: [meta, index]\nlast_updated: \"2026-07-01\"\n---\n\n"
+    "# Wiki Index\n\n"
+    "## Projects\n\n"
+    "| Page | Summary |\n"
+    "|------|---------|\n"
+    "| [[Projects/Alpha\\|Alpha]] | First project |\n"
+    "| [[Projects/Beta\\|Beta]] | Second project |\n\n"
+    "## Analysis\n\n"
+    "| Page | Summary |\n"
+    "|------|---------|\n"
+    "| [[Analysis/Existing\\|Existing]] | An existing analysis |\n"
 )
 
 # PyYAML is not stdlib, so it may be absent under a bare system python3. When it
@@ -546,6 +568,134 @@ def test_publish_refuses_path_traversal():
         # nothing escaped into the parent (sibling) directory
         assert not os.path.exists(os.path.join(parent, "escaped_evil"))
         assert not os.path.exists(os.path.join(parent, "escaped_evil", "Pwn.md"))
+
+
+# ── convention-honoring catalog writeback (log.md + index.md) ────────────────
+
+def test_append_log_creates_and_appends():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = os.path.join(tmp)
+
+        append_log(root, "First operation.", "2026-07-01")
+        with open(os.path.join(root, "log.md"), encoding="utf-8") as handle:
+            log = handle.read()
+        assert log == "- 2026-07-01 — First operation.\n", repr(log)
+
+        append_log(root, "Second operation.", "2026-07-02")
+        with open(os.path.join(root, "log.md"), encoding="utf-8") as handle:
+            log = handle.read()
+        assert log == (
+            "- 2026-07-01 — First operation.\n"
+            "- 2026-07-02 — Second operation.\n"
+        ), repr(log)
+
+        # a fixture without a trailing newline still gets a clean new line.
+        with open(os.path.join(root, "log.md"), "w", encoding="utf-8") as handle:
+            handle.write("# Wiki Log\n\n- 2026-06-30 — seed")
+        append_log(root, "New line.", "2026-07-03")
+        with open(os.path.join(root, "log.md"), encoding="utf-8") as handle:
+            log = handle.read()
+        assert log.endswith("- 2026-06-30 — seed\n- 2026-07-03 — New line.\n"), repr(log)
+
+
+def test_upsert_index_row_add_update_dedupe():
+    text = upsert_index_row(_FIXTURE_INDEX, "Projects", "Projects/Gamma", "Gamma", "A new project")
+    assert "| [[Projects/Gamma\\|Gamma]] | A new project |" in text
+    assert "| [[Projects/Alpha\\|Alpha]] | First project |" in text
+    assert "| [[Projects/Beta\\|Beta]] | Second project |" in text
+    assert text.index("Projects/Gamma") < text.index("## Analysis")
+
+    text2 = upsert_index_row(text, "Projects", "Projects/Gamma", "Gamma", "Updated summary")
+    assert text2.count("[[Projects/Gamma\\|") == 1, "wikilink row must not duplicate"
+    assert "Updated summary" in text2 and "A new project" not in text2
+
+    text3 = upsert_index_row(text2, "Projects", "Projects/Gamma", "Gamma", "Updated summary")
+    assert text3 == text2, "identical re-run must be a no-op"
+
+    text4 = upsert_index_row(_FIXTURE_INDEX, "Concepts", "Concepts/New Idea", "New Idea", "A concept")
+    assert "## Concepts" in text4
+    assert "| [[Concepts/New Idea\\|New Idea]] | A concept |" in text4
+    assert "## Projects" in text4 and "## Analysis" in text4
+
+
+def test_upsert_index_row_escapes_pipe_in_summary():
+    # A summary containing a literal '|' (realistic: it is the note's first body
+    # line) must not inject spurious table columns. The pipe is escaped to '\|'
+    # so the row stays a valid two-column Obsidian/GFM table row. This is the
+    # exact scenario from the format-preservation finding.
+    text = upsert_index_row(_FIXTURE_INDEX, "Projects", "Projects/W", "W", "multi space | pipe")
+
+    # The summary pipe is escaped, and the raw (spurious-column) form is absent.
+    assert "| [[Projects/W\\|W]] | multi space \\| pipe |" in text
+    assert "| multi space | pipe |" not in text
+
+    # The emitted row still delimits exactly two data cells: after removing the
+    # escaped pipes, only the 3 structural table pipes remain (lead|mid|trail).
+    row = next(ln for ln in text.splitlines() if "Projects/W" in ln)
+    assert row.replace("\\|", "").count("|") == 3, row
+
+    # Escaping does not disturb dedupe/idempotency: same wikilink updates in place.
+    text2 = upsert_index_row(text, "Projects", "Projects/W", "W", "again | still")
+    assert text2.count("[[Projects/W\\|") == 1
+    assert "| [[Projects/W\\|W]] | again \\| still |" in text2
+
+
+def test_publish_to_vault_catalog_updates_index_and_log():
+    with tempfile.TemporaryDirectory() as vault:
+        with open(os.path.join(vault, "index.md"), "w", encoding="utf-8") as handle:
+            handle.write(_FIXTURE_INDEX)
+        with open(os.path.join(vault, "log.md"), "w", encoding="utf-8") as handle:
+            handle.write(_FIXTURE_LOG)
+
+        publish_to_vault(
+            title="Published Note",
+            body="The headline summary.\n\nMore body.",
+            folder="Projects",
+            vault_root=vault,
+            updated="2026-07-05",
+            catalog=True,
+        )
+
+        with open(os.path.join(vault, "index.md"), encoding="utf-8") as handle:
+            index = handle.read()
+        assert "[[Projects/Published Note\\|Published Note]]" in index
+        assert "The headline summary." in index
+        assert index.index("Published Note") < index.index("## Analysis")
+        assert "| [[Projects/Alpha\\|Alpha]] | First project |" in index
+
+        with open(os.path.join(vault, "log.md"), encoding="utf-8") as handle:
+            log = handle.read()
+        assert "- 2026-06-30 — Seeded an earlier operation." in log
+        assert "- 2026-07-05 — Created note [[Projects/Published Note|Published Note]]\n" in log
+        assert log.endswith("\n")
+
+        # Re-publishing the same note does not duplicate the index row.
+        publish_to_vault(
+            title="Published Note", body="changed", folder="Projects",
+            vault_root=vault, updated="2026-07-06", catalog=True,
+        )
+        with open(os.path.join(vault, "index.md"), encoding="utf-8") as handle:
+            index2 = handle.read()
+        assert index2.count("[[Projects/Published Note\\|") == 1
+
+
+def test_publish_to_vault_catalog_false_skips():
+    with tempfile.TemporaryDirectory() as vault:
+        with open(os.path.join(vault, "index.md"), "w", encoding="utf-8") as handle:
+            handle.write(_FIXTURE_INDEX)
+        with open(os.path.join(vault, "log.md"), "w", encoding="utf-8") as handle:
+            handle.write(_FIXTURE_LOG)
+
+        path = publish_to_vault(
+            title="Ephemeral", body="scratch", folder="Analysis",
+            vault_root=vault, updated="2026-07-05", catalog=False,
+        )
+        assert os.path.exists(path)
+
+        with open(os.path.join(vault, "index.md"), encoding="utf-8") as handle:
+            assert handle.read() == _FIXTURE_INDEX
+        with open(os.path.join(vault, "log.md"), encoding="utf-8") as handle:
+            assert handle.read() == _FIXTURE_LOG
 
 
 # ── runner ───────────────────────────────────────────────────────────────────
