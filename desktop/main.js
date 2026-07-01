@@ -2,7 +2,17 @@
 
 const { app, BrowserWindow, dialog } = require('electron');
 const path = require('path');
+const os = require('os');
 const cp = require('child_process');
+
+// A Finder/launchd-launched app inherits a minimal PATH that omits the user's
+// bin dirs, so the backend's `claude` CLI (the subscription model) would not be
+// found. Rebuild a full PATH for the spawned backend.
+const FULL_PATH = [
+  path.join(os.homedir(), '.local', 'bin'),
+  '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin',
+  process.env.PATH || '',
+].filter(Boolean).join(':');
 
 // ── config ──────────────────────────────────────────────────────────────────
 // The lite backend runs on the user's Claude Max subscription. It is spawned
@@ -24,6 +34,7 @@ function startBackend() {
     cwd: REPO_DIR,
     env: {
       ...process.env,
+      PATH: FULL_PATH,
       DEFAULT_MODEL: 'claude-cli',
       PORT: String(PORT),
       PYTHONUNBUFFERED: '1',
@@ -45,7 +56,7 @@ function startBackend() {
   });
 }
 
-async function waitForBackend(attempts = 30, delayMs = 500) {
+async function waitForBackend(attempts = 90, delayMs = 500) {
   for (let i = 0; i < attempts; i++) {
     try {
       const res = await fetch(HEALTH_URL);
@@ -103,28 +114,28 @@ function createWindow() {
 app.whenReady().then(async () => {
   startBackend();
 
+  // Open the window right away; the renderer shows a live status dot and starts
+  // working as soon as the backend answers (its cold import can take 15-30s).
+  createWindow();
+
   const ready = await waitForBackend();
   if (!ready) {
-    dialog.showErrorBox(
-      'Atelier backend did not start',
-      [
-        `The agency backend did not answer on ${HEALTH_URL} within 15 seconds.`,
-        '',
-        'Common fixes:',
-        `  1. The venv must exist: ${BACKEND_PY}`,
-        `  2. lite_server.py must exist at: ${REPO_DIR}`,
-        '  3. The Claude CLI must be logged into Claude Max:',
-        '       claude login',
-        '',
-        'Check the terminal for [backend-err] lines, then relaunch.',
-      ].join('\n'),
-    );
-    killBackend();
-    app.quit();
-    return;
+    console.warn('[backend] not ready after 45s — the window is open; it will connect when the backend answers.');
+    // Only surface a dialog if the backend process died outright (a real config problem).
+    if (!backendProc) {
+      dialog.showErrorBox(
+        'Atelier backend could not start',
+        [
+          'The agency backend process exited before answering.',
+          '',
+          'Check that:',
+          `  1. the venv exists: ${BACKEND_PY}`,
+          `  2. lite_server.py exists at: ${REPO_DIR}`,
+          '  3. the Claude CLI is logged into Claude Max (run: claude login)',
+        ].join('\n'),
+      );
+    }
   }
-
-  createWindow();
 });
 
 app.on('activate', () => {
