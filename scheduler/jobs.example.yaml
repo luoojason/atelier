@@ -1,0 +1,25 @@
+# OpenSwarm scheduler jobs.
+#
+# Copy this file to scheduler/jobs.yaml (or point SWARM_JOBS_FILE at it) and
+# edit. Each list item is one scheduled prompt fired at the agency HTTP
+# endpoint that server.py exposes (POST /<agency>/get_response).
+#
+# Fields:
+#   name      required. Unique label for the job (also the run-log tag).
+#   schedule  required. Either a cron string ("min hour day month weekday")
+#             or an interval shorthand: "30s", "30m", "2h", "1d".
+#             The weekday field follows standard Unix cron: 0 or 7 = Sunday,
+#             1 = Monday ... 6 = Saturday (names mon-sun also accepted).
+#   prompt    required. The message text sent to the agency.
+#   agent     optional. Recipient agent name (e.g. "orchestrator"). Omit to let
+#             the agency route to its default entrypoint.
+#   endpoint  optional. Per-job base-URL override (defaults to SWARM_BASE_URL).
+
+- name: morning-standup
+  schedule: "0 9 * * *"          # cron: every day at 09:00 local time
+  prompt: "Summarize yesterday's activity logs and list today's top 3 priorities."
+  agent: orchestrator
+
+- name: hourly-inbox-sweep
+  schedule: "30m"                # interval: every 30 minutes
+  prompt: "Check for anything new that needs attention and triage what is urgent."

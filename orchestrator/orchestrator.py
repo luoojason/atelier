@@ -2,6 +2,7 @@ from agency_swarm import Agent, ModelSettings
 from openai.types.shared import Reasoning
 
 from config import get_default_model, is_openai_provider
+from shared_tools import VaultSearch, VaultRead, VaultWrite, RecallMemory, RememberFact
 from run_utils import _load_openswarm_dotenv
 
 _load_openswarm_dotenv()
@@ -15,6 +16,7 @@ def create_orchestrator() -> Agent:
             "and hands off to a specialist when tight user iteration is needed."
         ),
         instructions="./instructions.md",
+        tools=[VaultSearch, VaultRead, VaultWrite, RecallMemory, RememberFact],
         model=get_default_model(),
         model_settings=ModelSettings(
             reasoning=Reasoning(effort="medium", summary="auto") if is_openai_provider() else None,

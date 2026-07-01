@@ -48,3 +48,6 @@ moviepy<2
 fal-client
 httpx
 imageio-ffmpeg
+
+apscheduler
+pyyaml

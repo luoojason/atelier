@@ -4,6 +4,7 @@ from openai.types.shared import Reasoning
 from virtual_assistant.tools.ScholarSearch import ScholarSearch
 
 from config import get_default_model, is_openai_provider
+from shared_tools import VaultSearch, VaultRead, VaultWrite, RecallMemory, RememberFact
 
 
 def create_deep_research() -> Agent:
@@ -12,7 +13,7 @@ def create_deep_research() -> Agent:
         description="Comprehensive deep research agent that conducts thorough research on any topic.",
         instructions="./instructions.md",
         files_folder="./files",
-        tools=[WebSearchTool(), ScholarSearch, IPythonInterpreter],
+        tools=[WebSearchTool(), ScholarSearch, IPythonInterpreter, VaultSearch, VaultRead, VaultWrite, RecallMemory, RememberFact],
         model=get_default_model(),
         model_settings=ModelSettings(
             reasoning=Reasoning(effort="high", summary="auto") if is_openai_provider() else None,
