@@ -1,5 +1,6 @@
 {
     "name": "@vrsen/openswarm",
+  "productName": "Atelier",
     "version": "1.0.1-rc.9",
     "description": "An open-source multi-agent AI team built on Agency Swarm",
     "license": "MIT",

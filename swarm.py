@@ -98,7 +98,7 @@ def create_agency(load_threads_callback=None):
     agency = Agency(
         *all_agents,
         communication_flows=send_message_flows + handoff_flows,
-        name="OpenSwarm",
+        name="Atelier",
         shared_instructions="shared_instructions.md",
         load_threads_callback=load_threads_callback,
     )
