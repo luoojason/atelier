@@ -3,6 +3,7 @@
 const { app, BrowserWindow, dialog, ipcMain, screen, shell } = require('electron');
 const path = require('path');
 const os = require('os');
+const fs = require('fs');
 const cp = require('child_process');
 
 // A Finder/launchd-launched app inherits a minimal PATH that omits the user's
@@ -32,10 +33,50 @@ const HEALTH_URL = `http://127.0.0.1:${PORT}/health`;
 
 let backendProc = null;
 let mainWindow = null;
+let intentionalKill = false;   // set on quit/replace so the exit handler won't respawn
+let respawns = 0;
+let lastSpawnAt = 0;
+
+// ── backend log (Finder-launched apps discard child stdio; keep a file) ──────
+const LOG_DIR = path.join(os.homedir(), '.atelier', 'logs');
+const LOG_FILE = path.join(LOG_DIR, 'backend.log');
+let logStream = null;
+const recentStderr = []; // last N lines, surfaced in the failure dialog
+function openLog() {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    try { if (fs.statSync(LOG_FILE).size > 5 * 1024 * 1024) fs.renameSync(LOG_FILE, LOG_FILE + '.1'); } catch { /* first run */ }
+    logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+    logStream.write(`\n[main] --- launch ${new Date().toISOString()} ---\n`);
+  } catch { logStream = null; }
+}
+function logLine(s) {
+  if (logStream) { try { logStream.write(s.endsWith('\n') ? s : s + '\n'); } catch { /* stream gone */ } }
+}
+
+// Kill whatever already holds our port. Our own backend is always killed on a
+// clean quit, so anything listening here is a stale orphan (crash leftover) or
+// a second launch — either way the fresh code must bind. Precise: kill only the
+// PID(s) on the port, never a dev server on a different port.
+async function clearStalePort() {
+  try {
+    const res = await fetch(HEALTH_URL);
+    if (!res.ok) return;
+  } catch { return; } // nobody listening — normal path
+  try {
+    const out = cp.execSync(`lsof -nP -iTCP:${PORT} -sTCP:LISTEN -t`, { env: { PATH: FULL_PATH } }).toString();
+    for (const pid of out.trim().split('\n').filter(Boolean)) {
+      logLine(`[main] killing stale backend pid ${pid} holding port ${PORT}`);
+      try { process.kill(parseInt(pid, 10), 'SIGKILL'); } catch { /* already gone */ }
+    }
+    await new Promise((r) => setTimeout(r, 1200));
+  } catch { /* lsof missing or nothing to kill */ }
+}
 
 // ── backend ─────────────────────────────────────────────────────────────────
 
 function startBackend() {
+  lastSpawnAt = Date.now();
   backendProc = cp.spawn(BACKEND_PY, [path.join(BACKEND_DIR, 'lite_server.py')], {
     cwd: BACKEND_DIR, // sys.path[0] -> config/shared_tools/campaign_agent/scheduler imports
     env: {
@@ -51,16 +92,34 @@ function startBackend() {
 
   backendProc.stdout.on('data', (chunk) => {
     process.stdout.write(`[backend] ${chunk}`);
+    logLine(`[out] ${chunk}`.trimEnd());
   });
   backendProc.stderr.on('data', (chunk) => {
     process.stderr.write(`[backend-err] ${chunk}`);
+    logLine(`[err] ${chunk}`.trimEnd());
+    for (const line of String(chunk).split('\n')) if (line.trim()) recentStderr.push(line);
+    while (recentStderr.length > 60) recentStderr.shift();
   });
   backendProc.on('error', (err) => {
     console.error('[backend] failed to spawn:', err);
+    logLine(`[main] spawn error: ${err}`);
   });
   backendProc.on('close', (code, signal) => {
-    console.log(`[backend] exited code=${code} signal=${signal}`);
+    logLine(`[main] backend exited code=${code} signal=${signal}`);
     backendProc = null;
+    if (intentionalKill) return;
+    // Unexpected death (OOM under load, a crash, a lost port race). Respawn a
+    // bounded number of times with backoff; reset the counter once it has been
+    // healthy for a while so a genuinely broken build still gives up.
+    if (Date.now() - lastSpawnAt > 10 * 60 * 1000) respawns = 0;
+    if (respawns < 5) {
+      const delay = [1000, 5000, 15000, 30000, 30000][respawns];
+      respawns++;
+      logLine(`[main] respawning backend in ${delay}ms (attempt ${respawns})`);
+      setTimeout(() => { if (!backendProc && !intentionalKill) startBackend(); }, delay);
+    } else {
+      logLine('[main] giving up on backend after repeated exits');
+    }
   });
 }
 
@@ -182,42 +241,66 @@ ipcMain.handle('atelier:capture-page', async (event, rect) => {
 
 // ── boot ────────────────────────────────────────────────────────────────────
 
-app.whenReady().then(async () => {
-  startBackend();
-
-  // Open the window right away; the renderer shows a live status dot and starts
-  // working as soon as the backend answers (its cold import can take 15-30s).
-  createWindow();
-
-  const ready = await waitForBackend();
-  if (!ready) {
-    console.warn('[backend] not ready after 45s — the window is open; it will connect when the backend answers.');
-    // Only surface a dialog if the backend process died outright (a real config problem).
-    if (!backendProc) {
-      dialog.showErrorBox(
-        'Atelier backend could not start',
-        [
-          'The agency backend process exited before answering.',
-          '',
-          'Check that:',
-          `  1. the interpreter exists: ${BACKEND_PY}`,
-          `  2. lite_server.py exists at: ${BACKEND_DIR}`,
-          '  3. the Claude CLI is logged into Claude Max (run: claude login)',
-        ].join('\n'),
-      );
-    }
-  }
-});
-
-app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow();
-});
-
-app.on('window-all-closed', () => {
-  killBackend();
+// Single-instance lock: a second launch must not spawn a second backend that
+// then dies on the port the first one holds (the exact "exited before
+// answering" failure). Hand focus back to the running window instead.
+if (!app.requestSingleInstanceLock()) {
   app.quit();
-});
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
 
-app.on('before-quit', () => {
-  killBackend();
-});
+  app.whenReady().then(async () => {
+    openLog();
+    await clearStalePort(); // take down any orphaned backend before we bind
+    startBackend();
+
+    // Open the window right away; the renderer shows a live status dot and starts
+    // working as soon as the backend answers (its cold import can take 15-30s).
+    createWindow();
+
+    const ready = await waitForBackend();
+    if (!ready) {
+      console.warn('[backend] not ready after 45s — the window is open; it will connect when the backend answers.');
+      // Only surface a dialog if the backend is not currently alive (a respawn
+      // may be pending). Include the tail of stderr so the failure is not a
+      // dead end, and point at the full log.
+      if (!backendProc) {
+        const tail = recentStderr.slice(-12).join('\n');
+        dialog.showErrorBox(
+          'Atelier backend could not start',
+          [
+            'The agency backend process exited before answering.',
+            '',
+            'Check that:',
+            `  1. the interpreter exists: ${BACKEND_PY}`,
+            `  2. lite_server.py exists at: ${BACKEND_DIR}`,
+            '  3. the Claude CLI is logged into Claude Max (run: claude login)',
+            '',
+            `Full log: ${LOG_FILE}`,
+            tail ? `\nLast backend output:\n${tail}` : '',
+          ].join('\n'),
+        );
+      }
+    }
+  });
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+
+  app.on('window-all-closed', () => {
+    intentionalKill = true;
+    killBackend();
+    app.quit();
+  });
+
+  app.on('before-quit', () => {
+    intentionalKill = true;
+    killBackend();
+  });
+}
