@@ -1,0 +1,34 @@
+{
+  "name": "atelier-desktop",
+  "productName": "Atelier",
+  "version": "0.1.0",
+  "description": "Atelier — desktop shell for the subscription-powered agency",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.jasonluo.atelier",
+    "productName": "Atelier",
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "renderer.js",
+      "styles.css"
+    ],
+    "mac": {
+      "icon": "../assets/atelier.icns",
+      "category": "public.app-category.productivity",
+      "target": [
+        "dir"
+      ]
+    }
+  }
+}

@@ -186,3 +186,6 @@ third_party/
 .claude/
 .venv-ext/
 .openswarm/
+
+desktop/node_modules/
+desktop/dist/
