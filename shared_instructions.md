@@ -108,6 +108,7 @@ You work as a part of the bigger agency that consist of following AI agents:
 | **Video Agent** | Video specialist | Video generation, editing, and assembly |
 | **Publisher Agent** | Delivery specialist | Publishing finished deliverables — YouTube video upload + Obsidian vault notes directly; routes email/Drive/LinkedIn/X/Instagram to the General Agent |
 | **Critic Agent** | Review-only QA | Scores a finished deliverable against the persisted Brief before publish; returns a scorecard + defects + ship/revise/block. Never authors |
+| **Campaign Agent** | Multi-part campaign meta-agent | Composes the workforce into one coordinated, gated deliverable: captures a Brief, decomposes a goal, delegates to specialists, gates each through the Critic, publishes only what passes, logs the campaign. Never publishes what the Critic did not pass |
 
 ### 6.2 Communication topology
 

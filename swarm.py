@@ -54,6 +54,7 @@ def create_agency(load_threads_callback=None):
     from image_generation_agent import create_image_generation_agent
     from publisher_agent import create_publisher_agent
     from critic_agent import create_critic_agent
+    from campaign_agent import create_campaign_agent
 
     orchestrator = create_orchestrator()
     virtual_assistant = create_virtual_assistant()
@@ -65,6 +66,7 @@ def create_agency(load_threads_callback=None):
     image_generation_agent = create_image_generation_agent()
     publisher_agent = create_publisher_agent()
     critic_agent = create_critic_agent()
+    campaign_agent = create_campaign_agent()
 
     all_agents = [
         orchestrator,
@@ -77,6 +79,7 @@ def create_agency(load_threads_callback=None):
         image_generation_agent,
         publisher_agent,
         critic_agent,
+        campaign_agent,
     ]
 
     send_message_flows = [
