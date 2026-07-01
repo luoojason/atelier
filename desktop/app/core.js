@@ -31,6 +31,15 @@
         Atelier.ui.toast('hi'); Atelier.ui.openPanel('Test', Object.assign(
           document.createElement('div'), { textContent: 'panel body' }));
       A toast and a draggable floating panel appear.
+   8. Click the zoombar ⤢ (Fit) button — the view frames every card with a
+      ~60px margin (zoom clamped to 20–200%); with zero cards it resets to
+      pan (0,0) at 100%. Same via Atelier.canvas.fitToView(). In the console,
+      Atelier.canvas.setViewport({panX: 40, panY: 40, zoom: 1.2}) repaints.
+   9. Press Cmd/Ctrl+M on empty canvas — a Note card spawns (fallback; a
+      module listening on bus 'shortcut:add-app' claims the key instead).
+      Press Escape while a floating panel is open — the topmost panel
+      closes; with none open, bus 'shortcut:escape' fires. Cmd/Ctrl+M is
+      ignored while typing in an input/textarea; Escape always works.
    =========================================================================== */
 
 (function () {
@@ -99,6 +108,38 @@
       x: (r.width / 2 - panX) / zoom - cardW / 2,
       y: (r.height / 2 - panY) / zoom - cardH / 2,
     };
+  }
+
+  // fit all cards in view with a ~60px margin; no cards -> reset viewport
+  function fitToView() {
+    const cards = Array.from(content.children).filter((el) => el.classList.contains('card'));
+    if (!cards.length) { panX = 0; panY = 0; zoom = 1; applyTransform(); return; }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    cards.forEach((el) => {
+      const x = parseFloat(el.style.left) || 0;
+      const y = parseFloat(el.style.top) || 0;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x + el.offsetWidth);
+      maxY = Math.max(maxY, y + el.offsetHeight);
+    });
+    const r = canvas.getBoundingClientRect();
+    const bw = maxX - minX, bh = maxY - minY;
+    const nz = Math.min(MAX_Z, Math.max(MIN_Z, Math.min(r.width / (bw + 120), r.height / (bh + 120))));
+    zoom = nz;
+    panX = (r.width - bw * nz) / 2 - minX * nz;  // center the bbox horizontally
+    panY = (r.height - bh * nz) / 2 - minY * nz; // ...and vertically
+    applyTransform();
+  }
+  const fitBtn = document.querySelector('.zoombar [title="Fit"]');
+  if (fitBtn) fitBtn.addEventListener('click', fitToView);
+
+  // apply an explicit viewport (boards restore theirs through this) + repaint
+  function setViewport(v = {}) {
+    if (typeof v.panX === 'number' && isFinite(v.panX)) panX = v.panX;
+    if (typeof v.panY === 'number' && isFinite(v.panY)) panY = v.panY;
+    if (typeof v.zoom === 'number' && isFinite(v.zoom)) zoom = Math.min(MAX_Z, Math.max(MIN_Z, v.zoom));
+    applyTransform();
   }
 
   // ── event bus ─────────────────────────────────────────────────────────────
@@ -281,6 +322,12 @@
   }
 
   function spawnWidget(type, config, worldPos) {
+    // widgets.js owns config forms, live-data mounts, and persistence — route
+    // through it when loaded so every spawn path (palette, scripts) behaves
+    // like the picker. The inline path below is only the pre-widgets fallback.
+    if (window.AtelierWidgets && typeof window.AtelierWidgets.spawn === 'function') {
+      return window.AtelierWidgets.spawn(type, config, worldPos);
+    }
     const def = widgetRegistry.get(type);
     if (!def || typeof def.render !== 'function') return null;
     const cfg = Object.assign({}, def.defaultConfig || {}, config || {});
@@ -290,7 +337,7 @@
     card.innerHTML =
       '<div class="card-bar"><span class="card-dot"></span>' +
       '<span class="card-title"></span><span class="card-x">×</span></div>';
-    card.querySelector('.card-title').textContent = def.label || type;
+    card.querySelector('.card-title').textContent = cfg.title || def.label || type;
     const body = document.createElement('div');
     body.className = 'app-body';
     if (inner) body.appendChild(inner);
@@ -497,9 +544,32 @@
     });
   });
 
+  // ── keyboard shortcuts (Cmd/Ctrl+M add-app, Escape close/escape) ──────────
+  window.addEventListener('keydown', (e) => {
+    if (e.defaultPrevented) return; // palette & friends handle their own keys
+    if (e.key === 'Escape') {
+      // Escape works even while typing. Close the topmost floating panel if
+      // one is open (uniform z-index, so last in DOM order paints on top).
+      const panels = document.querySelectorAll('.atelier-panel');
+      if (panels.length) panels[panels.length - 1].remove();
+      else bus.emit('shortcut:escape');
+      return;
+    }
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if ((e.metaKey || e.ctrlKey) && (e.key === 'm' || e.key === 'M')) {
+      e.preventDefault();
+      bus.emit('shortcut:add-app', {});
+      const subs = listeners.get('shortcut:add-app');
+      // ponytail: note-spawn fallback until an app-launcher module registers
+      // a 'shortcut:add-app' bus listener and owns the key.
+      if (!subs || subs.size === 0) spawnApp('note');
+    }
+  });
+
   // ── publish the API ───────────────────────────────────────────────────────
   window.Atelier = {
-    canvas: { addCard, onDoubleClick, viewport, screenToWorld },
+    canvas: { addCard, onDoubleClick, viewport, screenToWorld, fitToView, setViewport },
     bus,
     store,
     backend,
@@ -535,6 +605,8 @@
       ['canvas.onDoubleClick', typeof A.canvas.onDoubleClick === 'function'],
       ['canvas.viewport', typeof A.canvas.viewport === 'function'],
       ['canvas.screenToWorld', typeof A.canvas.screenToWorld === 'function'],
+      ['canvas.fitToView', typeof A.canvas.fitToView === 'function'],
+      ['canvas.setViewport', typeof A.canvas.setViewport === 'function'],
       ['bus.on', A.bus && typeof A.bus.on === 'function'],
       ['bus.emit', A.bus && typeof A.bus.emit === 'function'],
       ['store.get', A.store && typeof A.store.get === 'function'],

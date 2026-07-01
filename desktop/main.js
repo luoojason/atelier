@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, dialog } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, screen, shell } = require('electron');
 const path = require('path');
 const os = require('os');
 const cp = require('child_process');
@@ -15,13 +15,19 @@ const FULL_PATH = [
 ].filter(Boolean).join(':');
 
 // ── config ──────────────────────────────────────────────────────────────────
-// The lite backend runs on the user's Claude Max subscription. It is spawned
-// from the openswarm repo with the light venv so the heavy media deps are never
-// imported. Paths are absolute on purpose — the packaged .app has a different
-// __dirname, but the backend and its venv always live in the repo.
+// The lite backend runs on the user's Claude Max subscription. Packaged, the
+// backend sources live at <Resources>/backend and the relocatable interpreter
+// (python-build-standalone, built by scripts/build-python-env.sh) at
+// <Resources>/python-env — the .app has no dependency on the repo. In dev the
+// repo + its light venv are used directly so edits run without a rebuild.
 const PORT = 8765;
-const REPO_DIR = '/Users/jasonluo08/Desktop/openswarm';
-const BACKEND_PY = '/Users/jasonluo08/Desktop/openswarm/.venv-ext/bin/python';
+const DEV_REPO = '/Users/jasonluo08/Desktop/openswarm';
+const BACKEND_DIR = app.isPackaged
+  ? path.join(process.resourcesPath, 'backend')
+  : DEV_REPO;
+const BACKEND_PY = app.isPackaged
+  ? path.join(process.resourcesPath, 'python-env', 'bin', 'python3')
+  : path.join(DEV_REPO, '.venv-ext', 'bin', 'python');
 const HEALTH_URL = `http://127.0.0.1:${PORT}/health`;
 
 let backendProc = null;
@@ -30,14 +36,16 @@ let mainWindow = null;
 // ── backend ─────────────────────────────────────────────────────────────────
 
 function startBackend() {
-  backendProc = cp.spawn(BACKEND_PY, ['lite_server.py'], {
-    cwd: REPO_DIR,
+  backendProc = cp.spawn(BACKEND_PY, [path.join(BACKEND_DIR, 'lite_server.py')], {
+    cwd: BACKEND_DIR, // sys.path[0] -> config/shared_tools/campaign_agent/scheduler imports
     env: {
       ...process.env,
       PATH: FULL_PATH,
       DEFAULT_MODEL: 'claude-cli',
       PORT: String(PORT),
       PYTHONUNBUFFERED: '1',
+      PYTHONDONTWRITEBYTECODE: '1', // never write .pyc into the sealed Resources tree
+      CLAUDE_ISOLATED: '1',
     },
   });
 
@@ -100,6 +108,7 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      webviewTag: true, // browser cards render sites in <webview partition="persist:atelier-browser">
     },
   });
 
@@ -108,6 +117,68 @@ function createWindow() {
     mainWindow = null;
   });
 }
+
+// ── webview hardening + renderer IPC ────────────────────────────────────────
+
+app.on('web-contents-created', (_event, contents) => {
+  // No webview preload in v1: strip any preload a <webview> tag (or a
+  // compromised page) tries to attach. The effective key lives on the
+  // webPreferences argument; params carries the tag attributes — clear both.
+  contents.on('will-attach-webview', (_e, webPreferences, params) => {
+    delete webPreferences.preload;
+    delete webPreferences.preloadURL;
+    delete params.preload;
+    delete params.preloadURL;
+    // Defense-in-depth beyond the contract's "leave the rest default": pin the
+    // dangerous webPreferences so a future renderer foothold cannot inject
+    // <webview nodeintegration> and escalate to Node.
+    webPreferences.nodeIntegration = false;
+    webPreferences.nodeIntegrationInSubFrames = false;
+    webPreferences.contextIsolation = true;
+  });
+  if (contents.getType() === 'webview') {
+    // ponytail: popups denied in v1 — OAuth-in-browser-card needs routing later
+    contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  } else {
+    // window.open from the app's own pages must never spawn an in-app
+    // BrowserWindow (chromeless, un-handled, popup-spammable). Hand http(s)
+    // URLs to the OS default browser — this is what the browser card's
+    // "Open in default browser" button rides on — and deny everything else.
+    contents.setWindowOpenHandler(({ url }) => {
+      if (/^https?:/i.test(url)) shell.openExternal(url);
+      return { action: 'deny' };
+    });
+  }
+});
+
+// atelier:capture-page — capture a region of the sender's window and return a
+// 480px-wide JPEG data URL. rect is in PHYSICAL pixels (the renderer already
+// multiplied by devicePixelRatio). Returns null on ANY failure, never throws.
+// capturePage() itself takes the rect in DIP page coordinates (a physical-pixel
+// rect on a 2x display returns an empty image), so convert here — the contract
+// keeps the renderer side physical.
+ipcMain.handle('atelier:capture-page', async (event, rect) => {
+  try {
+    const wc = event.sender;
+    if (!wc || wc.isDestroyed() || wc.isCrashed() || wc.isLoading()) return null;
+    let dip;
+    if (rect) {
+      const win = BrowserWindow.fromWebContents(wc);
+      const sf = (win && screen.getDisplayMatching(win.getBounds()).scaleFactor) || 1;
+      dip = {
+        x: Math.round(rect.x / sf),
+        y: Math.round(rect.y / sf),
+        width: Math.round(rect.width / sf),
+        height: Math.round(rect.height / sf),
+      };
+    }
+    const img = await wc.capturePage(dip);
+    if (!img || img.isEmpty()) return null;
+    return 'data:image/jpeg;base64,' + img.resize({ width: 480 }).toJPEG(70).toString('base64');
+  } catch {
+    return null;
+  }
+});
 
 // ── boot ────────────────────────────────────────────────────────────────────
 
@@ -129,8 +200,8 @@ app.whenReady().then(async () => {
           'The agency backend process exited before answering.',
           '',
           'Check that:',
-          `  1. the venv exists: ${BACKEND_PY}`,
-          `  2. lite_server.py exists at: ${REPO_DIR}`,
+          `  1. the interpreter exists: ${BACKEND_PY}`,
+          `  2. lite_server.py exists at: ${BACKEND_DIR}`,
           '  3. the Claude CLI is logged into Claude Max (run: claude login)',
         ].join('\n'),
       );

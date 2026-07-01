@@ -450,6 +450,10 @@
   observer.observe(content, { attributes: true, attributeFilter: ['style'], subtree: true });
   A.bus.on('card:added', scheduleSave);
   A.bus.on('card:removed', scheduleSave);
+  // boards.js emits this just before snapshotting a board switch: flush the
+  // debounced layout save NOW and disarm the timer so it cannot fire after the
+  // board's keys are swapped and write this board's layout into the next one.
+  A.bus.on('boards:will-switch', () => { clearTimeout(saveTimer); saveLayout(); });
 
   // debug / manual-test handle
   window.__atelierCustomization = {

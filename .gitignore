@@ -189,3 +189,4 @@ third_party/
 
 desktop/node_modules/
 desktop/dist/
+desktop/build-staging/

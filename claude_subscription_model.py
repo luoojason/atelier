@@ -61,8 +61,50 @@ DEFAULT_DISALLOWED_TOOLS: list[str] = [
 
 DEFAULT_TIMEOUT = 600  # seconds; agent turns can be slow
 
+# Opt-in isolated-run defaults (see ``run_cli``): a private config dir keeps the
+# CLI from reading the user's global CLAUDE.md / settings / model default, while
+# CLAUDE_SECURESTORAGE_CONFIG_DIR="" (empty string, undocumented) keeps credential
+# storage on the DEFAULT macOS Keychain item "Claude Code-credentials" so Max
+# OAuth login + token refresh keep working from the isolated home.
+DEFAULT_ISOLATED_CONFIG_DIR = "~/.atelier/claude-home"
+DEFAULT_ISOLATED_MODEL = "sonnet"
+
 
 # ── pure helpers (stdlib only) ────────────────────────────────────────────────
+
+
+def _isolation_active() -> bool:
+    """True when ``CLAUDE_ISOLATED`` is truthy ("1"/"true", case-insensitive)."""
+    return (os.getenv("CLAUDE_ISOLATED") or "").strip().lower() in ("1", "true")
+
+
+def _isolation_env() -> dict:
+    """Build the subprocess env for an isolated ``claude -p`` run.
+
+    Starts from the live environment, strips API-key routes (the subscription
+    CLI must authenticate via OAuth, never a paid key), points CLAUDE_CONFIG_DIR
+    at a private home (respecting an existing override), and pins
+    CLAUDE_SECURESTORAGE_CONFIG_DIR to the empty string (see the constant note
+    above). Verified live on claude 2.1.198.
+    """
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser(
+        DEFAULT_ISOLATED_CONFIG_DIR
+    )
+    try:
+        os.makedirs(config_dir, exist_ok=True)
+    except OSError as exc:
+        # run_cli's contract: callers only ever need to catch RuntimeError. A
+        # read-only HOME (or a file squatting on a path component) must not
+        # leak a raw OSError out of run_cli.
+        raise RuntimeError(
+            f"cannot create isolated claude config dir {config_dir!r}: {exc}"
+        ) from exc
+    env["CLAUDE_CONFIG_DIR"] = config_dir
+    env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = ""
+    return env
 
 
 def _tool_fields(tool: Any) -> tuple[str, str, dict]:
@@ -492,8 +534,25 @@ def run_cli(
     Returns the parsed CLI JSON dict; raises ``RuntimeError`` on failure — including
     a CLI timeout or a failure to launch the process, both of which are normalized
     to ``RuntimeError`` so callers only ever need to catch that single type.
+
+    Isolation (opt-in, env ``CLAUDE_ISOLATED`` truthy): the run gets ``--safe-mode``
+    (no global CLAUDE.md / hooks / plugins / skills / auto-memory), a guaranteed
+    ``--model`` (the ``model`` arg, else ``CLAUDE_CLI_MODEL``, else "sonnet" —
+    isolated runs no longer read the user's global model setting), and the
+    :func:`_isolation_env` environment. If the isolated run fails with a
+    "Not logged in" result/stderr, it is retried ONCE with the config-dir
+    redirection removed (plain ``--safe-mode`` was also verified isolated).
+    When ``CLAUDE_ISOLATED`` is not set, behavior is byte-identical to the
+    non-isolated path: no env kwarg is passed to ``runner`` and no ``--safe-mode``
+    is added.
     """
+    isolated = _isolation_active()
+
     argv: list[str] = [cli_path, "-p", "--output-format", "json"]
+    if isolated:
+        argv.append("--safe-mode")
+        if not model:
+            model = os.getenv("CLAUDE_CLI_MODEL") or DEFAULT_ISOLATED_MODEL
 
     # The system prompt embeds every tool's/handoff's full JSON Schema and can grow
     # large; passing it as a single argv element risks OSError E2BIG (ARG_MAX
@@ -527,48 +586,72 @@ def run_cli(
         # Variadic option kept last so it never swallows a following flag/value.
         argv += ["--disallowedTools", *tools]
 
-    try:
-        completed = runner(
-            argv,
+    def _attempt(env: dict | None) -> dict:
+        kwargs: dict = dict(
             input=user,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired as exc:
-        # subprocess.run raises TimeoutExpired (NOT a RuntimeError); normalize it so
-        # the documented single-exception contract holds for the slow-path the
-        # module explicitly anticipates ("agent turns can be slow").
-        raise RuntimeError(f"claude CLI timed out after {timeout}s") from exc
-    except OSError as exc:
-        # e.g. E2BIG (argument list too long) or the CLI binary missing — surface as
-        # the documented RuntimeError rather than a raw, uncaught OSError.
-        raise RuntimeError(f"claude CLI could not be launched: {exc}") from exc
+        # Only isolated runs pass an env; the non-isolated call stays byte-identical
+        # (no env kwarg) so injected test runners with the historical signature work.
+        if env is not None:
+            kwargs["env"] = env
+        try:
+            completed = runner(argv, **kwargs)
+        except subprocess.TimeoutExpired as exc:
+            # subprocess.run raises TimeoutExpired (NOT a RuntimeError); normalize it
+            # so the documented single-exception contract holds for the slow-path the
+            # module explicitly anticipates ("agent turns can be slow").
+            raise RuntimeError(f"claude CLI timed out after {timeout}s") from exc
+        except OSError as exc:
+            # e.g. E2BIG (argument list too long) or the CLI binary missing — surface
+            # as the documented RuntimeError rather than a raw, uncaught OSError.
+            raise RuntimeError(f"claude CLI could not be launched: {exc}") from exc
+
+        returncode = getattr(completed, "returncode", 0)
+        stdout = getattr(completed, "stdout", "") or ""
+        stderr = getattr(completed, "stderr", "") or ""
+        if returncode != 0:
+            raise RuntimeError(
+                f"claude CLI exited with code {returncode}: {stderr.strip() or stdout.strip()}"
+            )
+        try:
+            data = json.loads(stdout)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(
+                f"claude CLI returned non-JSON output: {stdout[:500]!r}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"claude CLI returned unexpected JSON: {stdout[:500]!r}")
+        if data.get("is_error"):
+            raise RuntimeError(f"claude CLI reported an error: {data.get('result')!r}")
+        return data
+
+    # The temp system-prompt file must outlive EVERY attempt (the isolated path may
+    # retry once), so it is deleted only after the attempt block finishes.
+    try:
+        env = _isolation_env() if isolated else None
+        try:
+            return _attempt(env)
+        except RuntimeError as exc:
+            # Isolated fallback: a fresh CLAUDE_CONFIG_DIR that cannot see the
+            # keychain credentials fails with "Not logged in" (surfaced via the
+            # CLI result or stderr, both of which land in the RuntimeError text).
+            # Retry ONCE with the config-dir redirection removed — plain
+            # --safe-mode was also verified isolated. No retry loop beyond that.
+            if isolated and "Not logged in" in str(exc):
+                retry_env = dict(env or {})
+                retry_env.pop("CLAUDE_CONFIG_DIR", None)
+                retry_env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
+                return _attempt(retry_env)
+            raise
     finally:
         if system_prompt_file is not None:
             try:
                 os.unlink(system_prompt_file)
             except OSError:
                 pass
-
-    returncode = getattr(completed, "returncode", 0)
-    stdout = getattr(completed, "stdout", "") or ""
-    stderr = getattr(completed, "stderr", "") or ""
-    if returncode != 0:
-        raise RuntimeError(
-            f"claude CLI exited with code {returncode}: {stderr.strip() or stdout.strip()}"
-        )
-    try:
-        data = json.loads(stdout)
-    except (ValueError, TypeError) as exc:
-        raise RuntimeError(
-            f"claude CLI returned non-JSON output: {stdout[:500]!r}"
-        ) from exc
-    if not isinstance(data, dict):
-        raise RuntimeError(f"claude CLI returned unexpected JSON: {stdout[:500]!r}")
-    if data.get("is_error"):
-        raise RuntimeError(f"claude CLI reported an error: {data.get('result')!r}")
-    return data
 
 
 def _gen_call_id() -> str:

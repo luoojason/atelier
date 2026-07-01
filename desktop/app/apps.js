@@ -4,16 +4,23 @@
    ==================================================
    Real, movable/resizable app cards spawned from the bottom dock (and the
    palette / registry). Registers five app-card types via Atelier.registerApp
-   and owns the dock wiring, plus persistence of open apps + positions.
+   (overriding core's boot stubs — registerApp overwrites by key) and owns the
+   dock wiring, plus persistence of open apps + positions.
 
    Types:
      note      — editable sticky note (textarea), text persisted per note.
-     browser   — URL bar that loads a site in a <webview> when the Electron
-                 build enables webviewTag, else an <iframe> with a clear note.
-     workflow  — list of Atelier scheduled jobs (sample; reads the scheduler
-                 jobs when connected).
-     calendar  — a simple month grid with prev/next month.
-     history   — recent sessions (sample; reads the run ledger when connected).
+     browser   — a real Electron <webview> tile (partition
+                 'persist:atelier-browser') with back/forward/reload/URL/open
+                 toolbar; falls back to an <iframe> in a plain browser or when
+                 webviewTag is off.
+     workflow  — live list of scheduler jobs from GET /jobs.
+     calendar  — the same jobs as a compact readable schedule list.
+     history   — live run ledger (GET /runs) + notifications
+                 (GET /notifications), refreshed every 20s.
+
+   Backend access: window.atelier.get(path) via the preload bridge when
+   present, else plain fetch to http://127.0.0.1:8765 (plain-browser testing).
+   All endpoint strings reach the DOM via textContent — never innerHTML.
 
    Dock wiring: index.html has six .dock-btn with title=Chat/Apps/Browser/
      Campaign/Notes/History. core.js already attached its own click handlers to
@@ -25,21 +32,38 @@
      store key "atelier.apps" and restored on load. A note's text and the
      browser's URL live in each app's config, so they survive a reload.
 
-   Contract: builds ONLY against window.Atelier. Does not touch index.html,
-     core.js, styles.css, or any other module. All CSS is injected below.
+   Contract: builds ONLY against window.Atelier (+ the window.atelier preload
+     bridge). Does not touch index.html, core.js, styles.css, or any other
+     module. All CSS is injected below.
 
    ── SELF-CHECK ────────────────────────────────────────────────────────────
    Runtime assertions run at the bottom (see selfCheck): five types registered,
    the store key is an array, the dock has its buttons. On success the console
    logs "[apps] self-check passed".
 
-   Manual test:
-     1. `npm start` in desktop/ (or open index.html in a browser).
-     2. Click the Browser dock button (🌐) → a browser card opens; type a URL
-        (e.g. example.com) and press Go → the site loads (iframe in this build).
-     3. Click Notes (🗒), type some text, then reload the app (Cmd-R) → the note
-        reopens at its position with the text intact.
-     4. Drag/resize any spawned card, reload → it restores where you left it.
+   ── MANUAL TEST ───────────────────────────────────────────────────────────
+     1. `npm start` in desktop/ (webview path needs main.js webviewTag:true) —
+        or open index.html in a plain browser for the iframe + HTTP fallbacks.
+     2. Browser dock button (🌐) → a card with a back/forward/reload/URL/open
+        toolbar loads https://duckduckgo.com in a <webview>. Type
+        "example.com" ↵ → https://example.com loads and the URL bar follows;
+        type "weather today" ↵ → a DuckDuckGo search; Back re-enables after
+        the second navigation; the card title follows the page title; a thin
+        accent bar under the toolbar pulses while loading. In a plain browser
+        the same toolbar drives an <iframe> and a hint line offers "Open in
+        browser" for sites that block embedding.
+     3. History (🕘) → newest-first rows from /runs (green dot for ok, red
+        otherwise; name; HH:MM; latency ms + tokens when present) and a
+        Notifications section ("name: error") beneath; refreshes every 20s.
+        With an empty ledger it shows "No runs yet — the scheduler ledger is
+        empty."; with the backend down, an offline note.
+     4. Campaign (↺) → one row per scheduler job: name, verbatim schedule
+        pill, first-80-chars prompt excerpt, agent when set; the jobs file
+        path is the footer. Calendar (🗓) → the same jobs as one line each:
+        "name — cron 0 9 * * 1" or "name — every 30m".
+     5. Notes (🗒): type text, reload (Cmd-R) → the note reopens at its
+        position with the text intact.
+     6. Close a History card (×) → its 20s poll stops (watch the Network tab).
    =========================================================================== */
 
 (function () {
@@ -50,6 +74,13 @@
   }
 
   const STORE_KEY = 'atelier.apps';
+  const HOME_URL = 'https://duckduckgo.com';
+
+  // Renderer HTTP fallback (contract): preload bridge when present, else plain
+  // fetch so the module still works when index.html is opened in a browser.
+  const api = (p) => window.atelier && window.atelier.get
+    ? window.atelier.get(p)
+    : fetch('http://127.0.0.1:8765' + p).then((r) => r.json());
 
   // ── injected styles (warm palette via the shared CSS vars) ────────────────
   (function injectStyles() {
@@ -59,17 +90,24 @@
       .atl-note-body .note-area { border-radius: 8px; padding: 8px; }
 
       .atl-browser-body { padding: 0; display: flex; flex-direction: column; }
-      .atl-url-bar { display: flex; gap: 6px; padding: 8px 10px;
-        border-bottom: 1px solid var(--border-soft); }
+      .atl-url-bar { display: flex; align-items: center; gap: 6px;
+        padding: 8px 10px; border-bottom: 1px solid var(--border-soft); }
+      .atl-tool-btn { flex: 0 0 auto; width: 28px; height: 28px; border: none;
+        background: transparent; color: var(--ink-mid); border-radius: 8px;
+        cursor: pointer; font-size: 15px; line-height: 1; }
+      .atl-tool-btn:hover { background: rgba(60, 48, 34, 0.06); }
+      .atl-tool-btn:disabled { opacity: 0.35; cursor: default; }
       .atl-url-input { flex: 1; min-width: 0; border: 1px solid var(--border);
         border-radius: 8px; padding: 6px 10px; font: inherit; font-size: 12.5px;
         color: var(--ink); background: #faf7f1; outline: none; }
       .atl-url-input:focus { border-color: var(--accent); }
-      .atl-url-go { border: none; border-radius: 8px; background: var(--accent);
-        color: #fff; padding: 0 13px; font-size: 12.5px; cursor: pointer; }
+      .atl-loadbar { flex: 0 0 auto; height: 2px; background: transparent; }
+      .atl-loadbar.on { background: var(--accent);
+        animation: atl-load-pulse 1s ease-in-out infinite; }
+      @keyframes atl-load-pulse { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.8; } }
       .atl-frame-note { font-size: 11.5px; color: var(--ink-dim);
         padding: 6px 10px; line-height: 1.4; }
-      .atl-frame-note:empty { display: none; }
+      .atl-frame-note a { color: var(--accent); }
       .atl-frame-wrap { flex: 1; position: relative; background: #fff; }
       .atl-frame { position: absolute; inset: 0; width: 100%; height: 100%;
         border: none; background: #fff; }
@@ -85,28 +123,27 @@
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .atl-row-sub { font-size: 11.5px; color: var(--ink-dim); margin-top: 2px;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .atl-dot { flex: 0 0 9px; width: 9px; height: 9px; border-radius: 50%;
+        background: var(--ink-dim); }
+      .atl-dot.ok { background: var(--ok); }
+      .atl-dot.bad { background: var(--accent); }
       .atl-pill { font-size: 10.5px; font-weight: 600; padding: 2px 8px;
-        border-radius: 20px; white-space: nowrap; }
-      .atl-pill.scheduled { color: var(--accent); background: var(--accent-soft); }
-      .atl-pill.running { color: #fff; background: var(--accent); }
-      .atl-pill.paused, .atl-pill.gated { color: var(--ink-mid); background: #ece5da; }
-      .atl-pill.done { color: var(--ok); background: #e2f0e7; }
-
-      .atl-cal-body { padding: 10px 12px; display: flex; flex-direction: column; }
-      .atl-cal-head { display: flex; align-items: center;
-        justify-content: space-between; margin-bottom: 8px; }
-      .atl-cal-title { font-size: 13px; font-weight: 600; color: var(--ink); }
-      .atl-cal-nav { border: none; background: transparent; color: var(--ink-mid);
-        cursor: pointer; font-size: 16px; width: 24px; height: 24px;
-        border-radius: 6px; line-height: 1; }
-      .atl-cal-nav:hover { background: rgba(60, 48, 34, 0.06); }
-      .atl-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
-      .atl-cal-dow { font-size: 10.5px; color: var(--ink-dim); text-align: center;
-        padding: 4px 0; font-weight: 600; }
-      .atl-cal-cell { text-align: center; padding: 6px 0; font-size: 12px;
-        color: var(--ink); border-radius: 7px; }
-      .atl-cal-cell.blank { visibility: hidden; }
-      .atl-cal-cell.today { background: var(--accent); color: #fff; font-weight: 700; }
+        border-radius: 20px; white-space: nowrap; color: var(--accent);
+        background: var(--accent-soft); }
+      .atl-sec-head { font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em;
+        text-transform: uppercase; color: var(--ink-dim); padding: 10px 12px 4px;
+        border-top: 1px solid var(--border-soft); }
+      .atl-notif-line { font-size: 11.5px; color: var(--ink-mid);
+        padding: 4px 12px; white-space: nowrap; overflow: hidden;
+        text-overflow: ellipsis; }
+      .atl-foot { margin-top: auto; font-size: 11px; color: var(--ink-dim);
+        padding: 8px 12px; border-top: 1px solid var(--border-soft);
+        word-break: break-all; }
+      .atl-foot:empty { display: none; }
+      .atl-sched-row { font-size: 12.5px; color: var(--ink); padding: 9px 12px;
+        border-bottom: 1px solid var(--border-soft); white-space: nowrap;
+        overflow: hidden; text-overflow: ellipsis; }
+      .atl-sched-row:last-child { border-bottom: none; }
     `;
     const style = document.createElement('style');
     style.id = 'atl-apps-styles';
@@ -115,7 +152,7 @@
   })();
 
   // ── open-app registry + persistence ───────────────────────────────────────
-  const openApps = new Map();     // appId -> { id, type, config, handle }
+  const openApps = new Map();     // appId -> { id, type, config, handle, cleanups }
   let idSeq = 0;
   function genId(type) { return type + '-' + Date.now().toString(36) + '-' + (idSeq++).toString(36); }
 
@@ -140,11 +177,20 @@
     if (pendingSave) { pendingSave = false; persist(); }
   });
 
-  // Card closed via its × button → core emits card:removed; drop it from state.
+  // Card closed via its × button → core emits card:removed; run the card's
+  // cleanups (poll intervals etc.) and drop it from state.
   if (A.bus && typeof A.bus.on === 'function') {
+    // boards.js emits this just before snapshotting a board switch: flush the
+    // debounced save NOW and disarm the timer so it cannot fire after the
+    // board's keys are swapped and leak this board's apps into the next one.
+    A.bus.on('boards:will-switch', () => { clearTimeout(persistTimer); persist(); });
     A.bus.on('card:removed', ({ el }) => {
       const appId = el && el.dataset && el.dataset.atlAppId;
-      if (appId && openApps.has(appId)) { openApps.delete(appId); persist(); }
+      if (!appId || !openApps.has(appId)) return;
+      const rec = openApps.get(appId);
+      (rec.cleanups || []).forEach((fn) => { try { fn(); } catch { /* best effort */ } });
+      openApps.delete(appId);
+      persist();
     });
   }
 
@@ -161,193 +207,342 @@
   }
 
   // ── helpers ───────────────────────────────────────────────────────────────
+  // scheme -> as-is; ~ or / -> file://; localhost/IP[:port] -> http://;
+  // single token with a dot -> https://; anything else -> DDG search.
   function normalizeUrl(raw) {
     raw = (raw || '').trim();
     if (!raw) return '';
-    if (!/^https?:\/\//i.test(raw)) raw = 'https://' + raw;
-    try { return new URL(raw).href; } catch { return ''; }
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) || /^(about|data|mailto|file):/i.test(raw)) return raw;
+    if (raw[0] === '~' || raw[0] === '/') return 'file://' + raw;
+    if (/^(localhost|\d{1,3}(\.\d{1,3}){3})(:\d+)?([/?#].*)?$/i.test(raw)) return 'http://' + raw;
+    if (!/\s/.test(raw) && raw.includes('.')) return 'https://' + raw;
+    return 'https://duckduckgo.com/?q=' + encodeURIComponent(raw);
   }
 
-  function webviewSupported() {
-    // Electron's <webview> only works when the build sets webPreferences
-    // .webviewTag = true. This build does not, so detection falls back to iframe.
-    try {
-      if (typeof customElements !== 'undefined' && customElements.get('webview')) return true;
-      const el = document.createElement('webview');
-      return typeof el.loadURL === 'function' || typeof el.reload === 'function';
-    } catch { return false; }
+  function fmtHHMM(ts) {
+    if (ts == null || ts === '') return '';
+    const d = new Date(typeof ts === 'number' ? (ts > 1e12 ? ts : ts * 1000) : ts);
+    if (isNaN(d.getTime())) return '';
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
   }
+
+  function noteEl(text) {
+    const n = document.createElement('div');
+    n.className = 'atl-list-note';
+    n.textContent = text;
+    return n;
+  }
+
+  const INTERVAL_RE = /^\s*(\d+)\s*([smhd])\s*$/i;   // scheduler shorthand: 30s/30m/2h/1d
 
   // ── builders (function declarations so TYPES below can reference them) ─────
-  function buildNote(body, cfg, api) {
+  function buildNote(body, cfg, ctl) {
     body.classList.add('atl-note-body');
     const ta = document.createElement('textarea');
     ta.className = 'note-area';
     ta.placeholder = 'Write a note…';
     ta.value = cfg.text || '';
-    ta.addEventListener('input', () => api.setConfig({ text: ta.value }));
+    ta.addEventListener('input', () => ctl.setConfig({ text: ta.value }));
     body.appendChild(ta);
   }
 
-  function buildBrowser(body, cfg, api) {
+  // ponytail: no tabs, one page per card — tabs are the upgrade path; popups
+  // are denied by main in v1 (OAuth-in-browser-card needs routing later).
+  function buildBrowser(body, cfg, ctl) {
     body.classList.add('atl-browser-body');
-    const useWebview = webviewSupported();
 
     const bar = document.createElement('form');
     bar.className = 'atl-url-bar';
+    function toolBtn(label, title) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'atl-tool-btn';
+      b.textContent = label;
+      b.title = title;
+      return b;
+    }
+    const backBtn = toolBtn('‹', 'Back');
+    const fwdBtn = toolBtn('›', 'Forward');
+    const reloadBtn = toolBtn('⟳', 'Reload');
     const input = document.createElement('input');
     input.className = 'atl-url-input';
     input.type = 'text';
-    input.placeholder = 'Enter a URL…';
-    input.value = cfg.url || '';
-    const go = document.createElement('button');
-    go.type = 'submit';
-    go.className = 'atl-url-go';
-    go.textContent = 'Go';
-    bar.append(input, go);
+    input.placeholder = 'Search or enter a URL…';
+    const extBtn = toolBtn('↗', 'Open in default browser');
+    bar.append(backBtn, fwdBtn, reloadBtn, input, extBtn);
 
-    const note = document.createElement('div');
-    note.className = 'atl-frame-note';
+    const loadbar = document.createElement('div');
+    loadbar.className = 'atl-loadbar';
     const frameWrap = document.createElement('div');
     frameWrap.className = 'atl-frame-wrap';
+    body.append(bar, loadbar, frameWrap);
 
-    let frame;
-    if (useWebview) {
-      frame = document.createElement('webview');
-    } else {
-      frame = document.createElement('iframe');
-      frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
-      frame.setAttribute('referrerpolicy', 'no-referrer');
-    }
-    frame.className = 'atl-frame';
-    frameWrap.appendChild(frame);
+    const startUrl = cfg.url || HOME_URL;
 
-    function load(url) {
-      const u = normalizeUrl(url);
-      if (!u) return;
-      input.value = u;
-      if (useWebview) frame.setAttribute('src', u);
-      else frame.src = u;
-      note.textContent = useWebview
-        ? ''
-        : 'Rendered in an <iframe>. Sites that block embedding (X-Frame-Options) appear blank; a packaged Electron build with webviewTag can load any site.';
-      api.setConfig({ url: u });
+    // Try the real <webview>. Attributes must be set BEFORE insertion —
+    // Electron reads partition/useragent at attach time.
+    let wv = null;
+    if (window.atelier) {
+      const el = document.createElement('webview');
+      el.setAttribute('partition', 'persist:atelier-browser');
+      el.setAttribute('src', 'about:blank');
+      el.setAttribute('useragent', navigator.userAgent.replace(/\s*Electron\/\S+/i, ''));
+      el.setAttribute('webpreferences', 'autoplayPolicy=no-user-gesture-required');
+      el.className = 'atl-frame';
+      frameWrap.appendChild(el);
+      if (typeof el.loadURL === 'function') wv = el;   // webviewTag on → element upgraded
+      else el.remove();                                // webviewTag off → dead node; iframe below
     }
 
-    bar.addEventListener('submit', (e) => { e.preventDefault(); load(input.value); });
+    if (wv) {
+      // ── webview mode ──────────────────────────────────────────────────────
+      let attached = false;      // webview methods throw before the guest attaches
+      let queued = startUrl;     // first real URL loads on the first dom-ready
+      const call = (fn) => {     // guard EVERY method call + swallow ERR_ABORTED rejections
+        try {
+          const r = fn();
+          if (r && typeof r.catch === 'function') r.catch(() => {});
+          return r;
+        } catch { return undefined; }
+      };
 
-    body.append(bar, note, frameWrap);
+      wv.addEventListener('dom-ready', () => {
+        attached = true;
+        if (queued) { const u = queued; queued = null; call(() => wv.loadURL(u)); }
+      }, { once: true });
 
-    if (cfg.url) {
-      load(cfg.url);
+      function currentUrl() {
+        const u = attached ? call(() => wv.getURL()) : null;
+        return (u && u !== 'about:blank') ? u : (input.value || startUrl);
+      }
+      function syncNav() {
+        if (!attached) return;
+        const u = call(() => wv.getURL());
+        if (u && u !== 'about:blank') {
+          if (document.activeElement !== input) input.value = u;
+          ctl.setConfig({ url: u });
+        }
+        backBtn.disabled = !call(() => wv.canGoBack());
+        fwdBtn.disabled = !call(() => wv.canGoForward());
+      }
+      function load(u) {
+        if (!u) return;
+        ctl.setConfig({ url: u });
+        if (attached) call(() => wv.loadURL(u));
+        else queued = u;
+      }
+
+      wv.addEventListener('did-navigate', syncNav);
+      wv.addEventListener('did-navigate-in-page', syncNav);
+      wv.addEventListener('page-title-updated', (e) => { if (e.title) ctl.setTitle(e.title); });
+      wv.addEventListener('did-start-navigation', (e) => {
+        if (e.isMainFrame && !e.isInPlace) loadbar.classList.add('on');
+      });
+      wv.addEventListener('did-stop-loading', () => loadbar.classList.remove('on'));
+
+      backBtn.addEventListener('click', () => call(() => wv.goBack()));
+      fwdBtn.addEventListener('click', () => call(() => wv.goForward()));
+      reloadBtn.addEventListener('click', () => { if (attached) call(() => wv.reload()); });
+      extBtn.addEventListener('click', () => {
+        // window.open routes through main.js's setWindowOpenHandler for the
+        // main window, which hands http(s) URLs to shell.openExternal — this
+        // really opens the OS default browser in Electron.
+        const u = currentUrl();
+        if (u && u !== 'about:blank') window.open(u, '_blank', 'noopener');
+      });
+      bar.addEventListener('submit', (e) => { e.preventDefault(); load(normalizeUrl(input.value)); });
+
+      input.value = startUrl;
+      backBtn.disabled = true;
+      fwdBtn.disabled = true;
     } else {
-      note.textContent = useWebview
-        ? 'Enter a URL to load a site in a webview.'
-        : 'Enter a URL to load a site in an <iframe> (this build has webviewTag off).';
+      // ── iframe fallback (plain browser, or webviewTag off) ────────────────
+      const iframe = document.createElement('iframe');
+      iframe.className = 'atl-frame';
+      iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-popups');
+      iframe.setAttribute('referrerpolicy', 'no-referrer');
+      frameWrap.appendChild(iframe);
+
+      // Blank-iframe detection is unreliable cross-origin, so the escape hatch
+      // is always visible instead.
+      const hint = document.createElement('div');
+      hint.className = 'atl-frame-note';
+      hint.append(document.createTextNode('Iframe mode — sites that block embedding stay blank. '));
+      const escLink = document.createElement('a');
+      escLink.textContent = 'Open in browser';
+      escLink.target = '_blank';
+      escLink.rel = 'noopener noreferrer';
+      hint.appendChild(escLink);
+      body.insertBefore(hint, frameWrap);
+
+      let current = '';
+      function load(u) {
+        if (!u) return;
+        current = u;
+        iframe.src = u;
+        escLink.href = u;
+        if (document.activeElement !== input) input.value = u;
+        ctl.setConfig({ url: u });
+        loadbar.classList.add('on');
+      }
+      iframe.addEventListener('load', () => loadbar.classList.remove('on'));
+
+      // Cross-origin frames refuse history access; best effort only.
+      backBtn.addEventListener('click', () => { try { iframe.contentWindow.history.back(); } catch { /* cross-origin */ } });
+      fwdBtn.addEventListener('click', () => { try { iframe.contentWindow.history.forward(); } catch { /* cross-origin */ } });
+      reloadBtn.addEventListener('click', () => { if (current) iframe.src = current; });
+      extBtn.addEventListener('click', () => { if (current) window.open(current, '_blank', 'noopener'); });
+      bar.addEventListener('submit', (e) => { e.preventDefault(); load(normalizeUrl(input.value)); });
+
+      load(startUrl);
     }
   }
 
-  function buildList(body, noteText, items) {
+  function buildHistory(body, cfg, ctl) {
     body.classList.add('atl-list-body');
-    const n = document.createElement('div');
-    n.className = 'atl-list-note';
-    n.textContent = noteText;
-    body.appendChild(n);
-    items.forEach((it) => {
-      const row = document.createElement('div');
-      row.className = 'atl-row';
-      const main = document.createElement('div');
-      main.className = 'atl-row-main';
-      const t = document.createElement('div');
-      t.className = 'atl-row-title';
-      t.textContent = it.title;
-      const s = document.createElement('div');
-      s.className = 'atl-row-sub';
-      s.textContent = it.sub;
-      main.append(t, s);
-      const pill = document.createElement('span');
-      pill.className = 'atl-pill ' + it.status;
-      pill.textContent = it.statusLabel || it.status;
-      row.append(main, pill);
-      body.appendChild(row);
-    });
+    const host = document.createElement('div');
+    body.appendChild(host);
+
+    function render(runs, notifications) {
+      host.textContent = '';
+      if (!runs.length) {
+        host.appendChild(noteEl('No runs yet — the scheduler ledger is empty.'));
+      } else {
+        // the ledger tail arrives oldest-first → show newest first
+        runs.slice().reverse().forEach((r) => {
+          const row = document.createElement('div');
+          row.className = 'atl-row';
+          const dot = document.createElement('span');
+          dot.className = 'atl-dot ' + (r.status === 'ok' ? 'ok' : 'bad');
+          const main = document.createElement('div');
+          main.className = 'atl-row-main';
+          const t = document.createElement('div');
+          t.className = 'atl-row-title';
+          t.textContent = r.name || '(unnamed)';
+          const bits = [fmtHHMM(r.ts)];
+          if (r.latency_ms != null) bits.push(r.latency_ms + ' ms');
+          if (r.tokens != null) bits.push(r.tokens + ' tok');
+          const s = document.createElement('div');
+          s.className = 'atl-row-sub';
+          s.textContent = bits.filter(Boolean).join(' · ');
+          main.append(t, s);
+          row.append(dot, main);
+          host.appendChild(row);
+        });
+      }
+      if (notifications.length) {
+        const h = document.createElement('div');
+        h.className = 'atl-sec-head';
+        h.textContent = 'Notifications';
+        host.appendChild(h);
+        notifications.slice().reverse().forEach((n) => {
+          const line = document.createElement('div');
+          line.className = 'atl-notif-line';
+          line.textContent = (n.name || '(unnamed)') + ': ' + (n.error || n.status || '');
+          host.appendChild(line);
+        });
+      }
+    }
+
+    async function refresh() {
+      try {
+        const [rd, nd] = await Promise.all([
+          api('/runs?limit=15'),
+          api('/notifications?limit=5'),
+        ]);
+        render((rd && rd.runs) || [], (nd && nd.notifications) || []);
+      } catch {
+        host.textContent = '';
+        host.appendChild(noteEl('Backend offline — the run ledger is unreachable.'));
+      }
+    }
+
+    refresh();
+    const timer = setInterval(refresh, 20000);
+    ctl.onRemove(() => clearInterval(timer));
   }
 
   function buildWorkflow(body) {
-    buildList(body, 'Sample jobs — reads the Atelier scheduler when connected.', [
-      { title: 'Weekly research digest', sub: 'Mon 09:00 · research → gate → publish', status: 'scheduled' },
-      { title: 'Product launch campaign', sub: 'every 6h · draft → review gate', status: 'running' },
-      { title: 'Short-form clip batch', sub: 'daily 18:00 · render → gate → post', status: 'paused' },
-    ]);
+    body.classList.add('atl-list-body');
+    const host = document.createElement('div');
+    host.appendChild(noteEl('Loading jobs…'));
+    const foot = document.createElement('div');
+    foot.className = 'atl-foot';
+    body.append(host, foot);
+
+    api('/jobs').then((data) => {
+      host.textContent = '';
+      const jobs = (data && data.jobs) || [];
+      if (data && data.error) host.appendChild(noteEl(String(data.error)));
+      if (!jobs.length) {
+        if (!(data && data.error)) host.appendChild(noteEl('No scheduled jobs.'));
+      } else {
+        jobs.forEach((j) => {
+          const row = document.createElement('div');
+          row.className = 'atl-row';
+          const main = document.createElement('div');
+          main.className = 'atl-row-main';
+          const t = document.createElement('div');
+          t.className = 'atl-row-title';
+          t.textContent = j.name || '(unnamed)';
+          const s = document.createElement('div');
+          s.className = 'atl-row-sub';
+          const excerpt = String(j.prompt || '').slice(0, 80);
+          s.textContent = excerpt + (j.agent ? ' · ' + j.agent : '');
+          main.append(t, s);
+          const pill = document.createElement('span');
+          pill.className = 'atl-pill';
+          pill.textContent = String(j.schedule || '');
+          row.append(main, pill);
+          host.appendChild(row);
+        });
+      }
+      foot.textContent = (data && data.file) ? String(data.file) : '';
+    }).catch(() => {
+      host.textContent = '';
+      host.appendChild(noteEl('Backend offline — jobs unavailable.'));
+    });
   }
 
-  function buildHistory(body) {
-    buildList(body, 'Sample sessions — will read the run ledger when connected.', [
-      { title: 'Metrics board refresh', sub: '2m ago · session #204', status: 'done' },
-      { title: 'Landing copy — 3 variants', sub: '1h ago · session #203', status: 'done' },
-      { title: 'Competitor teardown research', sub: 'yesterday · session #201', status: 'done' },
-      { title: 'Newsletter campaign', sub: '2d ago · session #198', status: 'gated' },
-    ]);
-  }
+  // ponytail: a readable schedule list, not a month grid — grid is decoration
+  // until jobs carry dates.
+  function buildCalendar(body) {
+    body.classList.add('atl-list-body');
+    const host = document.createElement('div');
+    host.appendChild(noteEl('Loading schedule…'));
+    body.appendChild(host);
 
-  function buildCalendar(body, cfg, api) {
-    body.classList.add('atl-cal-body');
-    const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
-      'July', 'August', 'September', 'October', 'November', 'December'];
-    const DOW = ['S', 'M', 'T', 'W', 'T', 'F', 'S'];
-
-    const head = document.createElement('div');
-    head.className = 'atl-cal-head';
-    const prev = document.createElement('button');
-    prev.type = 'button'; prev.className = 'atl-cal-nav'; prev.textContent = '‹';
-    const titleEl = document.createElement('div');
-    titleEl.className = 'atl-cal-title';
-    const next = document.createElement('button');
-    next.type = 'button'; next.className = 'atl-cal-nav'; next.textContent = '›';
-    head.append(prev, titleEl, next);
-
-    const grid = document.createElement('div');
-    grid.className = 'atl-cal-grid';
-    body.append(head, grid);
-
-    function render() {
-      const now = new Date();
-      const base = new Date(now.getFullYear(), now.getMonth() + (cfg.monthOffset || 0), 1);
-      const y = base.getFullYear(), m = base.getMonth();
-      titleEl.textContent = MONTHS[m] + ' ' + y;
-      grid.innerHTML = '';
-      DOW.forEach((d) => {
-        const c = document.createElement('div');
-        c.className = 'atl-cal-dow'; c.textContent = d;
-        grid.appendChild(c);
+    api('/jobs').then((data) => {
+      host.textContent = '';
+      const jobs = (data && data.jobs) || [];
+      if (!jobs.length) {
+        host.appendChild(noteEl((data && data.error) ? String(data.error) : 'No scheduled jobs.'));
+        return;
+      }
+      jobs.forEach((j) => {
+        const line = document.createElement('div');
+        line.className = 'atl-sched-row';
+        const name = j.name || '(unnamed)';
+        const sched = String(j.schedule || '');
+        const m = INTERVAL_RE.exec(sched);
+        line.textContent = m
+          ? name + ' — every ' + m[1] + m[2].toLowerCase()
+          : name + ' — cron ' + sched;
+        host.appendChild(line);
       });
-      const firstDay = new Date(y, m, 1).getDay();
-      const days = new Date(y, m + 1, 0).getDate();
-      for (let i = 0; i < firstDay; i++) {
-        const b = document.createElement('div');
-        b.className = 'atl-cal-cell blank';
-        grid.appendChild(b);
-      }
-      for (let d = 1; d <= days; d++) {
-        const c = document.createElement('div');
-        c.className = 'atl-cal-cell'; c.textContent = String(d);
-        if (y === now.getFullYear() && m === now.getMonth() && d === now.getDate()) c.classList.add('today');
-        grid.appendChild(c);
-      }
-    }
-
-    prev.addEventListener('click', () => { cfg.monthOffset = (cfg.monthOffset || 0) - 1; api.setConfig({ monthOffset: cfg.monthOffset }); render(); });
-    next.addEventListener('click', () => { cfg.monthOffset = (cfg.monthOffset || 0) + 1; api.setConfig({ monthOffset: cfg.monthOffset }); render(); });
-    render();
+    }).catch(() => {
+      host.textContent = '';
+      host.appendChild(noteEl('Backend offline — schedule unavailable.'));
+    });
   }
 
   // ── type table ────────────────────────────────────────────────────────────
   const TYPES = {
     note:     { label: 'Note', icon: '🗒', title: 'Note', w: 300, h: 240, defaultConfig: { text: '' }, build: buildNote },
-    browser:  { label: 'Browser', icon: '🌐', title: 'Browser', w: 480, h: 380, defaultConfig: { url: '' }, build: buildBrowser },
+    browser:  { label: 'Browser', icon: '🌐', title: 'Browser', w: 520, h: 420, defaultConfig: { url: '' }, build: buildBrowser },
     workflow: { label: 'Workflow', icon: '↺', title: 'Workflow', w: 380, h: 290, defaultConfig: {}, build: buildWorkflow },
-    calendar: { label: 'Calendar', icon: '🗓', title: 'Calendar', w: 320, h: 330, defaultConfig: { monthOffset: 0 }, build: buildCalendar },
-    history:  { label: 'History', icon: '🕘', title: 'History', w: 380, h: 300, defaultConfig: {}, build: buildHistory },
+    calendar: { label: 'Calendar', icon: '🗓', title: 'Calendar', w: 340, h: 280, defaultConfig: {}, build: buildCalendar },
+    history:  { label: 'History', icon: '🕘', title: 'History', w: 380, h: 320, defaultConfig: {}, build: buildHistory },
   };
 
   // ── spawn (also the registered create() path) ─────────────────────────────
@@ -368,8 +563,16 @@
     const shell = cardShell(def.title);
     shell.card.dataset.atlAppId = appId;
 
-    const api = { setConfig(patch) { Object.assign(cfg, patch); persistDebounced(); } };
-    def.build(shell.body, cfg, api);
+    const cleanups = [];
+    const ctl = {
+      setConfig(patch) { Object.assign(cfg, patch); persistDebounced(); },
+      setTitle(text) {
+        const t = shell.card.querySelector('.card-title');
+        if (t) t.textContent = String(text);
+      },
+      onRemove(fn) { cleanups.push(fn); },
+    };
+    def.build(shell.body, cfg, ctl);
 
     const rect = opts.rect || {};
     let x, y;
@@ -380,7 +583,7 @@
     const h = rect.h || def.h;
 
     const handle = A.canvas.addCard(shell.card, { x, y, w, h });
-    openApps.set(appId, { id: appId, type, config: cfg, handle });
+    openApps.set(appId, { id: appId, type, config: cfg, handle, cleanups });
     persist();
     return handle;
   }
@@ -437,6 +640,9 @@
     console.assert(Array.isArray(stored), '[apps] store key atelier.apps is not an array');
     const dock = document.querySelectorAll('.dock-btn');
     console.assert(dock.length >= 6, '[apps] expected 6 dock buttons, got', dock.length);
+    console.assert(normalizeUrl('example.com') === 'https://example.com', '[apps] normalizeUrl token+dot failed');
+    console.assert(normalizeUrl('localhost:8765') === 'http://localhost:8765', '[apps] normalizeUrl localhost failed');
+    console.assert(normalizeUrl('hello world') === 'https://duckduckgo.com/?q=hello%20world', '[apps] normalizeUrl search failed');
     if (!missing.length && Array.isArray(stored) && dock.length >= 6) {
       console.log('[apps] self-check passed — 5 app types registered, dock wired, store ok.');
     }

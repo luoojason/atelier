@@ -133,5 +133,8 @@
     <script defer src="app/apps.js"></script>
     <script defer src="app/palette.js"></script>
     <script defer src="app/customization.js"></script>
+    <!-- boards.js loads last: it snapshot-swaps the other modules' state. A
+         missing file 404s harmlessly under defer and must not break boot. -->
+    <script defer src="app/boards.js"></script>
   </body>
 </html>
