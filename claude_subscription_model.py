@@ -356,44 +356,97 @@ def _tool_call_from_str(s: str) -> dict | None:
     return _tool_call_from_obj(obj)
 
 
-def parse_result(result_text: str | None) -> dict:
+def _iter_embedded_objects(text: str):
+    """Yield top-level JSON objects found anywhere in ``text`` (fenced or bare)."""
+    dec = json.JSONDecoder()
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "{":
+            try:
+                obj, end = dec.raw_decode(text, i)
+                yield obj
+                i = end
+                continue
+            except ValueError:
+                pass
+        i += 1
+
+
+def _find_named_tool_call(text: str, valid_names) -> dict | None:
+    """First tool_call whose ``name`` is in ``valid_names``, scanning fenced
+    blocks first (the instructed shape) then any embedded object. Gating on the
+    real tool names is what lets a fenced call survive a natural lead-in
+    ("Let me read X:\\n```json {tool_call}```") while an example/protocol mention
+    (name "x"/"demo", or a non-tool name) stays text."""
+    chunks = [m.group(1) for m in _FENCE_RE.finditer(text)]
+    chunks.append(text)
+    for chunk in chunks:
+        for obj in _iter_embedded_objects(chunk):
+            tc = _tool_call_from_obj(obj)
+            if tc and tc["name"] in valid_names:
+                return tc
+    return None
+
+
+def parse_result(result_text: str | None, valid_names=None) -> dict:
     """Classify a CLI result as a tool call or plain text.
 
     Returns either ``{"kind": "tool_call", "name": ..., "arguments": {...}}`` or
     ``{"kind": "text", "text": ...}``.
 
-    A tool call is recognized ONLY when it is the *sole* content of the reply:
-    either a lone fenced block, or bare tool_call JSON with nothing else. The
-    bridge protocol instructs the model to emit exactly that, so this stays
-    faithful to real calls while refusing to misfire on prose that merely
-    *mentions* or *explains* the ``{"tool_call": ...}`` shape (e.g. "the format
-    would be {...} normally", or an example fenced block surrounded by prose).
-    Scanning for a tool_call embedded anywhere in prose was the source of those
-    false positives, so it is deliberately not done.
+    Sole-content tool calls (a lone fenced block, or bare tool_call JSON) are
+    always honored. When ``valid_names`` is provided (the real tool + handoff
+    names, passed by ``get_response``), a tool call embedded ANYWHERE — including
+    after a lead-in sentence — is honored too, but ONLY if its name is a real
+    tool. That name gate is what keeps prose that merely *mentions* or *shows an
+    example of* the ``{"tool_call": ...}`` shape (name "x"/"demo") from
+    misfiring, while fixing the real-world "Let me read X:\\n```...```" pattern
+    that a sole-content-only rule silently dropped. With ``valid_names=None`` the
+    strict sole-content behavior is preserved.
     """
     text = result_text or ""
     stripped = text.strip()
 
-    # 1. A lone fenced block: the entire (trimmed) reply is a single ```...```
-    #    block and nothing else.
+    # 1. A lone fenced block: the entire (trimmed) reply is a single fence.
     m = _FENCE_RE.fullmatch(stripped)
     if m:
         inner = m.group(1).strip()
         tc = _tool_call_from_str(inner)
-        if tc:
+        if tc and (valid_names is None or tc["name"] in valid_names):
             return {"kind": "tool_call", **tc}
-        # A lone fence that is not a tool call is structured output; unwrap it so
-        # the JSON survives the round-trip cleanly.
+        # A lone fence that is not a (valid) tool call is structured output;
+        # unwrap it so the JSON survives the round-trip cleanly.
         return {"kind": "text", "text": inner}
 
     # 2. The entire (trimmed) reply is bare tool_call JSON (no fence).
     tc = _tool_call_from_str(stripped)
-    if tc:
+    if tc and (valid_names is None or tc["name"] in valid_names):
         return {"kind": "tool_call", **tc}
 
-    # Otherwise plain text — including prose that happens to contain a tool_call
-    # shaped object, which must NOT be treated as a call.
+    # 3. Name-gated embedded scan: a call to a REAL tool anywhere in the reply
+    #    (e.g. preceded by a lead-in sentence). Only runs when names are known.
+    if valid_names:
+        tc = _find_named_tool_call(text, valid_names)
+        if tc:
+            return {"kind": "tool_call", **tc}
+
+    # Otherwise plain text.
     return {"kind": "text", "text": stripped}
+
+
+def _valid_call_names(tools, handoffs) -> set:
+    """The set of names the model may legitimately call: SDK function tools plus
+    handoff transfer tools. Used to gate embedded tool-call detection."""
+    names: set = set()
+    for t in tools or []:
+        n = getattr(t, "name", None)
+        if isinstance(n, str) and n:
+            names.add(n)
+    for h in handoffs or []:
+        n = getattr(h, "tool_name", None) or getattr(h, "name", None)
+        if isinstance(n, str) and n:
+            names.add(n)
+    return names
 
 
 def map_usage(cli_usage: dict | None) -> dict:
@@ -650,7 +703,7 @@ class ClaudeSubscriptionModel(_ModelBase):  # type: ignore[misc,valid-type]
             handoffs,
             model_settings,
         )
-        parsed = parse_result(cli_data.get("result", ""))
+        parsed = parse_result(cli_data.get("result", ""), _valid_call_names(tools, handoffs))
         output = self._build_output_items(parsed)
         usage = self._build_usage(cli_data)
         return ModelResponse(

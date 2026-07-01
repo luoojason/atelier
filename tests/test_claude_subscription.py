@@ -239,6 +239,45 @@ def test_parse_result():
     check("lone enclosing fence unwrapped", r7["kind"] == "text" and r7["text"] == '{"answer": "yes"}')
 
 
+# ── pure: parse_result name-gated (lead-in + fenced real tool call) ───────────
+
+
+def test_parse_result_name_gated():
+    print("parse_result (name-gated embedded)")
+    names = {"VaultRead", "VaultSearch"}
+
+    # The real-world regression: a lead-in sentence then a fenced call to a REAL
+    # tool must fire (a sole-content-only rule silently dropped this).
+    lead_in = 'Let me read the note.\n```json\n{"tool_call": {"name": "VaultRead", "arguments": {"note": "x.md"}}}\n```'
+    r = csm.parse_result(lead_in, names)
+    assert r["kind"] == "tool_call" and r["name"] == "VaultRead", r
+    assert r["arguments"] == {"note": "x.md"}, r
+
+    # Same shape but the name is NOT a real tool -> stays text (example/protocol).
+    r2 = csm.parse_result(lead_in.replace("VaultRead", "demo"), names)
+    assert r2["kind"] == "text", r2
+
+    # Bare tool_call-shaped object embedded in prose with an example name -> text.
+    echo = 'I have no matching tool. The format is {"tool_call": {"name": "x", "arguments": {}}} normally.'
+    assert csm.parse_result(echo, names)["kind"] == "text"
+
+    # But a bare call to a REAL tool in prose is honored (name-gated).
+    r3 = csm.parse_result('Sure. {"tool_call": {"name": "VaultSearch", "arguments": {"query": "q"}}}', names)
+    assert r3["kind"] == "tool_call" and r3["name"] == "VaultSearch", r3
+
+    # Backward compat: without valid_names, the strict sole-content rule holds,
+    # so an embedded call is NOT fired.
+    assert csm.parse_result(lead_in)["kind"] == "text"
+
+    # _valid_call_names gathers tool + handoff names defensively.
+    class _T:  # noqa: D401
+        def __init__(self, n): self.name = n
+    class _H:
+        def __init__(self, n): self.tool_name = n
+    got = csm._valid_call_names([_T("A"), _T("")], [_H("transfer_to_B")])
+    assert got == {"A", "transfer_to_B"}, got
+
+
 # ── pure: map_usage ───────────────────────────────────────────────────────────
 
 
@@ -653,6 +692,7 @@ def main():
     test_build_system_prompt()
     test_serialize_input()
     test_parse_result()
+    test_parse_result_name_gated()
     test_map_usage()
     test_run_cli_argv()
     test_tool_call_arguments_json_string()
