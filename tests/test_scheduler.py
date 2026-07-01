@@ -19,7 +19,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from scheduler import client
+from scheduler import client, retry, run_store
 from scheduler.jobs_core import (
     _parse_scalar,
     _tiny_yaml_load,
@@ -393,6 +393,29 @@ def test_send_reports_http_error():
 
 
 # --------------------------------------------------------------------------- #
+# client.summarize_response — cost retention
+# --------------------------------------------------------------------------- #
+
+
+def test_summarize_response_keeps_cost_when_present():
+    # Cost is kept under whichever key the provider used, alongside tokens.
+    for key in ("cost", "cost_usd", "total_cost"):
+        payload = {"response": "hi", "usage": {"total_tokens": 10, key: 0.0042}}
+        summary = client.summarize_response(200, payload)
+        assert summary["total_tokens"] == 10
+        assert summary["cost"] == 0.0042, key
+    # No cost key -> no cost field (tokens still kept).
+    plain = client.summarize_response(200, {"usage": {"total_tokens": 7}})
+    assert plain["total_tokens"] == 7
+    assert "cost" not in plain
+    # First matching key wins when several are present.
+    multi = client.summarize_response(
+        200, {"usage": {"total_tokens": 1, "cost": 0.1, "total_cost": 0.9}}
+    )
+    assert multi["cost"] == 0.1
+
+
+# --------------------------------------------------------------------------- #
 # format_run_line
 # --------------------------------------------------------------------------- #
 
@@ -417,20 +440,357 @@ def test_make_runner_logs_success(tmp_path=None):
 
     import scheduler.scheduler as sched
 
-    fake = _FakeClient(_FakeResponse(200, {"response": "hi"}))
+    fake = _FakeClient(
+        _FakeResponse(
+            200,
+            {"response": "hi", "usage": {"total_tokens": 12, "cost": 0.003}},
+        )
+    )
     original_send = client.send
+    saved_env = os.environ.get("SWARM_RUNS_JSONL")
     # patch client.send used inside scheduler.client to use our fake
     sched.client.send = lambda *a, **k: original_send(*a, client=fake, **k)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "runs.log"
+            ledger_path = Path(tmp) / "runs.jsonl"
+            # Point the structured ledger at the temp dir so the runner does not
+            # write to the real ~/.openswarm during tests.
+            os.environ["SWARM_RUNS_JSONL"] = str(ledger_path)
             job = {"name": "t", "schedule": "30m", "prompt": "hi"}
             runner = sched.make_runner(job, "http://h:8080", "open-swarm", None, log_path)
             runner()
+
+            # 1) the human-readable run log line is still written
             text = log_path.read_text()
             assert "\tt\tok\thi" in text, text
+
+            # 2) the structured ledger got a matching record
+            records = run_store.read_records(str(ledger_path))
+            assert len(records) == 1, records
+            rec = records[0]
+            assert rec["name"] == "t"
+            assert rec["status"] == "ok"
+            assert rec["status_code"] == 200
+            assert rec["tokens"] == 12
+            assert rec["cost"] == 0.003
+            assert rec["attempts"] == 1
+            assert rec["error"] is None
+            assert rec["response_excerpt"] == "hi"
+            assert isinstance(rec["latency_ms"], int) and rec["latency_ms"] >= 0
     finally:
         sched.client.send = original_send
+        if saved_env is None:
+            os.environ.pop("SWARM_RUNS_JSONL", None)
+        else:
+            os.environ["SWARM_RUNS_JSONL"] = saved_env
+
+
+def test_make_runner_retries_then_records_attempts(tmp_path=None):
+    # A connection error on the first two fires, success on the third: the run
+    # should be logged ok with attempts=3. make_runner does not thread a sleep
+    # into send_with_retry, so we replace time.sleep with a recording no-op spy;
+    # because send_with_retry resolves its sleep lazily this patch actually
+    # reaches it (a def-time default would silently ignore it and the test would
+    # really wait ~3.6s). We then assert the spy was used, so the test is fast
+    # AND proves the retries were exercised without real waiting.
+    import tempfile
+    from pathlib import Path
+
+    import scheduler.scheduler as sched
+
+    calls = {"n": 0}
+
+    def flaky_send(*a, **k):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ConnectionError("connection reset")
+        return {"ok": True, "status_code": 200, "response": "done", "total_tokens": 5}
+
+    slept = []
+    original_send = client.send
+    saved_env = os.environ.get("SWARM_RUNS_JSONL")
+    saved_sleep = retry.time.sleep
+    sched.client.send = flaky_send
+    retry.time.sleep = lambda seconds: slept.append(seconds)  # record, never wait
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "runs.log"
+            ledger_path = Path(tmp) / "runs.jsonl"
+            os.environ["SWARM_RUNS_JSONL"] = str(ledger_path)
+            job = {"name": "flaky", "schedule": "30m", "prompt": "hi"}
+            runner = sched.make_runner(job, "http://h:8080", "open-swarm", None, log_path)
+            runner()
+
+            assert calls["n"] == 3, calls
+            # The patched sleep really reached send_with_retry: one backoff per
+            # retry (2 for 3 attempts). If this is empty, the injectable-sleep
+            # rule regressed and the suite would be waiting for real seconds.
+            assert len(slept) == 2, slept
+            assert all(s >= 0 for s in slept)
+            records = run_store.read_records(str(ledger_path))
+            assert len(records) == 1, records
+            assert records[0]["status"] == "ok"
+            assert records[0]["attempts"] == 3
+            assert records[0]["error"] is None
+    finally:
+        sched.client.send = original_send
+        retry.time.sleep = saved_sleep
+        if saved_env is None:
+            os.environ.pop("SWARM_RUNS_JSONL", None)
+        else:
+            os.environ["SWARM_RUNS_JSONL"] = saved_env
+
+
+# --------------------------------------------------------------------------- #
+# run_store — build_record / append+read round-trip / rotation
+# --------------------------------------------------------------------------- #
+
+
+def test_build_record_shape():
+    rec = run_store.build_record(
+        name="job1",
+        ts="2026-07-01T09:00:00",
+        status="ok",
+        status_code=200,
+        tokens=42,
+        cost=0.01,
+        latency_ms=1234,
+        attempts=2,
+        error=None,
+        response_excerpt="hello world",
+    )
+    assert set(rec) == set(run_store.RECORD_FIELDS)
+    assert rec["name"] == "job1"
+    assert rec["ts"] == "2026-07-01T09:00:00"
+    assert rec["status"] == "ok"
+    assert rec["status_code"] == 200
+    assert rec["tokens"] == 42
+    assert rec["cost"] == 0.01
+    assert rec["latency_ms"] == 1234
+    assert rec["attempts"] == 2
+    assert rec["error"] is None
+    assert rec["response_excerpt"] == "hello world"
+
+
+def test_build_record_truncates_excerpt():
+    long_text = "x" * 5000
+    rec = run_store.build_record(
+        "j", "T", "ok", 200, None, None, 0, 1, None, long_text
+    )
+    assert len(rec["response_excerpt"]) == run_store.EXCERPT_MAX_CHARS
+    # None excerpt stays None (not the string "None")
+    rec_none = run_store.build_record("j", "T", "ok", 200, None, None, 0, 1, None, None)
+    assert rec_none["response_excerpt"] is None
+
+
+def test_append_and_read_records_round_trip():
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Nested subdir must be created by append_record.
+        path = str(Path(tmp) / "nested" / "runs.jsonl")
+        assert run_store.read_records(path) == []  # missing file -> []
+
+        recs = [
+            run_store.build_record(f"j{i}", "T", "ok", 200, i, None, 1, 1, None, "r")
+            for i in range(3)
+        ]
+        for rec in recs:
+            run_store.append_record(path, rec)
+
+        back = run_store.read_records(path)
+        assert back == recs, back
+        # limit keeps the most recent N; limit<=0 -> []
+        assert run_store.read_records(path, limit=2) == recs[-2:]
+        assert run_store.read_records(path, limit=0) == []
+
+
+def test_rotate_if_needed_tiny_max_bytes():
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "runs.jsonl")
+        rec = run_store.build_record("j", "T", "ok", 200, 1, None, 1, 1, None, "r")
+        run_store.append_record(path, rec)
+
+        # Below threshold: no rotation.
+        assert run_store.rotate_if_needed(path, max_bytes=10_000) is False
+        assert Path(path).exists()
+        assert not Path(path + ".1").exists()
+
+        # Tiny threshold: the existing file trips it and is moved aside.
+        assert run_store.rotate_if_needed(path, max_bytes=1) is True
+        assert not Path(path).exists()
+        assert Path(path + ".1").exists()
+
+        # A fresh append recreates the live file; the next read sees only it.
+        run_store.append_record(path, rec)
+        assert run_store.read_records(path) == [rec]
+
+        # Missing file rotates to nothing.
+        missing = str(Path(tmp) / "absent.jsonl")
+        assert run_store.rotate_if_needed(missing, max_bytes=1) is False
+
+
+# --------------------------------------------------------------------------- #
+# retry — should_retry matrix / send_with_retry backoff
+# --------------------------------------------------------------------------- #
+
+
+def test_should_retry_matrix():
+    # Pre-response failures retry; anything that reached the server does not.
+    assert retry.should_retry(0, None) is True
+    assert retry.should_retry(429, None) is True
+    for status in (400, 403, 404, 500, 502, 503):
+        assert retry.should_retry(status, None) is False, status
+    # 200 is a success, not retried.
+    assert retry.should_retry(200, None) is False
+    # A connect-phase failure never reached the server, so it is safe to retry.
+    assert retry.should_retry(0, ConnectionError("reset")) is True
+    # A timeout may mean the request was already sent (and its side effect fired),
+    # so it is NOT retried regardless of the status arg. This is the double-fire
+    # guard: a long upload that trips a read timeout must not be replayed.
+    assert retry.should_retry(0, TimeoutError("slow")) is False
+    assert retry.should_retry(500, TimeoutError("slow")) is False
+
+
+def test_should_retry_distinguishes_httpx_timeout_phases():
+    # Exercised with the real httpx exception hierarchy when it is importable
+    # (the daemon uses httpx). Connect-phase failures replay; read/write-phase
+    # failures do not, because the request already reached the server.
+    try:
+        import httpx
+    except ImportError:
+        print("NOTE: skipping httpx phase test (httpx unavailable)")
+        return
+
+    req = httpx.Request("POST", "http://h:8080/x")
+    # Connect-phase: the connection was never established -> safe to retry.
+    assert retry.should_retry(0, httpx.ConnectError("no route", request=req)) is True
+    assert retry.should_retry(0, httpx.ConnectTimeout("slow connect", request=req)) is True
+    assert retry.should_retry(0, httpx.PoolTimeout("no free conn", request=req)) is True
+    # Read/write-phase: the request reached the server -> must NOT be retried
+    # (this is the exact ReadTimeout that would otherwise double an upload).
+    assert retry.should_retry(0, httpx.ReadTimeout("slow read", request=req)) is False
+    assert retry.should_retry(0, httpx.WriteTimeout("slow write", request=req)) is False
+    assert retry.should_retry(0, httpx.RemoteProtocolError("server spoke", request=req)) is False
+
+
+def test_send_with_retry_does_not_retry_read_timeout():
+    # A ReadTimeout means the request reached the server: send_with_retry must
+    # call exactly once and never sleep, then report a synthesized error dict.
+    try:
+        import httpx
+    except ImportError:
+        print("NOTE: skipping read-timeout retry test (httpx unavailable)")
+        return
+
+    req = httpx.Request("POST", "http://h:8080/x")
+    calls = {"n": 0}
+    sleeps = []
+
+    def upload_that_read_times_out():
+        calls["n"] += 1
+        raise httpx.ReadTimeout("upload exceeded client timeout", request=req)
+
+    result, attempts = retry.send_with_retry(
+        upload_that_read_times_out,
+        max_retries=3,
+        base_delay=1.0,
+        sleep=sleeps.append,
+        rand=lambda: 0.0,
+    )
+    assert calls["n"] == 1, calls  # fired once, NOT re-fired
+    assert attempts == 1
+    assert sleeps == []
+    assert result["ok"] is False
+    assert result["status_code"] == 0
+    assert "timeout" in result["error"].lower()
+
+
+def test_send_with_retry_fails_twice_then_succeeds():
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ConnectionError("boom")
+        return {"ok": True, "status_code": 200, "response": "done"}
+
+    sleeps = []
+    result, attempts = retry.send_with_retry(
+        flaky,
+        max_retries=2,
+        base_delay=0.5,
+        sleep=sleeps.append,
+        rand=lambda: 0.0,  # kill the jitter for a deterministic delay
+    )
+    assert calls["n"] == 3  # 1 initial + 2 retries
+    assert attempts == 3
+    assert result["ok"] is True
+    assert result["response"] == "done"
+    # Deterministic exponential backoff: 0.5 * 2**0, then 0.5 * 2**1.
+    assert sleeps == [0.5, 1.0], sleeps
+
+
+def test_send_with_retry_caps_at_max_retries():
+    # Always failing with a retryable (connect-phase) error: capped at
+    # 1 + max_retries calls, returns a synthesized error dict (never raises)
+    # with the total attempt count.
+    calls = {"n": 0}
+
+    def always_fail():
+        calls["n"] += 1
+        raise ConnectionError("nope")
+
+    result, attempts = retry.send_with_retry(
+        always_fail, max_retries=2, base_delay=1.0, sleep=lambda *_a: None, rand=lambda: 0.0
+    )
+    assert calls["n"] == 3
+    assert attempts == 3
+    assert result["ok"] is False
+    assert result["status_code"] == 0
+    assert "nope" in result["error"]
+
+
+def test_send_with_retry_does_not_retry_5xx():
+    # A 5xx reached the server (a side effect may have fired): return at once,
+    # exactly one call, no sleeps.
+    calls = {"n": 0}
+    sleeps = []
+
+    def server_error():
+        calls["n"] += 1
+        return {"ok": False, "status_code": 500, "error": "boom"}
+
+    result, attempts = retry.send_with_retry(
+        server_error, max_retries=3, base_delay=1.0, sleep=sleeps.append, rand=lambda: 0.0
+    )
+    assert calls["n"] == 1
+    assert attempts == 1
+    assert sleeps == []
+    assert result["status_code"] == 500
+
+
+def test_send_with_retry_retries_429_result():
+    # A 429 comes back as a result dict (not an exception) and is retried.
+    calls = {"n": 0}
+
+    def rate_limited():
+        calls["n"] += 1
+        if calls["n"] < 2:
+            return {"ok": False, "status_code": 429}
+        return {"ok": True, "status_code": 200, "response": "ok"}
+
+    result, attempts = retry.send_with_retry(
+        rate_limited, max_retries=3, base_delay=1.0, sleep=lambda *_a: None, rand=lambda: 0.0
+    )
+    assert calls["n"] == 2
+    assert attempts == 2
+    assert result["ok"] is True
 
 
 def _run_all():

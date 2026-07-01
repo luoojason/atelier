@@ -17,17 +17,28 @@ Configuration (all via environment):
     SWARM_APP_TOKEN   bearer token for the server  (falls back to APP_TOKEN;
                                                     omit if the server has no token)
     SWARM_RUNS_LOG    append-only run log path     (default: scheduler/runs.log)
+    SWARM_RUNS_JSONL  structured JSONL ledger path  (default: ~/.openswarm/runs.jsonl)
+    SWARM_RUNS_JSONL_MAX_BYTES  ledger rotation size (default: 5242880 = 5 MiB)
+    SWARM_MAX_RETRIES retries for pre-response fails (default: 2)
+    SWARM_RETRY_BASE_DELAY  backoff base seconds     (default: 1.0)
 
-All heavy logic lives in ``jobs_core`` (pure) and ``client`` (thin HTTP). This
-module only wires those into APScheduler, so it stays small and side-effecty.
+All heavy logic lives in ``jobs_core`` / ``run_store`` / ``retry`` (all pure)
+and ``client`` (thin HTTP). This module only wires those into APScheduler, so it
+stays small and side-effecty. Each fire is timed, retried (only for pre-response
+failures: connect-phase error / status 0 / HTTP 429 — never a read/write timeout,
+which may have already reached the server), appended to the human run log
+AND to the structured JSONL ledger (name, ts, status, status_code, tokens, cost,
+latency_ms, attempts, error, response_excerpt).
 """
 
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 # Ensure "scheduler" is importable both as a package and when run as a script.
@@ -35,7 +46,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
-from scheduler import client
+from scheduler import client, retry, run_store
 from scheduler.jobs_core import build_trigger, format_run_line, load_jobs
 
 logger = logging.getLogger("swarm.scheduler")
@@ -45,6 +56,11 @@ EXAMPLE_JOBS_FILE = _HERE / "jobs.example.yaml"
 DEFAULT_RUNS_LOG = _HERE / "runs.log"
 DEFAULT_BASE_URL = "http://localhost:8080"
 DEFAULT_AGENCY = "open-swarm"
+
+# Retry + ledger tuning (all overridable via env).
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_RETRY_BASE_DELAY = 1.0
+DEFAULT_RUNS_JSONL_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB before rotation
 
 
 # --------------------------------------------------------------------------- #
@@ -83,6 +99,37 @@ def resolve_app_token():
     return os.getenv("SWARM_APP_TOKEN") or os.getenv("APP_TOKEN")
 
 
+def _resolve_int(env_name: str, default: int) -> int:
+    """Read a non-negative int from *env_name*, falling back on default/garbage."""
+    raw = os.getenv(env_name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value >= 0 else default
+
+
+def resolve_max_retries() -> int:
+    return _resolve_int("SWARM_MAX_RETRIES", DEFAULT_MAX_RETRIES)
+
+
+def resolve_retry_base_delay() -> float:
+    raw = os.getenv("SWARM_RETRY_BASE_DELAY")
+    if raw is None:
+        return DEFAULT_RETRY_BASE_DELAY
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_RETRY_BASE_DELAY
+    return value if value >= 0 else DEFAULT_RETRY_BASE_DELAY
+
+
+def resolve_runs_jsonl_max_bytes() -> int:
+    return _resolve_int("SWARM_RUNS_JSONL_MAX_BYTES", DEFAULT_RUNS_JSONL_MAX_BYTES)
+
+
 # --------------------------------------------------------------------------- #
 # Run logging
 # --------------------------------------------------------------------------- #
@@ -100,6 +147,28 @@ def append_run_log(runs_log: Path, name: str, status: str, detail: str = "") -> 
 # --------------------------------------------------------------------------- #
 
 
+def _append_ledger_record(name, status, status_code, result, latency_ms, attempts, error):
+    """Build and append one structured ledger record; never raises to the caller."""
+    record = run_store.build_record(
+        name=name,
+        ts=datetime.datetime.now().isoformat(timespec="seconds"),
+        status=status,
+        status_code=status_code,
+        tokens=result.get("total_tokens"),
+        cost=result.get("cost"),
+        latency_ms=latency_ms,
+        attempts=attempts,
+        error=error or None,
+        response_excerpt=result.get("response"),
+    )
+    try:
+        path = run_store.resolve_runs_jsonl_path()
+        run_store.rotate_if_needed(path, resolve_runs_jsonl_max_bytes())
+        run_store.append_record(path, record)
+    except Exception:  # a broken ledger must not take the daemon down
+        logger.exception("failed to append ledger record for job %s", name)
+
+
 def make_runner(job, base_url, agency, app_token, runs_log):
     """Return a zero-arg callable APScheduler can fire for *job*."""
     endpoint = job.get("endpoint") or base_url
@@ -107,20 +176,56 @@ def make_runner(job, base_url, agency, app_token, runs_log):
     def run() -> None:
         name = job["name"]
         logger.info("firing job %s -> %s", name, endpoint)
-        try:
-            result = client.send(
+
+        def _send():
+            return client.send(
                 endpoint,
                 agency,
                 job["prompt"],
                 agent=job.get("agent"),
                 app_token=app_token,
             )
-            status = "ok" if result.get("ok") else f"http-{result.get('status_code')}"
-            detail = str(result.get("response") or result.get("error") or "")
-            append_run_log(runs_log, name, status, detail)
-        except Exception as exc:  # network / server down / anything
+
+        started = time.monotonic()
+        attempts = 1
+        error = ""
+        result: dict = {}
+        try:
+            # Retry only pre-response failures (connect-phase error / 429 / status
+            # 0); a 5xx OR a read/write timeout may mean the agency already ran a
+            # side effect, so neither is retried. send_with_retry does not raise.
+            result, attempts = retry.send_with_retry(
+                _send,
+                max_retries=resolve_max_retries(),
+                base_delay=resolve_retry_base_delay(),
+            )
+        except Exception as exc:  # defensive; send_with_retry should absorb these
             logger.exception("job %s failed", name)
-            append_run_log(runs_log, name, "error", str(exc))
+            error = str(exc)
+            result = {}
+        latency_ms = int((time.monotonic() - started) * 1000)
+
+        if not isinstance(result, dict):
+            result = {}
+        status_code = result.get("status_code", 0)
+        if not error and not result:
+            error = "no result"
+        if error:
+            status = "error"
+        elif result.get("ok"):
+            status = "ok"
+        else:
+            status = f"http-{status_code}"
+
+        error_text = error or str(result.get("error") or "")
+        detail = str(result.get("response") or error_text or "")
+
+        # Keep the existing human-readable run log line.
+        append_run_log(runs_log, name, status, detail)
+        # Plus the structured, machine-readable ledger record.
+        _append_ledger_record(
+            name, status, status_code, result, latency_ms, attempts, error_text
+        )
 
     run.__name__ = f"run_{job['name']}"
     return run

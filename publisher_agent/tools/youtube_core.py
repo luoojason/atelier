@@ -13,6 +13,7 @@ The only YouTube-specific pieces:
   imported lazily, so importing this module has no heavy dependencies.
 """
 
+import datetime
 import os
 
 # YouTube API accepts exactly these three privacy values.
@@ -32,12 +33,64 @@ def normalize_privacy(privacy):
     return value
 
 
-def build_upload_request(file_path, title, description="", tags=None, privacy="unlisted"):
+def normalize_publish_at(publish_at):
+    """Parse an ISO-8601 timestamp and normalize it to an RFC3339 UTC string.
+
+    Returns ``None`` for an empty/None input (meaning "not scheduled"). Otherwise
+    parses the value, treating a naive timestamp as UTC and converting an aware
+    one to UTC, and returns a string like ``2026-07-05T14:00:00Z``.
+
+    Raises ``ValueError`` when the value cannot be parsed as ISO-8601 or when it
+    is not strictly in the future (YouTube rejects past scheduled times).
+    """
+    if publish_at is None:
+        return None
+    raw = str(publish_at).strip()
+    if not raw:
+        return None
+
+    # datetime.fromisoformat on older Pythons does not accept a trailing 'Z';
+    # normalize it to an explicit +00:00 offset before parsing.
+    candidate = raw
+    if candidate.endswith(("Z", "z")):
+        candidate = candidate[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise ValueError(
+            f"publish_at is not a valid ISO-8601 timestamp: {publish_at!r} ({exc})."
+        ) from exc
+
+    # Naive timestamps are interpreted as UTC; aware ones are converted to UTC.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    else:
+        parsed = parsed.astimezone(datetime.timezone.utc)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if parsed <= now:
+        raise ValueError(
+            f"publish_at must be a future time (got {publish_at!r}; "
+            f"now is {now.strftime('%Y-%m-%dT%H:%M:%SZ')})."
+        )
+
+    return parsed.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_upload_request(
+    file_path, title, description="", tags=None, privacy="unlisted", publish_at=None
+):
     """Build the params dict for a YouTube Data API v3 ``videos.insert`` call.
 
     Returns a plain dict with the ``part``, ``body`` (snippet + status), and the
     ``media_path`` that the caller should turn into a media upload. This function
     has no side effects and does not touch the network or the filesystem.
+
+    When ``publish_at`` is set, the video is scheduled: YouTube requires the
+    privacy status to be ``private`` (this overrides an explicit ``privacy`` such
+    as ``public``), and ``status.publishAt`` is set to the normalized RFC3339 UTC
+    timestamp. A past or malformed ``publish_at`` raises ``ValueError``.
     """
     if not title or not str(title).strip():
         raise ValueError("YouTube upload requires a non-empty title.")
@@ -48,7 +101,14 @@ def build_upload_request(file_path, title, description="", tags=None, privacy="u
         "tags": list(tags or []),
         "categoryId": DEFAULT_CATEGORY_ID,
     }
-    status = {"privacyStatus": normalize_privacy(privacy)}
+
+    normalized_publish_at = normalize_publish_at(publish_at)
+    if normalized_publish_at is not None:
+        # Scheduled videos must be private until they go live; publishAt wins over
+        # any explicit privacy the caller passed.
+        status = {"privacyStatus": "private", "publishAt": normalized_publish_at}
+    else:
+        status = {"privacyStatus": normalize_privacy(privacy)}
 
     return {
         "part": "snippet,status",
@@ -125,14 +185,21 @@ def upload_video(file_path, meta, service_factory, media_factory=None):
     description = meta.get("description", "")
     tags = meta.get("tags", [])
     privacy = normalize_privacy(meta.get("privacy", "unlisted"))
+    publish_at = meta.get("publish_at")
 
     if not file_path or not os.path.exists(file_path):
         return {"ok": False, "error": f"Video file not found: {file_path}"}
 
     try:
-        request = build_upload_request(file_path, title, description, tags, privacy)
+        request = build_upload_request(
+            file_path, title, description, tags, privacy, publish_at
+        )
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
+
+    # A scheduled upload forces privacyStatus='private'; report what was actually
+    # sent rather than the caller's requested privacy.
+    effective_privacy = request["body"]["status"]["privacyStatus"]
 
     try:
         service = service_factory()
@@ -160,7 +227,7 @@ def upload_video(file_path, meta, service_factory, media_factory=None):
         "ok": True,
         "video_id": video_id,
         "url": WATCH_URL.format(video_id=video_id),
-        "privacy": privacy,
+        "privacy": effective_privacy,
         "title": request["body"]["snippet"]["title"],
     }
 

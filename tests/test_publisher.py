@@ -7,6 +7,7 @@ touch the network.
     python3 tests/test_publisher.py
 """
 
+import datetime
 import os
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from youtube_core import (  # noqa: E402
     build_upload_request,
     credentials_error,
     normalize_privacy,
+    normalize_publish_at,
     resolve_credential_paths,
     upload_video,
 )
@@ -135,6 +137,113 @@ def test_normalize_privacy():
     assert normalize_privacy("garbage") == "unlisted"
 
 
+# ── scheduled publish (publish_at / status.publishAt) ────────────────────────
+
+def _future_utc(days=30):
+    """A whole-second UTC datetime that is safely in the future."""
+    return (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)
+    ).replace(microsecond=0)
+
+
+def test_normalize_publish_at_none_and_empty():
+    # No schedule requested -> None (unscheduled), never raises.
+    assert normalize_publish_at(None) is None
+    assert normalize_publish_at("") is None
+    assert normalize_publish_at("   ") is None
+
+
+def test_normalize_publish_at_naive_iso_treated_as_utc():
+    # ISO input like 2026-12-01T09:30:00 (no offset) normalizes to a Z-suffixed
+    # RFC3339 UTC string, unchanged apart from the appended Z.
+    future = _future_utc(days=45)
+    naive = future.strftime("%Y-%m-%dT%H:%M:%S")  # e.g. 2026-12-01T09:30:00
+    assert normalize_publish_at(naive) == naive + "Z"
+
+
+def test_normalize_publish_at_z_and_offset_forms():
+    future = _future_utc(days=10)
+    z_form = future.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # A trailing Z round-trips to the same RFC3339 string.
+    assert normalize_publish_at(z_form) == z_form
+    # An explicit +00:00 offset normalizes to the Z form.
+    assert normalize_publish_at(future.strftime("%Y-%m-%dT%H:%M:%S+00:00")) == z_form
+
+
+def test_normalize_publish_at_non_utc_offset_converted_to_utc():
+    # A time with a -05:00 offset must be converted to the equivalent UTC instant.
+    future_utc = _future_utc(days=20)
+    minus5 = future_utc.astimezone(datetime.timezone(datetime.timedelta(hours=-5)))
+    assert normalize_publish_at(minus5.isoformat()) == future_utc.strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def test_normalize_publish_at_past_raises():
+    past = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        normalize_publish_at(past)
+    except ValueError as exc:
+        assert "future" in str(exc).lower(), exc
+    else:
+        raise AssertionError("expected ValueError for a past publish_at")
+
+
+def test_normalize_publish_at_malformed_raises():
+    for bad in ("not-a-timestamp", "2026-13-45T99:99:99Z", "July 5th"):
+        try:
+            normalize_publish_at(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for malformed publish_at={bad!r}")
+
+
+def test_build_upload_request_schedule_forces_private_and_sets_publish_at():
+    future = _future_utc(days=15)
+    normalized = future.strftime("%Y-%m-%dT%H:%M:%SZ")
+    # publish_at wins even over an explicit privacy='public'.
+    req = build_upload_request(
+        "/tmp/clip.mp4",
+        title="Scheduled",
+        privacy="public",
+        publish_at=future.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+    status = req["body"]["status"]
+    assert status["privacyStatus"] == "private", status
+    assert status["publishAt"] == normalized, status
+
+
+def test_build_upload_request_no_publish_at_unchanged():
+    # Without publish_at, status has no publishAt and privacy is untouched.
+    req = build_upload_request("/tmp/clip.mp4", title="t", privacy="public")
+    assert req["body"]["status"] == {"privacyStatus": "public"}, req["body"]["status"]
+    assert "publishAt" not in req["body"]["status"]
+
+
+def test_build_upload_request_past_publish_at_raises():
+    past = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        build_upload_request("/tmp/c.mp4", title="t", publish_at=past)
+    except ValueError as exc:
+        assert "future" in str(exc).lower(), exc
+    else:
+        raise AssertionError("expected ValueError for past publish_at")
+
+
+def test_build_upload_request_malformed_publish_at_raises():
+    try:
+        build_upload_request("/tmp/c.mp4", title="t", publish_at="garbage-time")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for malformed publish_at")
+
+
 # ── upload_video (with injected fake service) ────────────────────────────────
 
 def test_upload_video_calls_service_and_returns_url():
@@ -168,6 +277,59 @@ def test_upload_video_calls_service_and_returns_url():
         assert recorder["body"]["snippet"]["title"] == "Launch"
         assert recorder["body"]["status"]["privacyStatus"] == "public"
         assert recorder["media_body"] == ("MEDIA", video_path)
+    finally:
+        os.unlink(video_path)
+
+
+def test_upload_video_threads_publish_at_and_reports_private():
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+        handle.write(b"fake video bytes")
+        video_path = handle.name
+    try:
+        future = _future_utc(days=12)
+        normalized = future.strftime("%Y-%m-%dT%H:%M:%SZ")
+        recorder = {}
+        service = _FakeService(recorder, {"id": "sched789"})
+
+        result = upload_video(
+            video_path,
+            meta={
+                "title": "Scheduled Launch",
+                # Caller asked for public, but scheduling forces private.
+                "privacy": "public",
+                "publish_at": future.strftime("%Y-%m-%dT%H:%M:%S"),
+            },
+            service_factory=lambda: service,
+            media_factory=lambda path: ("MEDIA", path),
+        )
+
+        assert result["ok"] is True, result
+        assert result["video_id"] == "sched789"
+        # Reported privacy reflects what was actually sent (private), not the ask.
+        assert result["privacy"] == "private", result
+        sent_status = recorder["body"]["status"]
+        assert sent_status["privacyStatus"] == "private", sent_status
+        assert sent_status["publishAt"] == normalized, sent_status
+    finally:
+        os.unlink(video_path)
+
+
+def test_upload_video_past_publish_at_returns_error():
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
+        handle.write(b"x")
+        video_path = handle.name
+    try:
+        past = (
+            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        result = upload_video(
+            video_path,
+            meta={"title": "t", "publish_at": past},
+            service_factory=lambda: _FakeService({}, {"id": "x"}),
+            media_factory=lambda path: path,
+        )
+        assert result["ok"] is False
+        assert "future" in result["error"].lower(), result
     finally:
         os.unlink(video_path)
 

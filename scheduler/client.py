@@ -76,8 +76,15 @@ def summarize_response(status_code: int, payload: Any) -> dict:
         if "error" in payload:
             result["error"] = payload["error"]
         usage = payload.get("usage")
-        if isinstance(usage, dict) and "total_tokens" in usage:
-            result["total_tokens"] = usage["total_tokens"]
+        if isinstance(usage, dict):
+            if "total_tokens" in usage:
+                result["total_tokens"] = usage["total_tokens"]
+            # Keep a cost figure when the usage dict carries one, under whatever
+            # key the provider used. Optional: absent on most agency responses.
+            for cost_key in ("cost", "cost_usd", "total_cost"):
+                if cost_key in usage:
+                    result["cost"] = usage[cost_key]
+                    break
     elif payload is not None:
         result["text"] = str(payload)[:500]
     return result

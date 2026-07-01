@@ -32,6 +32,14 @@ class UploadToYouTube(BaseTool):
         "unlisted",
         description="Privacy status: 'public', 'unlisted', or 'private'. Defaults to 'unlisted'.",
     )
+    publish_at: str = Field(
+        "",
+        description=(
+            "Optional ISO-8601/RFC3339 timestamp (UTC) to schedule the video, e.g. "
+            "'2026-07-05T14:00:00Z'. When set, YouTube keeps the video private until "
+            "this future time, overriding 'privacy'. Must be in the future."
+        ),
+    )
 
     def run(self) -> str:
         meta = {
@@ -39,6 +47,7 @@ class UploadToYouTube(BaseTool):
             "description": self.description,
             "tags": self.tags,
             "privacy": self.privacy,
+            "publish_at": self.publish_at or None,
         }
         result = upload_video(self.file_path, meta, service_factory=get_service)
         if not result.get("ok"):
