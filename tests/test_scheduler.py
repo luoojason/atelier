@@ -10,6 +10,7 @@ optional: the load_jobs test degrades gracefully (jobs_core has a built-in
 fallback parser, so it should still work) and prints a note if it cannot.
 """
 
+import contextlib
 import os
 import sys
 
@@ -19,7 +20,7 @@ _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from scheduler import client, retry, run_store
+from scheduler import client, notify, retry, run_store
 from scheduler.jobs_core import (
     _parse_scalar,
     _tiny_yaml_load,
@@ -540,6 +541,230 @@ def test_make_runner_retries_then_records_attempts(tmp_path=None):
             os.environ.pop("SWARM_RUNS_JSONL", None)
         else:
             os.environ["SWARM_RUNS_JSONL"] = saved_env
+
+
+# --------------------------------------------------------------------------- #
+# notify wiring — the thin _maybe_notify / make_runner glue (the untested layer)
+# --------------------------------------------------------------------------- #
+#
+# scheduler.notify's pure functions (should_notify / notify / ...) are covered by
+# tests/test_notify.py. What was NOT covered is the wiring in scheduler.py that
+# turns them into a real guarantee:
+#   * _maybe_notify's try/except is the SOLE thing that stops a notification
+#     failure from crashing the job runner ("notify never crashes the runner").
+#   * _maybe_notify does read -> gate -> write (read recent history, apply
+#     should_notify, only then write) so a suppressed failure never drifts the
+#     dedup anchor and defeats the storm-suppression window.
+#   * make_runner only notifies when status != "ok".
+# These tests exercise exactly that glue, so a refactor that dropped the swallow,
+# flipped the gate, or wrote-before-gating would now fail CI.
+
+
+@contextlib.contextmanager
+def _scoped_env(**overrides):
+    """Temporarily set env vars (a None value deletes the var); restore on exit."""
+    saved = {key: os.environ.get(key) for key in overrides}
+    try:
+        for key, value in overrides.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, old in saved.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
+
+
+def _failure_record(name="j", error="connection refused", ts=1000.0, status="error"):
+    """A minimal ledger-record-shaped dict for a failed run."""
+    return {
+        "name": name,
+        "ts": ts,
+        "status": status,
+        "status_code": 0,
+        "tokens": None,
+        "cost": None,
+        "latency_ms": 5,
+        "attempts": 3,
+        "error": error,
+        "response_excerpt": None,
+    }
+
+
+def test_maybe_notify_swallows_internal_error():
+    # The bare try/except in _maybe_notify is the only guarantee that a broken
+    # notification path cannot crash the job runner. Force the read step to raise
+    # and prove _maybe_notify swallows it (returns None, does not propagate). If
+    # the swallow is ever removed, this raises and the test fails.
+    import scheduler.scheduler as sched
+
+    def _explode(*a, **k):
+        raise RuntimeError("sink unreadable")
+
+    saved = sched.notify.read_notifications
+    sched.notify.read_notifications = _explode
+    try:
+        assert sched._maybe_notify(_failure_record()) is None
+    finally:
+        sched.notify.read_notifications = saved
+
+
+def test_maybe_notify_read_gate_write_suppresses_storm():
+    # _maybe_notify wires read -> gate -> write against the real JSONL sink: it
+    # reads recent history, applies should_notify, and only writes on a fresh
+    # failure. A suppressed failure must NOT be written, so it cannot drift the
+    # dedup anchor forward and defeat the storm-suppression window.
+    import tempfile
+    from pathlib import Path
+
+    import scheduler.scheduler as sched
+
+    with tempfile.TemporaryDirectory() as tmp, _scoped_env(
+        SWARM_NOTIFICATIONS=str(Path(tmp) / "notifications.jsonl"),
+        SWARM_NOTIFY_MIN_INTERVAL="3600",
+        SWARM_AIEOS_URL=None,  # no network POST from the fallback
+    ):
+        sink = str(Path(tmp) / "notifications.jsonl")
+
+        # 1) First failure: empty history -> gate allows -> one line written.
+        sched._maybe_notify(_failure_record(ts=1000.0))
+        assert len(notify.read_notifications(sink)) == 1
+
+        # 2) Same failure 300s later, inside the 3600s window -> suppressed.
+        sched._maybe_notify(_failure_record(ts=1300.0))
+        assert len(notify.read_notifications(sink)) == 1
+
+        # 3) Anchor-drift guard: 3700s after the *written* anchor (1000), but only
+        # 3400s after the *suppressed* 1300. It is allowed, proving the suppressed
+        # failure never became the anchor (read->gate->write, not write-always).
+        sched._maybe_notify(_failure_record(ts=4700.0))
+        assert len(notify.read_notifications(sink)) == 2
+
+        # 4) A distinct job with identical timing shares no key -> never deduped.
+        sched._maybe_notify(_failure_record(name="k", ts=4700.0))
+        assert len(notify.read_notifications(sink)) == 3
+
+
+def test_make_runner_notifies_only_on_failure():
+    # make_runner gates the notification on status != "ok": a success fires no
+    # notification, a failure fires exactly one carrying the ledger record.
+    import tempfile
+    from pathlib import Path
+
+    import scheduler.scheduler as sched
+
+    original_send = client.send
+    saved_notify = sched._maybe_notify
+    calls = []
+    sched._maybe_notify = lambda record: calls.append(record)
+    try:
+        # --- success (status "ok") -> no notification ---
+        ok_fake = _FakeClient(
+            _FakeResponse(200, {"response": "hi", "usage": {"total_tokens": 3}})
+        )
+        sched.client.send = lambda *a, **k: original_send(*a, client=ok_fake, **k)
+        with tempfile.TemporaryDirectory() as tmp, _scoped_env(
+            SWARM_RUNS_JSONL=str(Path(tmp) / "runs.jsonl")
+        ):
+            job = {"name": "good", "schedule": "30m", "prompt": "hi"}
+            sched.make_runner(
+                job, "http://h:8080", "open-swarm", None, Path(tmp) / "runs.log"
+            )()
+        assert calls == [], calls  # a healthy run never notifies
+
+        # --- failure (http-500) -> exactly one notification with the record ---
+        err_fake = _FakeClient(_FakeResponse(500, {"error": "boom"}))
+        sched.client.send = lambda *a, **k: original_send(*a, client=err_fake, **k)
+        with tempfile.TemporaryDirectory() as tmp, _scoped_env(
+            SWARM_RUNS_JSONL=str(Path(tmp) / "runs.jsonl")
+        ):
+            job = {"name": "bad", "schedule": "30m", "prompt": "hi"}
+            sched.make_runner(
+                job, "http://h:8080", "open-swarm", None, Path(tmp) / "runs.log"
+            )()
+        assert len(calls) == 1, calls
+        assert calls[0]["name"] == "bad"
+        assert calls[0]["status"] == "http-500"
+    finally:
+        sched.client.send = original_send
+        sched._maybe_notify = saved_notify
+
+
+def test_make_runner_notify_crash_does_not_break_run():
+    # The runner-level guarantee: even when the notification subsystem blows up on
+    # a failed job, runner() must not raise, and the run log + ledger (written
+    # before the notify step) must still be intact. This proves _maybe_notify's
+    # swallow contains the failure inside the live make_runner path.
+    import tempfile
+    from pathlib import Path
+
+    import scheduler.scheduler as sched
+
+    fake = _FakeClient(_FakeResponse(500, {"error": "kaboom"}))  # failure -> notify
+    original_send = client.send
+    saved_should = sched.notify.should_notify
+
+    def _explode(*a, **k):
+        raise RuntimeError("notify subsystem down")
+
+    sched.client.send = lambda *a, **k: original_send(*a, client=fake, **k)
+    sched.notify.should_notify = _explode
+    try:
+        with tempfile.TemporaryDirectory() as tmp, _scoped_env(
+            SWARM_RUNS_JSONL=str(Path(tmp) / "runs.jsonl"),
+            SWARM_NOTIFICATIONS=str(Path(tmp) / "notifications.jsonl"),
+            SWARM_AIEOS_URL=None,
+        ):
+            log_path = Path(tmp) / "runs.log"
+            job = {"name": "boom", "schedule": "30m", "prompt": "hi"}
+            runner = sched.make_runner(
+                job, "http://h:8080", "open-swarm", None, log_path
+            )
+            runner()  # must NOT raise despite the exploding notify path
+
+            assert "\tboom\thttp-500\t" in log_path.read_text()
+            records = run_store.read_records(str(Path(tmp) / "runs.jsonl"))
+            assert len(records) == 1 and records[0]["status"] == "http-500", records
+    finally:
+        sched.client.send = original_send
+        sched.notify.should_notify = saved_should
+
+
+def test_make_runner_failure_writes_notification_end_to_end():
+    # End-to-end wiring with no spies between the layers: a failing job drives
+    # make_runner -> _maybe_notify -> notify.notify -> the JSONL sink. Exactly one
+    # durable notification is written, and no AIEOS POST fires (URL unset).
+    import tempfile
+    from pathlib import Path
+
+    import scheduler.scheduler as sched
+
+    fake = _FakeClient(_FakeResponse(500, {"error": "downstream 503 at 12:00:01"}))
+    original_send = client.send
+    sched.client.send = lambda *a, **k: original_send(*a, client=fake, **k)
+    try:
+        with tempfile.TemporaryDirectory() as tmp, _scoped_env(
+            SWARM_RUNS_JSONL=str(Path(tmp) / "runs.jsonl"),
+            SWARM_NOTIFICATIONS=str(Path(tmp) / "notifications.jsonl"),
+            SWARM_AIEOS_URL=None,
+        ):
+            sink = str(Path(tmp) / "notifications.jsonl")
+            job = {"name": "nightly", "schedule": "30m", "prompt": "hi"}
+            sched.make_runner(
+                job, "http://h:8080", "open-swarm", None, Path(tmp) / "runs.log"
+            )()
+
+            notes = notify.read_notifications(sink)
+            assert len(notes) == 1, notes
+            assert notes[0]["name"] == "nightly"
+            assert notes[0]["status"] == "http-500"
+            assert notes[0]["key"].startswith("nightly::"), notes[0]
+    finally:
+        sched.client.send = original_send
 
 
 # --------------------------------------------------------------------------- #

@@ -21,6 +21,12 @@ Configuration (all via environment):
     SWARM_RUNS_JSONL_MAX_BYTES  ledger rotation size (default: 5242880 = 5 MiB)
     SWARM_MAX_RETRIES retries for pre-response fails (default: 2)
     SWARM_RETRY_BASE_DELAY  backoff base seconds     (default: 1.0)
+    SWARM_NOTIFICATIONS  failure-alert JSONL sink     (default: ~/.openswarm/
+                                                       notifications.jsonl)
+    SWARM_AIEOS_URL   AIEOS timeline base URL for the failure-notification
+                      fallback POST (e.g. http://127.0.0.1:7824); unset = off
+    SWARM_NOTIFY_MIN_INTERVAL  dedup window seconds for the same failure
+                               (default: 3600)
 
 All heavy logic lives in ``jobs_core`` / ``run_store`` / ``retry`` (all pure)
 and ``client`` (thin HTTP). This module only wires those into APScheduler, so it
@@ -46,7 +52,7 @@ _HERE = Path(__file__).resolve().parent
 if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
-from scheduler import client, retry, run_store
+from scheduler import client, notify, retry, run_store
 from scheduler.jobs_core import build_trigger, format_run_line, load_jobs
 
 logger = logging.getLogger("swarm.scheduler")
@@ -61,6 +67,10 @@ DEFAULT_AGENCY = "open-swarm"
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BASE_DELAY = 1.0
 DEFAULT_RUNS_JSONL_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB before rotation
+
+# Failure-notification tuning (all overridable via env).
+DEFAULT_NOTIFY_MIN_INTERVAL = 3600  # suppress the same failure for 1h by default
+NOTIFY_RECENT_LIMIT = 200  # how many prior notifications to scan for dedup
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +140,15 @@ def resolve_runs_jsonl_max_bytes() -> int:
     return _resolve_int("SWARM_RUNS_JSONL_MAX_BYTES", DEFAULT_RUNS_JSONL_MAX_BYTES)
 
 
+def resolve_aieos_url():
+    """AIEOS timeline base URL for the failure-notification fallback (or None)."""
+    return os.getenv("SWARM_AIEOS_URL")
+
+
+def resolve_notify_min_interval() -> int:
+    return _resolve_int("SWARM_NOTIFY_MIN_INTERVAL", DEFAULT_NOTIFY_MIN_INTERVAL)
+
+
 # --------------------------------------------------------------------------- #
 # Run logging
 # --------------------------------------------------------------------------- #
@@ -167,6 +186,38 @@ def _append_ledger_record(name, status, status_code, result, latency_ms, attempt
         run_store.append_record(path, record)
     except Exception:  # a broken ledger must not take the daemon down
         logger.exception("failed to append ledger record for job %s", name)
+    return record
+
+
+def _post_aieos_event(url, json) -> None:
+    """POST a timeline event to AIEOS (real side effect; injected in tests)."""
+    import httpx  # lazy: only the daemon path needs it
+
+    httpx.post(url, json=json, timeout=5.0)
+
+
+def _maybe_notify(record) -> None:
+    """Send a failure notification for *record*, deduped. Never raises.
+
+    Reads the recent notification history from the JSONL sink, applies the
+    dedup/rate-limit gate, and only then emits. Any failure here (I/O, network,
+    a broken sink) is swallowed so a notification problem cannot crash the job
+    runner or the daemon.
+    """
+    try:
+        path = notify.resolve_notifications_path()
+        recent = notify.read_notifications(path, limit=NOTIFY_RECENT_LIMIT)
+        if notify.should_notify(record, recent, resolve_notify_min_interval()):
+            notify.notify(
+                record,
+                notifications_path=path,
+                poster=_post_aieos_event,
+                aieos_url=resolve_aieos_url(),
+            )
+    except Exception:  # a notify failure must never crash the runner
+        logger.exception(
+            "failed to send failure notification for job %s", record.get("name")
+        )
 
 
 def make_runner(job, base_url, agency, app_token, runs_log):
@@ -223,9 +274,13 @@ def make_runner(job, base_url, agency, app_token, runs_log):
         # Keep the existing human-readable run log line.
         append_run_log(runs_log, name, status, detail)
         # Plus the structured, machine-readable ledger record.
-        _append_ledger_record(
+        record = _append_ledger_record(
             name, status, status_code, result, latency_ms, attempts, error_text
         )
+        # On a final failure (retries already exhausted upstream), tell the user
+        # — deduped so a recurring failure does not storm every interval.
+        if status != "ok":
+            _maybe_notify(record)
 
     run.__name__ = f"run_{job['name']}"
     return run
