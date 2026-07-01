@@ -232,6 +232,49 @@ def upload_video(file_path, meta, service_factory, media_factory=None):
     }
 
 
+def load_or_refresh_credentials(
+    token_file,
+    client_secrets,
+    scopes,
+    *,
+    credentials_loader,
+    request_factory,
+    flow_runner,
+):
+    """Return usable OAuth credentials, persisting them to ``token_file``.
+
+    Pure orchestration with injected seams so the write-back is testable without
+    google-api-python-client:
+
+    - ``credentials_loader(token_file, scopes) -> creds`` loads a saved token.
+    - ``request_factory() -> Request`` builds the transport for a refresh.
+    - ``flow_runner(client_secrets, scopes) -> creds`` runs the interactive flow.
+
+    Loads any saved token; if it is missing or invalid, either refreshes it
+    (when expired but refreshable) or runs the OAuth flow, then writes the
+    resulting ``creds.to_json()`` back to ``token_file``. Persisting after a
+    REFRESH (not only after the flow) is the fix for the original bug: otherwise
+    the on-disk token stays stale, every run refreshes again, and a rotated
+    refresh_token would be silently discarded and could later fail auth.
+    """
+    creds = None
+    if token_file and os.path.exists(token_file):
+        creds = credentials_loader(token_file, scopes)
+
+    if creds is None or not getattr(creds, "valid", False):
+        if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
+            creds.refresh(request_factory())
+        else:
+            creds = flow_runner(client_secrets, scopes)
+        # Persist the refreshed OR newly obtained token so the next run reuses it
+        # and any rotated refresh_token is not lost.
+        if token_file:
+            with open(token_file, "w", encoding="utf-8") as handle:
+                handle.write(creds.to_json())
+
+    return creds
+
+
 def get_service(env=None):
     """Build a real authenticated YouTube Data API v3 service.
 
@@ -251,26 +294,31 @@ def get_service(env=None):
     from googleapiclient.discovery import build  # noqa: PLC0415
 
     scopes = ["https://www.googleapis.com/auth/youtube.upload"]
-    creds = None
 
-    if token_file and os.path.exists(token_file):
-        creds = Credentials.from_authorized_user_file(token_file, scopes)
+    def _load(token, scp):
+        return Credentials.from_authorized_user_file(token, scp)
 
-    if creds is None or not getattr(creds, "valid", False):
-        try:
-            from google.auth.transport.requests import Request  # noqa: PLC0415
+    def _request():
+        from google.auth.transport.requests import Request  # noqa: PLC0415
 
-            if creds and getattr(creds, "expired", False) and getattr(creds, "refresh_token", None):
-                creds.refresh(Request())
-            else:
-                from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: PLC0415
+        return Request()
 
-                flow = InstalledAppFlow.from_client_secrets_file(client_secrets, scopes)
-                creds = flow.run_local_server(port=0)
-                if token_file:
-                    with open(token_file, "w", encoding="utf-8") as handle:
-                        handle.write(creds.to_json())
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"YouTube OAuth failed: {exc}") from exc
+    def _flow(secrets, scp):
+        from google_auth_oauthlib.flow import InstalledAppFlow  # noqa: PLC0415
+
+        flow = InstalledAppFlow.from_client_secrets_file(secrets, scp)
+        return flow.run_local_server(port=0)
+
+    try:
+        creds = load_or_refresh_credentials(
+            token_file,
+            client_secrets,
+            scopes,
+            credentials_loader=_load,
+            request_factory=_request,
+            flow_runner=_flow,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"YouTube OAuth failed: {exc}") from exc
 
     return build("youtube", "v3", credentials=creds)

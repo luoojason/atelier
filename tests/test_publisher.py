@@ -22,6 +22,7 @@ sys.path.insert(0, _TOOLS_DIR)
 from youtube_core import (  # noqa: E402
     build_upload_request,
     credentials_error,
+    load_or_refresh_credentials,
     normalize_privacy,
     normalize_publish_at,
     resolve_credential_paths,
@@ -415,6 +416,116 @@ def test_credentials_error_none_when_token_exists():
         os.unlink(token_path)
 
 
+# ── OAuth token write-back (load_or_refresh_credentials) ─────────────────────
+
+class _FakeCreds:
+    """Minimal stand-in for google.oauth2.credentials.Credentials."""
+
+    def __init__(self, *, valid, expired=False, refresh_token=None, token_json="{}"):
+        self.valid = valid
+        self.expired = expired
+        self.refresh_token = refresh_token
+        self._token_json = token_json
+        self.refreshed = False
+
+    def refresh(self, request):
+        # A real refresh mints a new access token and marks the creds valid.
+        self.refreshed = True
+        self.valid = True
+
+    def to_json(self):
+        return self._token_json
+
+
+def test_refreshed_token_is_written_back_to_disk():
+    # The core regression: after an in-memory refresh, the refreshed token must be
+    # persisted so the next run reuses it (and a rotated refresh_token is kept).
+    with tempfile.TemporaryDirectory() as tmp:
+        token_file = os.path.join(tmp, "token.json")
+        with open(token_file, "w", encoding="utf-8") as handle:
+            handle.write('{"stale": true}')
+
+        creds = _FakeCreds(
+            valid=False, expired=True, refresh_token="r",
+            token_json='{"refreshed": true}',
+        )
+
+        def _loader(tf, scopes):
+            return creds
+
+        def _request():
+            return object()
+
+        def _flow(secrets, scopes):
+            raise AssertionError("flow must not run when the token is refreshable")
+
+        out = load_or_refresh_credentials(
+            token_file, "", ["scope"],
+            credentials_loader=_loader,
+            request_factory=_request,
+            flow_runner=_flow,
+        )
+        assert out is creds
+        assert creds.refreshed is True
+        with open(token_file, encoding="utf-8") as handle:
+            assert handle.read() == '{"refreshed": true}', "refreshed token not persisted"
+
+
+def test_flow_token_is_written_back_to_disk():
+    # The interactive-flow path must also persist (unchanged behavior, guarded).
+    with tempfile.TemporaryDirectory() as tmp:
+        token_file = os.path.join(tmp, "token.json")  # does not exist yet
+        new_creds = _FakeCreds(valid=True, token_json='{"new": true}')
+
+        def _loader(tf, scopes):
+            raise AssertionError("no token file exists to load")
+
+        def _request():
+            raise AssertionError("no refresh on the flow path")
+
+        def _flow(secrets, scopes):
+            return new_creds
+
+        out = load_or_refresh_credentials(
+            token_file, "/secrets.json", ["scope"],
+            credentials_loader=_loader,
+            request_factory=_request,
+            flow_runner=_flow,
+        )
+        assert out is new_creds
+        with open(token_file, encoding="utf-8") as handle:
+            assert handle.read() == '{"new": true}'
+
+
+def test_valid_token_is_not_rewritten():
+    # A still-valid token must be returned as-is with no refresh, no flow, no write.
+    with tempfile.TemporaryDirectory() as tmp:
+        token_file = os.path.join(tmp, "token.json")
+        with open(token_file, "w", encoding="utf-8") as handle:
+            handle.write('{"good": true}')
+
+        creds = _FakeCreds(valid=True, token_json='{"SHOULD_NOT_WRITE": true}')
+
+        def _loader(tf, scopes):
+            return creds
+
+        def _request():
+            raise AssertionError("no refresh for a valid token")
+
+        def _flow(secrets, scopes):
+            raise AssertionError("no flow for a valid token")
+
+        out = load_or_refresh_credentials(
+            token_file, "", ["scope"],
+            credentials_loader=_loader,
+            request_factory=_request,
+            flow_runner=_flow,
+        )
+        assert out is creds
+        with open(token_file, encoding="utf-8") as handle:
+            assert handle.read() == '{"good": true}', "valid token must be left untouched"
+
+
 # ── publish_to_vault ─────────────────────────────────────────────────────────
 
 def test_build_note_frontmatter():
@@ -696,6 +807,101 @@ def test_publish_to_vault_catalog_false_skips():
             assert handle.read() == _FIXTURE_INDEX
         with open(os.path.join(vault, "log.md"), encoding="utf-8") as handle:
             assert handle.read() == _FIXTURE_LOG
+
+
+def test_catalog_wikilink_targets_the_slugified_filename():
+    # A title with a colon slugifies to a different filename ('Report: Q3 Results'
+    # -> 'Report Q3 Results.md'). The catalog wikilink must point at that real file,
+    # not the raw colon title (a name slugify never produces), or the index/log
+    # links dangle. Display text keeps the human-readable raw title.
+    with tempfile.TemporaryDirectory() as vault:
+        with open(os.path.join(vault, "index.md"), "w", encoding="utf-8") as handle:
+            handle.write(_FIXTURE_INDEX)
+        with open(os.path.join(vault, "log.md"), "w", encoding="utf-8") as handle:
+            handle.write(_FIXTURE_LOG)
+
+        path = publish_to_vault(
+            title="Report: Q3 Results",
+            body="Quarterly summary.",
+            folder="Analysis",
+            vault_root=vault,
+            updated="2026-07-05",
+            catalog=True,
+        )
+
+        # The note file landed under the slugified (colon-stripped) name.
+        assert path == os.path.join(vault, "Analysis", "Report Q3 Results.md")
+        assert os.path.exists(path)
+
+        with open(os.path.join(vault, "index.md"), encoding="utf-8") as handle:
+            index = handle.read()
+        with open(os.path.join(vault, "log.md"), encoding="utf-8") as handle:
+            log = handle.read()
+
+        # Wikilink target = the slugified stem (the file that exists); display =
+        # the raw title. The dangling raw-title target must be absent.
+        assert "[[Analysis/Report Q3 Results\\|Report: Q3 Results]]" in index, index
+        assert "Created note [[Analysis/Report Q3 Results|Report: Q3 Results]]" in log, log
+        assert "Analysis/Report: Q3 Results" not in index
+        assert "Analysis/Report: Q3 Results" not in log
+
+        # The catalogued target names a note file that actually exists on disk.
+        assert os.path.exists(os.path.join(vault, "Analysis", "Report Q3 Results.md"))
+
+
+def test_catalog_concurrent_publishes_keep_every_row():
+    # Two+ concurrent publishes each read-modify-write the shared index.md/log.md.
+    # Without a lock the second write clobbers the first's new row (last-writer-wins)
+    # and entries silently vanish. With the catalog lock, every row survives.
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    with tempfile.TemporaryDirectory() as vault:
+        with open(os.path.join(vault, "index.md"), "w", encoding="utf-8") as handle:
+            handle.write(_FIXTURE_INDEX)
+        with open(os.path.join(vault, "log.md"), "w", encoding="utf-8") as handle:
+            handle.write(_FIXTURE_LOG)
+
+        n = 40
+        barrier = threading.Barrier(n)
+
+        def _publish(i):
+            # Release all threads together to maximize contention on the catalog.
+            barrier.wait()
+            publish_to_vault(
+                title=f"Concurrent Note {i}",
+                body=f"summary {i}",
+                folder="Analysis",
+                vault_root=vault,
+                updated="2026-07-05",
+                catalog=True,
+            )
+
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            list(pool.map(_publish, range(n)))
+
+        with open(os.path.join(vault, "index.md"), encoding="utf-8") as handle:
+            index = handle.read()
+        with open(os.path.join(vault, "log.md"), encoding="utf-8") as handle:
+            log = handle.read()
+
+        for i in range(n):
+            assert f"[[Analysis/Concurrent Note {i}\\|Concurrent Note {i}]]" in index, (
+                f"index dropped row {i}"
+            )
+            assert f"Created note [[Analysis/Concurrent Note {i}|Concurrent Note {i}]]" in log, (
+                f"log dropped bullet {i}"
+            )
+
+        # Pre-existing catalog content is preserved through the concurrent writes.
+        assert "| [[Analysis/Existing\\|Existing]] | An existing analysis |" in index
+        assert "- 2026-06-30 — Seeded an earlier operation." in log
+
+        # Each note's own .md file was written (never at risk from the race).
+        for i in range(n):
+            assert os.path.exists(
+                os.path.join(vault, "Analysis", f"Concurrent Note {i}.md")
+            ), i
 
 
 # ── runner ───────────────────────────────────────────────────────────────────

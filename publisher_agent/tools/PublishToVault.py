@@ -12,11 +12,17 @@ the pure functions remain importable under a plain python3 (for tests) even when
 the framework is not installed.
 """
 
+import contextlib
 import json
 import os
 import re
 from datetime import date
 from pathlib import Path
+
+try:  # POSIX-only; the vault lives on macOS. Absent on non-POSIX -> no locking.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 DEFAULT_VAULT = "/Users/jasonluo08/Desktop/AI Brain"
 
@@ -185,21 +191,63 @@ def _first_line(text):
     return ""
 
 
+@contextlib.contextmanager
+def _catalog_lock(root):
+    """Hold an exclusive advisory lock while mutating the shared catalog files.
+
+    index.md and log.md are each updated by a non-atomic read-modify-write. Two
+    concurrent publishes (agency_swarm dispatches sync tools via asyncio.to_thread
+    worker threads, and the scheduler serves concurrent requests) would otherwise
+    read the same pre-image and the second write would clobber the first's freshly
+    added row/bullet — last-writer-wins silently drops a catalog entry. An
+    exclusive ``flock`` on a dedicated lockfile serializes the whole catalog
+    update (both files) across threads and processes so every entry survives.
+
+    ``flock`` is per-open-file-description, so two threads that each ``open`` the
+    lockfile still mutually exclude. Best-effort: if locking is unavailable
+    (non-POSIX, or the lockfile cannot be created), proceed without it rather than
+    failing the publish.
+    """
+    if fcntl is None:
+        yield
+        return
+    lock_path = Path(root) / ".catalog.lock"
+    try:
+        handle = open(lock_path, "w", encoding="utf-8")
+    except OSError:
+        yield
+        return
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def _catalog_note(root, folder, title, section=None, name=None, summary=None, when=None):
     """Upsert an index.md row + append a log.md line; best-effort (never fatal)."""
     when = when or date.today().isoformat()
     section = (section or folder).strip("/") or folder
     display = name or title
-    wikilink = f"{folder}/{title}"
+    # The wikilink target must name the note file that publish_to_vault actually
+    # writes, i.e. slugify_filename(title) (line-illegal chars stripped, whitespace
+    # collapsed). Building it from the raw title would point a colon/slash title
+    # (e.g. 'Report: Q3') at 'Analysis/Report: Q3', a name slugify never produces,
+    # leaving a dangling wikilink in index.md/log.md. Display keeps the raw title.
+    wikilink = f"{folder}/{slugify_filename(title)}"
     summary = summary or display
     try:
-        index_path = root / "index.md"
-        index_text = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
-        index_path.write_text(
-            upsert_index_row(index_text, section, wikilink, display, summary),
-            encoding="utf-8",
-        )
-        append_log(root, f"Created note [[{wikilink}|{display}]]", when)
+        with _catalog_lock(root):
+            index_path = root / "index.md"
+            index_text = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+            index_path.write_text(
+                upsert_index_row(index_text, section, wikilink, display, summary),
+                encoding="utf-8",
+            )
+            append_log(root, f"Created note [[{wikilink}|{display}]]", when)
     except OSError:
         pass
 

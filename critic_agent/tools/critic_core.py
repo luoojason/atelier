@@ -18,6 +18,9 @@ system python3.
 
 from __future__ import annotations
 
+import math
+import re
+
 # Scores are on a 0-10 scale. A dimension strictly below `block` is a hard fail;
 # every dimension at or above `ship` is clean. Anything in between is a revise.
 # These are the operator/server defaults; the agent cannot change them.
@@ -75,22 +78,59 @@ def _coerce_thresholds(thresholds) -> tuple:
 
 
 def _numeric_scores(scores) -> list:
-    """Coerce a {dimension: score} mapping into a list of float scores.
+    """Coerce a {dimension: score} mapping into a list of valid float scores.
 
-    An unreadable score (non-numeric) fails safe: it is treated as 0.0 so it can
-    never be counted as a passing dimension. This is deliberate — the gate exists
-    to stop a bad review from shipping, so garbage input errs toward blocking.
+    A score that is not a readable, finite number inside the [0, 10] domain fails
+    safe: it is treated as 0.0 so it can never be counted as a passing dimension.
+    This is deliberate — the gate exists to stop a bad review from shipping, so
+    garbage input errs toward blocking. "Garbage" here covers three things that
+    all used to slip through:
+
+      - non-numeric input (e.g. "n/a") -> ValueError on float(), coerced to 0.0;
+      - a non-finite float (NaN, +/-inf) -> float() accepts it, but NaN silently
+        satisfies neither `< block` nor `>= ship`, which used to launder a hard
+        failure down to "revise"; isfinite() rejects it to 0.0 so it blocks like
+        any other unreadable score;
+      - an out-of-domain number (e.g. 999 or -1) -> the scale is 0-10, so a value
+        outside it is not a real score. It is coerced to 0.0 (never clamped UP to
+        10), so typing a huge number can never manufacture a ship.
     """
     values = []
     for raw in (scores or {}).values():
         try:
-            values.append(float(raw))
+            num = float(raw)
         except (TypeError, ValueError):
             values.append(0.0)
+            continue
+        if not math.isfinite(num) or not (_SCORE_MIN <= num <= _SCORE_MAX):
+            values.append(0.0)
+            continue
+        values.append(num)
     return values
 
 
-def verdict_from_scores(scores: dict, thresholds: dict = None) -> str:
+def _defect_severity_rank(defects) -> int:
+    """Highest self-reported defect severity: 2=critical, 1=high, 0=none/other.
+
+    The instructions require every defect to be prefixed with its severity
+    ("CRITICAL: ...", "HIGH: ..."). Only the label before the first ':' is
+    inspected, so a severity word appearing later in the evidence prose cannot
+    trip a false positive. Unlabeled or lower-severity ("MEDIUM"/"LOW") defects
+    return 0 and do not move the gate on their own.
+    """
+    rank = 0
+    for defect in defects or []:
+        label = str(defect).split(":", 1)[0].lower()
+        words = set(re.findall(r"[a-z]+", label))
+        if "critical" in words:
+            rank = max(rank, 2)
+        elif "high" in words:
+            rank = max(rank, 1)
+    return rank
+
+
+def verdict_from_scores(scores: dict, thresholds: dict = None,
+                        defects=None) -> str:
     """Deterministically derive the publish verdict from dimension scores.
 
     Rules (0-10 scale, defaults block<4, ship>=8):
@@ -114,10 +154,31 @@ def verdict_from_scores(scores: dict, thresholds: dict = None) -> str:
     `thresholds` is an operator/config input only; see _coerce_thresholds. It is
     validated (clamped to 0-10, block < ship) before use, so a low score can
     never be shipped by fiat.
+
+    `defects` is a defect-floor cross-check so the evidence channel actually
+    gates instead of being decorative. A review that itself reports a blocking
+    problem cannot be shipped by typing high numbers next to it:
+      - a CRITICAL defect is a hard failure -> "block", overriding the scores;
+      - a HIGH defect can never ship -> a score-derived "ship" is downgraded to
+        "revise".
+    The floor only ever tightens the verdict (it never turns a block/revise into
+    a ship), and MEDIUM/LOW/unlabeled defects do not move it on their own.
     """
     block_t, ship_t = _coerce_thresholds(thresholds)
     scores = scores or {}
     values = _numeric_scores(scores)
+    verdict = _verdict_from_values(values, scores, block_t, ship_t)
+
+    severity = _defect_severity_rank(defects)
+    if severity >= 2:
+        return "block"
+    if severity >= 1 and verdict == "ship":
+        return "revise"
+    return verdict
+
+
+def _verdict_from_values(values, scores, block_t, ship_t) -> str:
+    """The score-only verdict, before the defect floor is applied."""
     if any(v < block_t for v in values):
         return "block"
     missing = [dim for dim in rubric() if dim not in scores]

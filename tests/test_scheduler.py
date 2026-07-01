@@ -1018,6 +1018,199 @@ def test_send_with_retry_retries_429_result():
     assert result["ok"] is True
 
 
+# --------------------------------------------------------------------------- #
+# regression tests — the six confirmed scheduler bugs
+# --------------------------------------------------------------------------- #
+
+
+def test_read_records_skips_malformed_line():
+    # Bug #1: a single torn/interleaved JSONL line must not abort the whole read.
+    # read_records should skip it (mirroring notify.read_notifications) so the
+    # overnight digest and any ledger inspection still see every intact record,
+    # instead of json.loads raising on the first bad line and killing the job.
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "runs.jsonl"
+        good1 = run_store.build_record("a", "T", "ok", 200, 1, None, 1, 1, None, "r")
+        good2 = run_store.build_record("b", "T", "ok", 200, 2, None, 1, 1, None, "r")
+        run_store.append_record(str(path), good1)
+        # A torn line, exactly as a crash mid-append / interleaved writers produce.
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write('{"name":"torn","stat\n')
+        run_store.append_record(str(path), good2)
+
+        back = run_store.read_records(str(path))
+        assert back == [good1, good2], back  # bad line skipped, intact ones kept
+
+
+def test_concurrent_rotate_append_loses_no_records():
+    # Bug #2: distinct scheduler threads firing on the same cron minute each run
+    # rotate_if_needed -> append_record against the one global ledger. Unlocked,
+    # the second rotation raced os.replace and raised FileNotFoundError, silently
+    # dropping that fire's record. Under _LEDGER_LOCK exactly one thread rotates
+    # the full file, the rest append to the fresh file, and nothing raises or is
+    # lost. Pre-fix this test fails (FileNotFoundError in the losing threads).
+    import tempfile
+    import threading
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(Path(tmp) / "runs.jsonl")
+        # Seed a comfortably over-threshold file so every thread sees a rotation
+        # is due; after the single rotation the fresh file stays well under it.
+        for i in range(200):
+            seed = run_store.build_record(f"seed{i}", "T", "ok", 200, i, None, 1, 1, None, "x")
+            run_store.append_record(path, seed)
+        max_bytes = 8192
+
+        n = 8
+        barrier = threading.Barrier(n)
+        errors = []
+
+        def fire(i):
+            rec = run_store.build_record(f"j{i}", "T", "ok", 200, i, None, 1, 1, None, "r")
+            try:
+                barrier.wait()  # release all threads into the rotation window at once
+                run_store.rotate_if_needed(path, max_bytes)
+                run_store.append_record(path, rec)
+            except Exception as exc:  # a raced rotation would surface here
+                errors.append(exc)
+
+        threads = [threading.Thread(target=fire, args=(i,)) for i in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], errors  # no FileNotFoundError from a raced rotation
+        live = run_store.read_records(path)
+        rotated = run_store.read_records(path + ".1")
+        combined = live + rotated
+        # Every seed record survived (rotated aside) and every fire's record is
+        # present: total is preserved, nothing was silently dropped or clobbered.
+        assert len(combined) == 200 + n, (len(live), len(rotated))
+        names = {r["name"] for r in combined}
+        for i in range(n):
+            assert f"j{i}" in names, (i, sorted(n for n in names if n.startswith("j")))
+
+
+def test_build_record_truncates_error():
+    # Bug #6: the redaction/bloat cap that guards response_excerpt must also guard
+    # the error field, so an adversarial server error body or a very long
+    # exception string cannot write an unbounded ledger line.
+    long_error = "E" * 20000
+    rec = run_store.build_record("j", "T", "error", 0, None, None, 5, 3, long_error, None)
+    assert len(rec["error"]) == run_store.ERROR_MAX_CHARS
+    # A short error passes through unchanged; None stays None (not the str "None").
+    rec_short = run_store.build_record("j", "T", "error", 0, None, None, 5, 3, "boom", None)
+    assert rec_short["error"] == "boom"
+    rec_none = run_store.build_record("j", "T", "ok", 200, None, None, 5, 1, None, "r")
+    assert rec_none["error"] is None
+
+
+def test_should_retry_excludes_write_phase_builtin_socket_errors():
+    # Bug #4: BrokenPipeError (peer closed mid-write) and ConnectionResetError
+    # (mid-stream reset) are ConnectionError subclasses, but the request may have
+    # already reached the server — the same ambiguous write phase as WriteTimeout,
+    # which is deliberately not retried. They must NOT be retried, or a scheduled
+    # side effect (e.g. a Publisher upload) could be doubled.
+    assert retry.should_retry(0, BrokenPipeError("peer closed while writing")) is False
+    assert retry.should_retry(0, ConnectionResetError("connection reset")) is False
+    # Genuine connect-phase failures never delivered the request -> still retryable.
+    assert retry.should_retry(0, ConnectionRefusedError("connection refused")) is True
+    assert retry.should_retry(0, ConnectionError("bare connect failure")) is True
+
+
+def test_make_runner_transport_failure_is_error_not_http0():
+    # Bug #3: when send_with_retry exhausts a connect-phase failure it returns the
+    # synthesized {"ok": False, "status_code": 0, "error": ...} dict (it never
+    # raises). make_runner must label that run "error" and preserve the text, not
+    # the nonsensical "http-0" it produced before the fix.
+    import tempfile
+    from pathlib import Path
+
+    import scheduler.scheduler as sched
+
+    def refused_send(*a, **k):
+        raise ConnectionError("connection refused - server down")
+
+    original_send = client.send
+    saved_sleep = retry.time.sleep
+    sched.client.send = refused_send
+    retry.time.sleep = lambda *_a: None  # never actually wait during retries
+    try:
+        with tempfile.TemporaryDirectory() as tmp, _scoped_env(
+            SWARM_RUNS_JSONL=str(Path(tmp) / "runs.jsonl"),
+            SWARM_NOTIFICATIONS=str(Path(tmp) / "notifications.jsonl"),
+            SWARM_AIEOS_URL=None,
+            SWARM_MAX_RETRIES="0",
+        ):
+            log_path = Path(tmp) / "runs.log"
+            job = {"name": "down", "schedule": "30m", "prompt": "hi"}
+            sched.make_runner(job, "http://h:8080", "open-swarm", None, log_path)()
+
+            text = log_path.read_text()
+            assert "\tdown\terror\t" in text, text
+            assert "http-0" not in text, text
+
+            records = run_store.read_records(str(Path(tmp) / "runs.jsonl"))
+            assert len(records) == 1, records
+            assert records[0]["status"] == "error"
+            assert records[0]["status_code"] == 0
+            assert "connection refused" in (records[0]["error"] or ""), records[0]
+
+            # A transport failure still fires the failure alert (status != "ok").
+            notes = notify.read_notifications(str(Path(tmp) / "notifications.jsonl"))
+            assert len(notes) == 1 and notes[0]["status"] == "error", notes
+    finally:
+        sched.client.send = original_send
+        retry.time.sleep = saved_sleep
+
+
+def test_make_runner_runlog_write_failure_does_not_suppress_ledger_and_alert():
+    # Bug #5: append_run_log runs before the deliberately-guarded ledger append
+    # and the failure notification. A transient FS fault on the run-log path must
+    # not propagate out of run() and suppress those durable sinks, so make_runner
+    # wraps the run-log write. The ledger record and the alert must still land.
+    import tempfile
+    from pathlib import Path
+
+    import scheduler.scheduler as sched
+
+    fake = _FakeClient(_FakeResponse(500, {"error": "boom"}))  # a failed run
+    original_send = client.send
+    saved_append = sched.append_run_log
+
+    def _explode_runlog(*a, **k):
+        raise PermissionError("runs.log is read-only")
+
+    sched.client.send = lambda *a, **k: original_send(*a, client=fake, **k)
+    sched.append_run_log = _explode_runlog
+    try:
+        with tempfile.TemporaryDirectory() as tmp, _scoped_env(
+            SWARM_RUNS_JSONL=str(Path(tmp) / "runs.jsonl"),
+            SWARM_NOTIFICATIONS=str(Path(tmp) / "notifications.jsonl"),
+            SWARM_AIEOS_URL=None,
+        ):
+            job = {"name": "loud", "schedule": "30m", "prompt": "hi"}
+            runner = sched.make_runner(
+                job, "http://h:8080", "open-swarm", None, Path(tmp) / "runs.log"
+            )
+            runner()  # must NOT raise despite the run-log write blowing up
+
+            # The durable ledger record still landed...
+            records = run_store.read_records(str(Path(tmp) / "runs.jsonl"))
+            assert len(records) == 1 and records[0]["status"] == "http-500", records
+            # ...and so did the failure alert.
+            notes = notify.read_notifications(str(Path(tmp) / "notifications.jsonl"))
+            assert len(notes) == 1 and notes[0]["name"] == "loud", notes
+    finally:
+        sched.client.send = original_send
+        sched.append_run_log = saved_append
+
+
 def _run_all():
     funcs = [
         (name, obj)

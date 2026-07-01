@@ -146,26 +146,47 @@ def read_note(path_or_title: str) -> str:
         c = candidate.resolve()
         return c == root_res or root_res in c.parents
 
-    # 1) absolute path — only honored when it is a .md file INSIDE the vault.
-    # Without this containment/extension check an absolute ident like
-    # "/etc/hosts" or "~/.pypirc" would be read straight off disk, turning this
-    # into an arbitrary-file-read (exfiltration) primitive. Absolute idents that
-    # fail the check raise immediately rather than falling through to the
-    # relative branch (where `root / "/abs"` would collapse back to the abs path).
+    def _readable_note(candidate: Path) -> bool:
+        """A candidate is readable only if it is a .md file safely inside the
+        vault and not under a skipped dir (Sources/.git/.obsidian/.trash).
+
+        This is the SAME guard for the absolute and the relative branch. Without
+        it either branch is an arbitrary-file-read (exfiltration) primitive: the
+        relative branch previously returned ANY file inside the vault, so idents
+        like ".git/config" (tokenized remote URLs), "secret.txt"/".env", or
+        ".obsidian/workspace.json" leaked straight off disk even though the
+        absolute branch already rejected the same files. The suffix check is on
+        the resolved path so a symlink note.md -> secret.txt can't slip through.
+        """
+        if not _inside_vault(candidate):
+            return False
+        c = candidate.resolve()
+        if c.suffix.lower() != ".md" or not c.is_file():
+            return False
+        try:
+            rel_parts = c.relative_to(root_res).parts
+        except ValueError:
+            return False
+        return not _is_skipped(rel_parts[:-1])
+
+    # 1) absolute path — only honored when it is a .md note INSIDE the vault.
+    # Absolute idents that fail the guard raise immediately rather than falling
+    # through to the relative branch (where `root / "/abs"` would collapse back
+    # to the abs path).
     p = Path(ident).expanduser()
     if p.is_absolute():
-        if _inside_vault(p) and p.suffix.lower() == ".md" and p.is_file():
+        if _readable_note(p):
             return p.read_text(encoding="utf-8", errors="replace")
         raise FileNotFoundError(f"Note not found: {path_or_title}")
 
-    # 2) relative to vault root (with or without .md suffix). resolve() the
-    # candidate and require it to stay inside the vault so that '..' traversal
-    # (e.g. "../../etc/hosts") cannot escape.
+    # 2) relative to vault root (with or without .md suffix), guarded IDENTICALLY
+    # to the absolute branch so the relative form is not a weaker exfil path. The
+    # resolve()-based containment check also blocks '..' traversal.
     candidates = [root / ident]
     if not ident.endswith(".md"):
         candidates.append(root / f"{ident}.md")
     for cand in candidates:
-        if _inside_vault(cand) and cand.is_file():
+        if _readable_note(cand):
             return cand.read_text(encoding="utf-8", errors="replace")
 
     # 3) match by filename stem or frontmatter title
@@ -259,6 +280,29 @@ def _row_wikilink_target(line: str):
     return m.group(1).strip() if m else None
 
 
+def _escape_table_cell(value: str) -> str:
+    """Collapse whitespace and escape ``|`` so a value is safe in a table cell.
+
+    A raw pipe inside a Markdown table cell starts a new column, so a summary
+    such as ``'cost | benefit'`` (realistic: the default summary is the note's
+    first body line) would otherwise inject a spurious column and corrupt the
+    two-column index row. GFM / Obsidian render ``\\|`` as a literal pipe. This
+    mirrors publisher_agent/tools/PublishToVault._escape_table_cell.
+    """
+    return " ".join((value or "").split()).replace("|", "\\|")
+
+
+def _escape_wikilink_name(value: str) -> str:
+    """Escape a display name for use inside ``[[target\\|name]]`` in a table cell.
+
+    A raw ``|`` in the name would read as another alias separator AND inject a
+    table column; ``]]`` would close the wikilink early and spill the rest of the
+    name into the row as broken markup. Both are neutralized so the row stays a
+    single, well-formed two-column entry.
+    """
+    return (value or "").replace("]]", "] ]").replace("|", "\\|")
+
+
 def upsert_index_row(index_text: str, section: str, wikilink: str,
                      name: str, summary: str) -> str:
     """Idempotently insert/update a ``| [[wikilink\\|name]] | summary |`` index row.
@@ -272,8 +316,11 @@ def upsert_index_row(index_text: str, section: str, wikilink: str,
     """
     wikilink = (wikilink or "").strip()
     name = (name or "").strip() or wikilink
-    summary = " ".join((summary or "").split())
-    new_row = f"| [[{wikilink}\\|{name}]] | {summary} |"
+    # The wikilink target stays raw (it is dedupe-keyed and _catalog_note derives
+    # it from a sanitized filename, so it carries no table-breaking chars); the
+    # free-text name and summary are escaped so user body text can't corrupt the
+    # row's column layout or close the wikilink early.
+    new_row = f"| [[{wikilink}\\|{_escape_wikilink_name(name)}]] | {_escape_table_cell(summary)} |"
 
     lines = index_text.split("\n")
 
@@ -347,7 +394,13 @@ def _catalog_note(root: Path, folder: str, title: str, *, section=None,
     when = when or date.today().isoformat()
     section = (section or folder).strip("/") or folder
     display = name or title
-    wikilink = f"{folder}/{title}"
+    # The note is saved as _safe_filename(title) (line in write_note), which
+    # rewrites '/ \\ : * ? " < > | \\n \\t' to '-'. Obsidian resolves [[...]]
+    # against the FILENAME, not the frontmatter title, so the index/log wikilink
+    # target must be built from that sanitized stem -- otherwise any title with a
+    # sanitized char (colons/slashes are common) yields a dead link. The raw
+    # title is kept only as the human-readable display name.
+    wikilink = f"{folder}/{Path(_safe_filename(title)).stem}"
     summary = summary or display
     try:
         index_path = root / "index.md"

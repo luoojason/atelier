@@ -8,6 +8,7 @@ and ``upload_fn`` callables are injected.
     python3 tests/test_oneshot.py
 """
 
+import datetime
 import os
 import sys
 
@@ -59,17 +60,27 @@ class _FakeUpload:
 
 # ── happy path: render -> upload ─────────────────────────────────────────────
 
+def _future_iso(days=30):
+    """A whole-second, Z-suffixed UTC timestamp safely in the future."""
+    return (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=days)
+    ).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def test_render_then_upload_passes_path_and_meta_and_returns_upload_result():
     render = _FakeRender({OUTPUT_KEY: "/tmp/x.mp4"})
     upload = _FakeUpload()
 
+    # A dynamically-computed future time so the happy path (which now validates
+    # publish_at before rendering) stays valid regardless of the run date.
+    future = _future_iso()
     out = render_and_upload(
         render,
         upload,
         text="hello world",
         title="My Short",
         privacy="public",
-        publish_at="2026-07-05T14:00:00Z",
+        publish_at=future,
     )
 
     # returns the upload result unchanged
@@ -85,7 +96,7 @@ def test_render_then_upload_passes_path_and_meta_and_returns_upload_result():
     meta = call["meta"]
     assert meta["title"] == "My Short", meta
     assert meta["privacy"] == "public", meta
-    assert meta["publish_at"] == "2026-07-05T14:00:00Z", meta
+    assert meta["publish_at"] == future, meta
 
 
 def test_render_called_once_with_text_and_title():
@@ -185,6 +196,46 @@ def test_blank_text_counts_as_missing():
     else:
         raise AssertionError("blank text should count as missing input")
     assert render.calls == []
+
+
+# ── publish_at validated BEFORE the expensive render (fail fast) ─────────────
+
+def test_past_publish_at_validated_before_render():
+    # A past schedule time must be rejected up front, before paying for a full
+    # TTS+ffmpeg+whisper render (which the old code did, only failing at upload).
+    render = _FakeRender({OUTPUT_KEY: "/tmp/x.mp4"})
+    upload = _FakeUpload()
+    past = "2020-01-01T00:00:00Z"
+    try:
+        render_and_upload(render, upload, text="hi", title="T", publish_at=past)
+    except ValueError as exc:
+        assert "future" in str(exc).lower(), exc
+    else:
+        raise AssertionError("expected ValueError for a past publish_at")
+    assert render.calls == [], "render must NOT run when publish_at is in the past"
+    assert upload.calls == []
+
+
+def test_malformed_publish_at_validated_before_render():
+    render = _FakeRender({OUTPUT_KEY: "/tmp/x.mp4"})
+    upload = _FakeUpload()
+    try:
+        render_and_upload(render, upload, text="hi", title="T", publish_at="not-a-date")
+    except ValueError as exc:
+        assert "iso-8601" in str(exc).lower(), exc
+    else:
+        raise AssertionError("expected ValueError for a malformed publish_at")
+    assert render.calls == [], "render must NOT run when publish_at is malformed"
+    assert upload.calls == []
+
+
+def test_no_publish_at_still_renders_and_uploads():
+    # The eager validation must be a no-op for the common unscheduled case.
+    render = _FakeRender({OUTPUT_KEY: "/tmp/x.mp4"})
+    upload = _FakeUpload()
+    out = render_and_upload(render, upload, text="hi", title="T")
+    assert out["ok"] is True, out
+    assert len(render.calls) == 1 and len(upload.calls) == 1
 
 
 # ── render_string_to_result adapter (glue used by the BaseTool) ──────────────

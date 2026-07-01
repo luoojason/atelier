@@ -12,8 +12,18 @@ from shared_tools import CopyFile, ExecuteTool, FindTools, ManageConnections, Se
 
 _load_openswarm_dotenv()
 
-# Class-level rename — idempotent, safe to run once at import time.
-IPythonInterpreter.__name__ = "ProgrammaticToolCalling"
+
+# The General Agent's instructions refer to the code-execution tool as
+# "ProgrammaticToolCalling" (the Composio programmatic-call workflow), while
+# every other agent (Data Analyst, Docs, Slides, Deep Research) refers to the
+# SAME shared class as "IPythonInterpreter". The model-facing tool name is
+# derived from the class __name__, so renaming the shared IPythonInterpreter
+# in place would contaminate all those other agents. Instead, expose a thin
+# local subclass to the General Agent only: it inherits the interpreter's
+# behavior, docstring, schema, and the Composio run-patch, but carries its own
+# name, leaving the shared class untouched for the other agents.
+class ProgrammaticToolCalling(IPythonInterpreter):
+    __doc__ = IPythonInterpreter.__doc__
 
 
 def create_virtual_assistant() -> Agent:
@@ -31,7 +41,7 @@ def create_virtual_assistant() -> Agent:
         tools=[
             WebSearchTool(),
             PersistentShellTool,
-            IPythonInterpreter,
+            ProgrammaticToolCalling,
             CopyFile,
             ExecuteTool,
             FindTools,

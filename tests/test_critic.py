@@ -137,6 +137,86 @@ def test_non_numeric_score_fails_safe():
     print("ok test_non_numeric_score_fails_safe")
 
 
+def test_nan_and_infinite_scores_fail_safe():
+    # Regression (bug 3): a non-finite score (NaN / +-inf) is unreadable garbage,
+    # not a passing score. It must fail safe to blocking exactly like the string
+    # 'n/a' case, instead of laundering a hard failure down to 'revise' (NaN
+    # satisfies neither `< block` nor `>= ship`, so it used to fall through to
+    # revise). A bare NaN token is reachable: json.loads accepts it by default.
+    scores = _all(9)
+    scores["brief_adherence"] = float("nan")
+    assert verdict_from_scores(scores) == "block", "NaN must block, not revise"
+    for bad in (float("inf"), float("-inf")):
+        s = _all(9)
+        s["factual_support"] = bad
+        assert verdict_from_scores(s) == "block", bad
+    # NaN can still never manufacture a ship either
+    assert verdict_from_scores(_all(float("nan"))) == "block"
+    print("ok test_nan_and_infinite_scores_fail_safe")
+
+
+def test_out_of_range_scores_cannot_ship():
+    # Regression (bug 2, range): scores live on a 0-10 scale; a value outside it
+    # is not a real score. It is coerced to 0.0 (never clamped UP to 10), so
+    # typing a huge number can never buy a ship.
+    assert verdict_from_scores(_all(999)) == "block"
+    assert verdict_from_scores(_all(-1)) == "block"
+    scores = _all(9)
+    scores["completeness"] = 1000
+    assert verdict_from_scores(scores) == "block"
+    print("ok test_out_of_range_scores_cannot_ship")
+
+
+def test_defects_gate_the_verdict():
+    # Regression (bug 2, defect gate): the evidence channel is not decorative. A
+    # self-reported blocking defect cannot be shipped by typing high scores.
+    assert verdict_from_scores(_all(10)) == "ship"  # baseline: clean ships
+    # a CRITICAL defect forces block despite perfect scores
+    assert verdict_from_scores(
+        _all(10), defects=["CRITICAL: fabricated statistic (section 2)"]
+    ) == "block"
+    # a HIGH defect can never ship; a would-be ship downgrades to revise
+    assert verdict_from_scores(
+        _all(10), defects=["HIGH: omits Q3 churn required by must_include"]
+    ) == "revise"
+    # MEDIUM / LOW / unlabeled defects do not move a clean ship on their own
+    assert verdict_from_scores(_all(10), defects=["LOW: minor typo"]) == "ship"
+    assert verdict_from_scores(_all(10), defects=["MEDIUM: tighten intro"]) == "ship"
+    assert verdict_from_scores(_all(10), defects=["reads a little dry"]) == "ship"
+    # the floor only tightens: it never relaxes a block into a lesser verdict
+    low = _all(9)
+    low["factual_support"] = 1
+    assert verdict_from_scores(low, defects=["LOW: typo"]) == "block"
+    # severity is read from the label before ':', not from prose after it
+    assert verdict_from_scores(
+        _all(10), defects=["LOW: a critical outage is merely discussed"]
+    ) == "ship"
+    print("ok test_defects_gate_the_verdict")
+
+
+def test_scorecard_tool_wires_defects_into_gate():
+    # Regression (bug 2, wiring): the ScoreCard BaseTool must FEED its defects
+    # into the gate, not just render them. Needs agency_swarm/pydantic, so this
+    # is skipped under the bare python3 run and exercised under the agents venv
+    # (.venv-ext/bin/python).
+    try:
+        sys.path.insert(0, _REPO_ROOT)
+        from critic_agent.tools.ScoreCard import ScoreCard
+    except Exception as exc:  # agency_swarm/pydantic absent -> skip cleanly
+        print(f"skip test_scorecard_tool_wires_defects_into_gate ({exc.__class__.__name__})")
+        return
+    clean = _all(10)
+    assert ScoreCard(scores=clean, defects=[]).run().strip().endswith("Verdict: SHIP")
+    gated = ScoreCard(
+        scores=clean, defects=["CRITICAL: fabricated statistic (section 2)"]
+    ).run()
+    assert gated.strip().endswith("Verdict: BLOCK"), gated
+    # a huge score no longer ships either
+    huge = _all(999)
+    assert ScoreCard(scores=huge, defects=[]).run().strip().endswith("Verdict: BLOCK")
+    print("ok test_scorecard_tool_wires_defects_into_gate")
+
+
 def test_format_scorecard_renders_verdict_and_defects():
     scores = _all(9)
     scores["format"] = 6
@@ -180,6 +260,10 @@ def _run():
         test_partial_rubric_never_ships,
         test_empty_scores_never_ship,
         test_non_numeric_score_fails_safe,
+        test_nan_and_infinite_scores_fail_safe,
+        test_out_of_range_scores_cannot_ship,
+        test_defects_gate_the_verdict,
+        test_scorecard_tool_wires_defects_into_gate,
         test_format_scorecard_renders_verdict_and_defects,
         test_format_scorecard_marks_unscored_dims,
     ]

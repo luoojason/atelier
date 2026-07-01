@@ -22,8 +22,10 @@ so ``import claude_subscription_model`` works even without the SDK present.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from typing import Any, Callable
@@ -83,11 +85,63 @@ def _tool_fields(tool: Any) -> tuple[str, str, dict]:
     return name, description, schema
 
 
+def _resolve_tool_choice(model_settings: Any) -> str | None:
+    """Pull ``tool_choice`` off a ModelSettings-like object (duck-typed).
+
+    ``ModelSettings.tool_choice`` is ``"auto"`` / ``"required"`` / ``"none"`` or a
+    specific tool name, or ``None`` when unset. Read via ``getattr`` so this stays
+    stdlib-only (no ``agents`` import) and testable under bare python3.
+    """
+    if model_settings is None:
+        return None
+    choice = getattr(model_settings, "tool_choice", None)
+    return choice if isinstance(choice, str) else None
+
+
+def _tool_choice_instruction(tool_choice: Any, has_callables: bool) -> str | None:
+    """Render a system-prompt instruction that enforces a non-default ``tool_choice``.
+
+    The ``claude -p`` subscription CLI has no ``--tool-choice`` flag, so a forced
+    tool choice is bridged the same way the tools themselves are: as an instruction
+    appended to the system prompt. Returns ``None`` for the default ``"auto"`` (or an
+    unset/empty choice) so the happy path is unchanged.
+    """
+    if not isinstance(tool_choice, str):
+        return None
+    choice = tool_choice.strip()
+    lowered = choice.lower()
+    if not lowered or lowered == "auto":
+        return None
+    if lowered == "none":
+        return (
+            "# Tool choice\n\n"
+            "Do NOT call any tool this turn. Answer directly in plain text."
+        )
+    if not has_callables:
+        # Forcing a call with nothing to call would only stall the model.
+        return None
+    if lowered in ("required", "any"):
+        return (
+            "# Tool choice\n\n"
+            "You MUST call one of the available tools this turn. Respond with ONLY "
+            "the single fenced `json` tool_call block described above and nothing "
+            "else — do not answer in plain prose."
+        )
+    # A specific tool name was forced.
+    return (
+        "# Tool choice\n\n"
+        f"You MUST call the tool named `{choice}` this turn. Respond with ONLY the "
+        f'single fenced `json` tool_call block described above (with "name": '
+        f'"{choice}") and nothing else.'
+    )
+
+
 def build_system_prompt(
     system_instructions: str | None,
     tools: list | None,
     output_schema: Any | None,
     handoffs: list | None = None,
+    tool_choice: Any = None,
 ) -> str:
     """Assemble the string handed to ``--append-system-prompt``.
 
@@ -145,6 +199,10 @@ def build_system_prompt(
             lines.append("```")
             lines.append("")
         parts.append("\n".join(lines).rstrip())
+
+    tc_instruction = _tool_choice_instruction(tool_choice, bool(callables))
+    if tc_instruction:
+        parts.append(tc_instruction)
 
     if output_schema is not None and not _is_plain_text(output_schema):
         try:
@@ -271,7 +329,18 @@ def _tool_call_from_obj(obj: Any) -> dict | None:
     if not isinstance(name, str) or not name:
         return None
     args = tc.get("arguments")
-    if not isinstance(args, dict):
+    if isinstance(args, str):
+        # LLMs frequently emit ``arguments`` as a JSON-ENCODED STRING (the same
+        # convention the OpenAI/Anthropic function-call schema uses) rather than a
+        # nested object, e.g. ``"arguments": "{\"city\": \"Paris\"}"``. Decode it
+        # back into a dict instead of silently discarding the caller's arguments
+        # and firing the tool with an empty ``{}``.
+        try:
+            decoded = json.loads(args)
+        except (ValueError, TypeError):
+            decoded = None
+        args = decoded if isinstance(decoded, dict) else {}
+    elif not isinstance(args, dict):
         args = {}
     return {"name": name, "arguments": args}
 
@@ -367,25 +436,67 @@ def run_cli(
 
     ``runner`` is injectable (defaults to :func:`subprocess.run`) so tests can feed
     a canned CLI JSON response without touching the network or a real subscription.
-    Returns the parsed CLI JSON dict; raises ``RuntimeError`` on failure.
+    Returns the parsed CLI JSON dict; raises ``RuntimeError`` on failure — including
+    a CLI timeout or a failure to launch the process, both of which are normalized
+    to ``RuntimeError`` so callers only ever need to catch that single type.
     """
     argv: list[str] = [cli_path, "-p", "--output-format", "json"]
+
+    # The system prompt embeds every tool's/handoff's full JSON Schema and can grow
+    # large; passing it as a single argv element risks OSError E2BIG (ARG_MAX
+    # overflow). Write it to a private temp file and reference it via the CLI's
+    # ``--append-system-prompt-file`` flag instead — the user prompt already goes on
+    # stdin, so nothing unbounded lands on argv. The file is removed once the CLI
+    # returns (it is fully consumed synchronously by then).
+    system_prompt_file: str | None = None
     if system:
-        argv += ["--append-system-prompt", system]
+        fd, system_prompt_file = tempfile.mkstemp(
+            prefix="claude_sysprompt_", suffix=".txt"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(system)
+        except Exception:
+            os.unlink(system_prompt_file)
+            raise
+        argv += ["--append-system-prompt-file", system_prompt_file]
     if model:
         argv += ["--model", model]
-    tools = DEFAULT_DISALLOWED_TOOLS if disallowed_tools is None else disallowed_tools
+
+    # Resolve the native-tool denylist. ``None`` (unset) AND an empty list both fall
+    # back to the safe default: an empty list must NOT silently re-enable the CLI's
+    # own side-effecting tools (Bash/Write/Edit/WebFetch/...), which would defeat the
+    # bridge's whole guardrail. ``[]`` is a natural but dangerous way to say "no
+    # restrictions" (config.get(k, []), ``x or []``, JSON-omitted field), so only a
+    # NON-EMPTY override replaces the default denylist.
+    tools = disallowed_tools or DEFAULT_DISALLOWED_TOOLS
     if tools:
         # Variadic option kept last so it never swallows a following flag/value.
         argv += ["--disallowedTools", *tools]
 
-    completed = runner(
-        argv,
-        input=user,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        completed = runner(
+            argv,
+            input=user,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # subprocess.run raises TimeoutExpired (NOT a RuntimeError); normalize it so
+        # the documented single-exception contract holds for the slow-path the
+        # module explicitly anticipates ("agent turns can be slow").
+        raise RuntimeError(f"claude CLI timed out after {timeout}s") from exc
+    except OSError as exc:
+        # e.g. E2BIG (argument list too long) or the CLI binary missing — surface as
+        # the documented RuntimeError rather than a raw, uncaught OSError.
+        raise RuntimeError(f"claude CLI could not be launched: {exc}") from exc
+    finally:
+        if system_prompt_file is not None:
+            try:
+                os.unlink(system_prompt_file)
+            except OSError:
+                pass
 
     returncode = getattr(completed, "returncode", 0)
     stdout = getattr(completed, "stdout", "") or ""
@@ -442,8 +553,13 @@ class ClaudeSubscriptionModel(_ModelBase):  # type: ignore[misc,valid-type]
 
     # -- internal --------------------------------------------------------------
 
-    def _invoke(self, system_instructions, input, tools, output_schema, handoffs=None) -> dict:
-        system = build_system_prompt(system_instructions, tools, output_schema, handoffs)
+    def _invoke(
+        self, system_instructions, input, tools, output_schema, handoffs=None, model_settings=None
+    ) -> dict:
+        tool_choice = _resolve_tool_choice(model_settings)
+        system = build_system_prompt(
+            system_instructions, tools, output_schema, handoffs, tool_choice
+        )
         user = serialize_input(input)
         return run_cli(
             system,
@@ -526,7 +642,13 @@ class ClaudeSubscriptionModel(_ModelBase):  # type: ignore[misc,valid-type]
         from agents.items import ModelResponse
 
         cli_data = await asyncio.to_thread(
-            self._invoke, system_instructions, input, tools, output_schema, handoffs
+            self._invoke,
+            system_instructions,
+            input,
+            tools,
+            output_schema,
+            handoffs,
+            model_settings,
         )
         parsed = parse_result(cli_data.get("result", ""))
         output = self._build_output_items(parsed)

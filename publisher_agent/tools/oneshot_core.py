@@ -17,6 +17,16 @@ reddit-shorts media pipeline or the YouTube network:
   upload result dict (``{"ok": bool, "video_id", "url", ...}``).
 """
 
+# The publish_at validator is the single source of truth for schedule-time rules
+# (must parse as ISO-8601 and be strictly in the future). Import it so the one-shot
+# can reject a bad schedule BEFORE the expensive render instead of after. Relative
+# import in production (publisher_agent.tools.oneshot_core); flat import under the
+# test harness, which puts the tools dir on sys.path.
+try:  # package context
+    from .youtube_core import normalize_publish_at
+except ImportError:  # flat import (tests)
+    from youtube_core import normalize_publish_at
+
 # The key that a render-result dict uses for the finished .mp4 path. Kept in sync
 # with video_generation_agent.tools.shorts_core.OUTPUT_KEY.
 OUTPUT_KEY = "output_path"
@@ -81,6 +91,14 @@ def render_and_upload(
         raise ValueError("provide exactly one of `text` or `subreddit`, not both")
     if not has_text and not has_sub:
         raise ValueError("provide exactly one of `text` or `subreddit`")
+
+    # Validate the schedule time BEFORE rendering. publish_at is a trivially
+    # checkable primary input, but the only validator (normalize_publish_at, via
+    # upload_fn -> build_upload_request) otherwise runs AFTER the expensive
+    # TTS+ffmpeg+whisper render, so a past/malformed timestamp would pay for a full
+    # render only to fail at upload. Fail fast, mirroring the pre-render guards
+    # above. Raises ValueError for a past or unparseable timestamp; None/"" is fine.
+    normalize_publish_at(publish_at)
 
     render_result = render_fn(text=text, title=title, subreddit=subreddit)
 

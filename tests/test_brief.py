@@ -193,6 +193,77 @@ def test_save_coexists_with_plain_memory_entries():
         print("ok test_save_coexists_with_plain_memory_entries")
 
 
+def test_corrupt_store_is_preserved_not_wiped():
+    # Regression (bug 1): a corrupt/truncated store must never be silently wiped
+    # by the next save. After briefs exist, the file is truncated (as an
+    # interrupted write or a hand-edit would leave it). The next save must NOT
+    # read the corrupt file as empty and overwrite it with a single entry.
+    # Instead the corrupt bytes are preserved to a sibling backup and a warning
+    # is raised, so no prior data is silently or permanently destroyed.
+    import warnings
+
+    with temp_memory() as mem:
+        mp = memory_path()
+        save_brief(build_brief("keep me", project="acme"), mp)
+        save_brief(build_brief("me too", project="beta"), mp)
+        # simulate an interrupted write / hand-edit: a truncated, unparseable file
+        mem.write_text('[{"kind": "brief", "text": "acme"', encoding="utf-8")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            save_brief(build_brief("after corruption", project="gamma"), mp)
+
+        # not silent: a RuntimeWarning was raised about the corruption
+        assert any(issubclass(w.category, RuntimeWarning) for w in caught), caught
+        # not wiped: the corrupt bytes were moved aside, not destroyed
+        backups = list(mem.parent.glob(mem.name + ".corrupt-*"))
+        assert len(backups) == 1, backups
+        assert "acme" in backups[0].read_text(encoding="utf-8")
+        # the store is usable again; the new brief round-trips
+        assert load_brief("gamma", mp)["goal"] == "after corruption"
+        print("ok test_corrupt_store_is_preserved_not_wiped")
+
+
+def test_concurrent_appends_never_lose_entries():
+    # Regression (bug 4): N processes appending at once must lose nothing. Without
+    # the exclusive lock this is a classic lost update -- overlapping
+    # load->append->write cycles clobber each other and the file ends up with far
+    # fewer than N*M entries. With the lock every append survives, and the atomic
+    # writer leaves no temp files behind.
+    import json as _json
+    import subprocess
+
+    with temp_memory() as mem:
+        workers = 6
+        per_worker = 40
+        worker_src = (
+            "import sys; sys.path.insert(0, sys.argv[1]);"
+            "import memory_core;"
+            "wid = sys.argv[2]; n = int(sys.argv[3]);"
+            "[memory_core.remember('fact', wid + '-' + str(i)) for i in range(n)]"
+        )
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", worker_src, str(_SHARED), f"w{w}", str(per_worker)]
+            )
+            for w in range(workers)
+        ]
+        for p in procs:
+            assert p.wait() == 0, "worker process failed"
+
+        entries = _json.loads(mem.read_text(encoding="utf-8"))
+        assert len(entries) == workers * per_worker, (
+            f"expected {workers * per_worker} entries, kept {len(entries)}"
+        )
+        # every worker's full run survived, none partially clobbered
+        for w in range(workers):
+            got = sum(1 for e in entries if str(e.get("text", "")).startswith(f"w{w}-"))
+            assert got == per_worker, (w, got)
+        # the atomic writer cleaned up after itself
+        assert not list(mem.parent.glob(mem.name + ".*.tmp"))
+        print("ok test_concurrent_appends_never_lose_entries")
+
+
 def _run():
     tests = [
         test_build_brief_goal_only,
@@ -201,6 +272,8 @@ def _run():
         test_load_unknown_project_returns_none,
         test_briefs_are_scoped_by_project,
         test_save_coexists_with_plain_memory_entries,
+        test_corrupt_store_is_preserved_not_wiped,
+        test_concurrent_appends_never_lose_entries,
     ]
     for t in tests:
         t()

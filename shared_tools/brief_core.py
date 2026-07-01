@@ -16,7 +16,6 @@ these functions, and the tests import only these pure helpers + stdlib.
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,9 +25,9 @@ from pathlib import Path
 # fails) the loader is imported directly from memory_core, which the test puts
 # on sys.path.
 try:  # pragma: no cover - exercised by both paths across environments
-    from shared_tools.memory_core import _load
+    from shared_tools.memory_core import _append_entry, _load
 except ImportError:  # pragma: no cover
-    from memory_core import _load
+    from memory_core import _append_entry, _load
 
 
 def _norm(value) -> str | None:
@@ -63,14 +62,16 @@ def build_brief(goal, fmt=None, must_include=None, must_avoid=None,
 def save_brief(brief, memory_path) -> dict:
     """Append `brief` to the memory JSON at `memory_path` and return the entry.
 
-    Uses the same append-only pattern as memory_core.remember: load the JSON
-    list (tolerating a missing/corrupt file), append one entry, write it back.
-    The entry is shaped like a memory entry ({ts, kind, text, project}) plus a
-    `brief` key holding the full structured dict; kind is "brief" and the entry
-    is keyed by the brief's project.
+    Uses memory_core._append_entry, the single durable write path the store
+    shares with memory_core.remember: the load->append->write runs under an
+    exclusive cross-process lock, the file is replaced atomically (never
+    truncated by an interrupted write), and a pre-existing corrupt store is
+    preserved to a `<name>.corrupt-<ts>` sibling with a warning rather than being
+    silently overwritten. The entry is shaped like a memory entry
+    ({ts, kind, text, project}) plus a `brief` key holding the full structured
+    dict; kind is "brief" and the entry is keyed by the brief's project.
     """
     path = Path(memory_path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "kind": "brief",
@@ -78,11 +79,7 @@ def save_brief(brief, memory_path) -> dict:
         "project": _norm(brief.get("project") if isinstance(brief, dict) else None),
         "brief": dict(brief) if isinstance(brief, dict) else {},
     }
-    entries = _load(path)
-    entries.append(entry)
-    path.write_text(json.dumps(entries, indent=2, ensure_ascii=False),
-                    encoding="utf-8")
-    return entry
+    return _append_entry(path, entry)
 
 
 def load_brief(project, memory_path):

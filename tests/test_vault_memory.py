@@ -392,6 +392,128 @@ def test_write_note_catalog_false_skips_catalog():
     print("ok test_write_note_catalog_false_skips_catalog")
 
 
+def test_recall_limit_zero_and_negative_return_none():
+    # Regression (bug 6): recall(limit=0) must return NONE, not the whole store.
+    # entries[-0:] == entries[0:] == everything, and a negative limit skipped the
+    # slice entirely, so both used to dump the entire memory store into context.
+    with tempfile.TemporaryDirectory() as tmp:
+        mem = Path(tmp) / "swarm_memory.json"
+        os.environ["SWARM_MEMORY_PATH"] = str(mem)
+        remember("fact", "one")
+        remember("fact", "two")
+        remember("fact", "three")
+
+        assert recall(limit=0) == [], "limit=0 must return no entries"
+        assert recall(limit=-1) == [], "a negative limit must return no entries"
+        assert recall(limit=-5) == [], "any negative limit clamps to none"
+        # positive and None limits are unaffected.
+        last = recall(limit=1)
+        assert len(last) == 1 and last[0]["text"] == "three", last
+        assert len(recall(limit=None)) == 3, "limit=None disables the cap"
+        assert len(recall()) == 3, "default limit returns all when store is small"
+    print("ok test_recall_limit_zero_and_negative_return_none")
+
+
+def test_catalog_wikilink_targets_sanitized_filename():
+    # Regression (bug 3): the index/log wikilink must target the SANITIZED
+    # filename the note is actually saved under, not the raw title. Obsidian
+    # resolves [[...]] against the filename, so a title with a character
+    # _safe_filename rewrites (colons/slashes are common) otherwise produces an
+    # index row pointing at a file that does not exist -- a dead link.
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["OBSIDIAN_VAULT"] = tmp
+        root = Path(tmp)
+        (root / "index.md").write_text(_FIXTURE_INDEX, encoding="utf-8")
+        (root / "log.md").write_text(_FIXTURE_LOG, encoding="utf-8")
+
+        write_note("Projects", "GeoAI: Status Q3", "body line here", catalog=True)
+
+        # the note is saved under the sanitized filename ...
+        saved = root / "Projects" / "GeoAI- Status Q3.md"
+        assert saved.is_file(), "note saved under sanitized filename"
+
+        index = (root / "index.md").read_text(encoding="utf-8")
+        # ... and the wikilink TARGET matches that real file while the display
+        # name keeps the raw title.
+        assert "[[Projects/GeoAI- Status Q3\\|GeoAI: Status Q3]]" in index, index
+        # the old dead-link form (raw colon in the target) must be gone.
+        assert "[[Projects/GeoAI: Status Q3\\|" not in index, \
+            "wikilink target must not be built from the raw title"
+        # log.md link targets the real file too.
+        log = (root / "log.md").read_text(encoding="utf-8")
+        assert "[[Projects/GeoAI- Status Q3|GeoAI: Status Q3]]" in log, log
+    print("ok test_catalog_wikilink_targets_sanitized_filename")
+
+
+def test_upsert_index_row_escapes_pipe_and_brackets():
+    # Regression (bug 4): a '|' in summary/name injects extra table columns and a
+    # ']]' in a name closes the wikilink early. Both must be neutralized so the
+    # row stays a valid two-column entry (the sibling PublishToVault already did
+    # this; the fix was never ported to vault_core until now).
+    text = upsert_index_row(_FIXTURE_INDEX, "Projects", "Projects/W", "W", "cost | benefit")
+    assert "| [[Projects/W\\|W]] | cost \\| benefit |" in text
+    assert "| cost | benefit |" not in text
+    row = next(ln for ln in text.splitlines() if "Projects/W" in ln)
+    # after removing the escaped pipes, only the 3 structural table pipes remain.
+    assert row.replace("\\|", "").count("|") == 3, row
+    # escaping does not disturb dedupe/idempotency.
+    text2 = upsert_index_row(text, "Projects", "Projects/W", "W", "again | still")
+    assert text2.count("[[Projects/W\\|") == 1
+
+    # a name containing '|' AND ']]' must not corrupt the row or close the link.
+    text3 = upsert_index_row(_FIXTURE_INDEX, "Projects", "Projects/Z", "a|b]] evil", "s")
+    row3 = next(ln for ln in text3.splitlines() if "Projects/Z" in ln)
+    assert row3.count("[[") == 1 and row3.count("]]") == 1, row3
+    assert row3.replace("\\|", "").count("|") == 3, row3
+    # the row is still dedupe-keyed by its (unescaped) target.
+    text4 = upsert_index_row(text3, "Projects", "Projects/Z", "a|b]] evil", "s2")
+    assert text4.count("[[Projects/Z\\|") == 1
+    print("ok test_upsert_index_row_escapes_pipe_and_brackets")
+
+
+def test_read_note_relative_branch_refuses_non_md_and_skipped():
+    # Regression (bug 5): the relative-path branch of read_note must apply the
+    # SAME guard as the absolute branch -- a .md file, inside the vault, not under
+    # a skipped dir. It previously returned ANY file inside the vault, so an
+    # injected 'read note .git/config' / 'secret.txt' / '.env' exfiltrated
+    # secrets that the absolute branch already refused.
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["OBSIDIAN_VAULT"] = tmp
+        root = Path(tmp)
+        (root / "Analysis").mkdir(parents=True)
+        (root / "Analysis" / "Real.md").write_text(
+            "---\ntitle: Real\ntags: []\nlast_updated: 2026-07-01\n---\n\nbody\n",
+            encoding="utf-8",
+        )
+        # secrets reachable via a RELATIVE ident.
+        (root / ".git").mkdir()
+        (root / ".git" / "config").write_text(
+            "[remote \"origin\"]\n url = https://user:TOKEN@github.com/o/r.git\n",
+            encoding="utf-8",
+        )
+        (root / "secret.txt").write_text("api-key=SUPER-SECRET\n", encoding="utf-8")
+        (root / ".env").write_text("OPENAI_API_KEY=sk-SECRET\n", encoding="utf-8")
+        (root / ".obsidian").mkdir()
+        (root / ".obsidian" / "workspace.json").write_text('{"k": 1}\n', encoding="utf-8")
+        # even a .md file is not a readable note when it lives under a skipped dir.
+        (root / "Sources").mkdir()
+        (root / "Sources" / "Immutable.md").write_text("immutable secret\n", encoding="utf-8")
+
+        for rel in (".git/config", "secret.txt", ".env",
+                    ".obsidian/workspace.json", "Sources/Immutable.md"):
+            raised = False
+            try:
+                read_note(rel)
+            except FileNotFoundError:
+                raised = True
+            assert raised, f"read_note must refuse relative path {rel!r}"
+
+        # legitimate relative reads still work (regression guard).
+        assert "body" in read_note("Analysis/Real.md")
+        assert "body" in read_note("Real")  # resolved by filename stem
+    print("ok test_read_note_relative_branch_refuses_non_md_and_skipped")
+
+
 def _run():
     tests = [
         test_write_then_read_roundtrip_and_frontmatter,
@@ -400,11 +522,15 @@ def _run():
         test_write_refuses_path_traversal,
         test_write_refuses_normalized_sources,
         test_read_note_refuses_outside_vault_and_non_md,
+        test_read_note_relative_branch_refuses_non_md_and_skipped,
         test_search_finds_note_and_skips_sources,
         test_search_no_match_returns_empty,
         test_memory_autocreates_and_roundtrips,
+        test_recall_limit_zero_and_negative_return_none,
         test_append_log_creates_and_appends,
         test_upsert_index_row_add_update_dedupe,
+        test_upsert_index_row_escapes_pipe_and_brackets,
+        test_catalog_wikilink_targets_sanitized_filename,
         test_write_note_catalog_true_appends_log_and_index_row,
         test_write_note_catalog_false_skips_catalog,
     ]

@@ -265,14 +265,26 @@ def make_runner(job, base_url, agency, app_token, runs_log):
             status = "error"
         elif result.get("ok"):
             status = "ok"
+        elif not status_code:
+            # No HTTP response was received: send_with_retry synthesizes an
+            # exhausted/terminal transport failure (connection refused, etc.) as
+            # {"ok": False, "status_code": 0, "error": <str>}. That is an "error",
+            # not a nonsensical "http-0", so surface it as such and lift its text.
+            status = "error"
+            error = str(result.get("error") or "")
         else:
             status = f"http-{status_code}"
 
         error_text = error or str(result.get("error") or "")
         detail = str(result.get("response") or error_text or "")
 
-        # Keep the existing human-readable run log line.
-        append_run_log(runs_log, name, status, detail)
+        # Keep the existing human-readable run log line. A transient FS fault here
+        # (permissions, disk full, read-only mount) must NOT suppress the durable
+        # ledger record or the failure alert below, so it is non-fatal like them.
+        try:
+            append_run_log(runs_log, name, status, detail)
+        except Exception:  # a run-log write fault must not lose the ledger/alert
+            logger.exception("failed to append run log line for job %s", name)
         # Plus the structured, machine-readable ledger record.
         record = _append_ledger_record(
             name, status, status_code, result, latency_ms, attempts, error_text

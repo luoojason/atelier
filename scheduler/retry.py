@@ -48,6 +48,13 @@ _UNSAFE_EXC_NAMES = frozenset(
         "ReadError",         # httpx: mid-stream read failure
         "WriteError",        # httpx: mid-stream write failure
         "RemoteProtocolError",  # httpx: the server already spoke to us
+        # Builtin socket errors that occur AFTER the request left the client:
+        # BrokenPipeError means the peer closed while we were writing the body
+        # (the request may already be on the server), and ConnectionResetError is
+        # a mid-stream reset — both are the same ambiguous write phase as
+        # WriteTimeout, so replaying them could double a side effect.
+        "BrokenPipeError",
+        "ConnectionResetError",
     }
 )
 
@@ -80,8 +87,10 @@ def _exc_is_retryable(exc: BaseException) -> bool:
         return True
     if isinstance(exc, TimeoutError):
         return False
-    # Builtin ConnectionError (connection refused/reset while connecting) never
-    # delivered the request, so it is safe to retry.
+    # Builtin ConnectionError raised while *connecting* (e.g. ConnectionRefusedError
+    # — connection refused) never delivered the request, so it is safe to retry.
+    # Its write-phase subclasses BrokenPipeError / ConnectionResetError are caught
+    # above by _UNSAFE_EXC_NAMES first, so they never reach this branch.
     if isinstance(exc, ConnectionError):
         return True
     return False
