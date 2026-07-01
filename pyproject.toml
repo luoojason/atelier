@@ -72,3 +72,8 @@ exclude = ["agentswarm-cli*", "venv*", ".venv*", ".agency_swarm*", "node_modules
 [tool.setuptools.data-files]
 "." = ["openswarm.config.mjs", "openswarm.product-env.json", "package.json"]
 "patches" = ["patches/dom-to-pptx+1.1.5.patch"]
+
+[tool.pytest.ini_options]
+# All tests live in tests/; keeps pytest out of desktop/build-staging's
+# bundled site-packages (their shipped tests break collection).
+testpaths = ["tests"]

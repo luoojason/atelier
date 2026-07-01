@@ -11,7 +11,8 @@
   },
   "devDependencies": {
     "electron": "^33.2.1",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^25.1.8",
+    "playwright-core": "^1.61.1"
   },
   "build": {
     "appId": "com.jasonluo.atelier",
@@ -20,8 +21,33 @@
       "main.js",
       "preload.js",
       "index.html",
-      "renderer.js",
+      "app/**/*",
       "styles.css"
+    ],
+    "extraResources": [
+      {
+        "from": "build-staging/python-env",
+        "to": "python-env",
+        "filter": ["**/*", "!**/__pycache__/**", "!**/*.pyc"]
+      },
+      {
+        "from": "..",
+        "to": "backend",
+        "filter": [
+          "lite_server.py",
+          "config.py",
+          "claude_subscription_model.py",
+          "helpers.py",
+          "run_utils.py",
+          "shared_tools/**/*",
+          "campaign_agent/**/*",
+          "scheduler/**/*",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/.venv*/**",
+          "!**/tests/**"
+        ]
+      }
     ],
     "mac": {
       "icon": "../assets/atelier.icns",
