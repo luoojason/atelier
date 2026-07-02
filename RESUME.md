@@ -1,8 +1,22 @@
 # Atelier — resume prompt
 
-Paste the block below to pick up after a context clear.
+## THE GOAL (paste this after a context clear)
+
+**Make Atelier a strict superset of OpenSwarm, then make every subsystem a living widget.** Work at ~/Desktop/openswarm (branch swarm-extensions), app = /Applications/Atelier.app, all on the Claude Max subscription (zero API keys). Read first: this file, docs/UI-BACKLOG.md, wiki Projects/OpenSwarm.md + Analysis/Atelier + Dashboard Merge Plan.md in the vault ~/Desktop/AI Brain.
+
+**Phase A — total parity.** Drive docs/UI-BACKLOG.md (all 54 features) to DONE in Atelier's idiom (vanilla JS modules on window.Atelier, warm-cream/terracotta, views + cards + widgets, subscription-only). Add a Status column to UI-BACKLOG.md and keep it current. Previously deferred/rejected items get REWORKED into Atelier-native equivalents, not skipped:
+- Agent orchestration: Agent cards spawn SUB-AGENTS as real child sessions (a SpawnAgent/CheckAgent MCP tool pair on lite_server, sessions gain parent_id, depth cap 1, child cap ~4) that AUTO-REVEAL as cards beside the parent with live SVG ARROWS (world-coord connector layer that follows drags) — this was in flight, build it first.
+- In-place board switch (drop location.reload); output version history (port cc-dashboard/OpenSwarm versions.py idiom); marquee-link (drag a box around a browser card to link it to an agent session); onboarding tour; App Builder → "mini-app card" (agent scaffolds a small self-contained HTML view-card, no runtime); 9Router/multi-provider → a model picker (sonnet/opus/haiku via /config + CLAUDE_CLI_MODEL); terminal → read-only run-log card streaming ~/.atelier/logs/backend.log; MCP registry → tool-inspector card over the atelier MCP tools.
+
+**Phase B — living widgets.** Every subsystem gets a glanceable, animated, warm-cream canvas widget (registerWidget-based, configurable, persisted, mount/cleanup discipline):
+- Scheduler = the flagship: a circular TIMER widget per job — an SVG ring that fills (stroke-dashoffset synced to the real next-fire time from /jobs cron parsing), pulses when the job fires (new /runs ledger line), then resets and fills again — the visible "light completing the circuit then re-arming the loop".
+- Runs = ticker widget (last N ledger lines, green/red pulse on arrival); Campaign = gate-pipeline widget (brief → produce → critic → publish nodes lighting up from campaign state); Agent sessions = status-orb widgets (breathing idle/running/error light, click opens the card); Claude Code spend = burn gauge (today vs 7-day average from /cc/aggregate); backend + scheduler health = heartbeat dots.
+
+**Rules** (proven over 12 rounds): research-first, then Workflow builds — parallel disjoint-file agents against a FROZEN contract → 2 adversarial reviewers → fixer; keep the pytest suite green (301 baseline) and node --check everything; screenshot-verify in real Electron (playwright-core _electron harness in desktop/) BEFORE electron-builder; rebuild + reinstall /Applications/Atelier.app each round; commit per round (no AI markers); update vault wiki page + index/log + this RESUME + auto-memory each round.
 
 ---
+
+## Prior resume context (rounds 1-12)
 
 Resume the **Atelier** project. Atelier is my fork of VRSEN/OpenSwarm at `~/Desktop/openswarm` (branch `swarm-extensions`), extended into a deliverable workforce **and a desktop app**, all running on my **Claude Max subscription** (zero API keys).
 
