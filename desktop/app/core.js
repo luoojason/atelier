@@ -969,6 +969,9 @@
       toggleBtn.addEventListener('click', () => {
         const on = document.body.classList.toggle('sidebar-collapsed');
         store.set('atelier.sidebar.collapsed', on ? '1' : '');
+        // the canvas width just changed ~248px; nudge size-on-resize consumers
+        // (e.g. the open Graph view's canvas) so they don't keep a stale bitmap.
+        window.dispatchEvent(new Event('resize'));
       });
     }
     const navBoard = (dir) => {
