@@ -18,14 +18,6 @@ _VERSION = "2022-06-28"
 _TIMEOUT = 15
 NOT_CONNECTED = "Notion isn't connected — add a token in Settings."
 
-_ID_RE = re.compile(r"[0-9a-fA-F]{32}")
-# Notion URLs place the id as the trailing segment of the slug (e.g.
-# ".../My-Doc-<32 hex>"). Trying an end-anchored match first avoids a
-# leftmost, unanchored search swallowing a hex-looking title character (e.g.
-# the "c" in "Doc") into the id; a plain raw id still matches via the
-# unanchored fallback in _extract_id.
-_ID_RE_END = re.compile(r"[0-9a-fA-F]{32}$")
-
 
 def _settings_path() -> Path:
     return Path(os.getenv("ATELIER_SETTINGS_PATH")
@@ -51,10 +43,15 @@ def _headers(token: str) -> dict:
 
 
 def _extract_id(page: str) -> str:
-    """Pull a 32-hex Notion id out of a raw id or a Notion URL (dashes ignored)."""
+    """Pull a 32-hex Notion id out of a raw id, a dashed UUID, or a Notion URL.
+
+    Notion always places the 32-hex id as the last long hex run in the URL
+    slug (before any ?query / #fragment / trailing slash), so take the last
+    run of >=32 hex chars and its trailing 32. Falls back to the raw string.
+    """
     compact = (page or "").replace("-", "")
-    match = _ID_RE_END.search(compact) or _ID_RE.search(compact)
-    return match.group(0) if match else (page or "").strip()
+    runs = re.findall(r"[0-9a-fA-F]{32,}", compact)
+    return runs[-1][-32:] if runs else (page or "").strip()
 
 
 def _title_of(obj: dict) -> str:
@@ -171,6 +168,12 @@ class NotionRead(BaseTool):
                 text = _block_text(block)
                 if text:
                     body_lines.append(text)
+        else:
+            # Metadata fetch succeeded but the body didn't — say so explicitly
+            # rather than silently returning a title-only read.
+            body_lines.append(
+                f"(could not read page body: HTTP {children.status_code})"
+            )
         out = f"# {title}\n\n" + "\n".join(body_lines)
         return out[:6000]
 
@@ -193,7 +196,9 @@ class NotionCreatePage(BaseTool):
         body = {
             "parent": {"page_id": _extract_id(self.parent_id)},
             "properties": {"title": {"title": [{"text": {"content": self.title}}]}},
-            "children": _paragraph_blocks(self.content),
+            # Notion rejects >100 children blocks per request; send the first
+            # 100 rather than 400ing on longer content.
+            "children": _paragraph_blocks(self.content)[:100],
         }
         try:
             resp = httpx.post(f"{_BASE}/pages", headers=_headers(token),
@@ -223,7 +228,9 @@ class NotionAppend(BaseTool):
             resp = httpx.patch(
                 f"{_BASE}/blocks/{_extract_id(self.page_id)}/children",
                 headers=_headers(token),
-                json={"children": _paragraph_blocks(self.content)},
+                # Notion rejects >100 children blocks per request; send the
+                # first 100 rather than 400ing on longer content.
+                json={"children": _paragraph_blocks(self.content)[:100]},
                 timeout=_TIMEOUT,
             )
         except Exception as exc:  # noqa: BLE001

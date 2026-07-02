@@ -96,3 +96,76 @@ def test_paragraph_blocks_chunks_long_text():
     assert all(len(b["paragraph"]["rich_text"][0]["text"]["content"]) <= 2000
                for b in blocks)
     assert len(blocks) >= 3
+
+
+# ── _extract_id: real "Copy link" URLs, dashed UUIDs, raw ids ──────────────────
+
+def test_extract_id_from_notion_url_with_query_string():
+    page_id = "a" * 32
+    url = "https://www.notion.so/My-Doc-" + page_id + "?pvs=4"
+    assert notion_tools._extract_id(url) == page_id
+
+
+def test_extract_id_from_dashed_uuid():
+    dashed = "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"
+    assert notion_tools._extract_id(dashed) == "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"
+
+
+def test_extract_id_raw_non_id_passthrough():
+    assert notion_tools._extract_id("parent") == "parent"
+
+
+def test_extract_id_from_url_with_trailing_slash():
+    page_id = "b" * 32
+    url = "https://www.notion.so/My-Doc-" + page_id + "/"
+    assert notion_tools._extract_id(url) == page_id
+
+
+def test_extract_id_from_url_with_fragment():
+    page_id = "c" * 32
+    url = "https://www.notion.so/My-Doc-" + page_id + "#frag"
+    assert notion_tools._extract_id(url) == page_id
+
+
+# ── NotionCreatePage / NotionAppend: 100-block cap ──────────────────────────────
+
+def test_create_page_caps_children_at_100_blocks(token, monkeypatch):
+    captured = {}
+
+    def fake_post(url, *a, **k):
+        captured["json"] = k.get("json")
+        return _Resp(200, {"url": "https://notion.so/new"})
+
+    monkeypatch.setattr(notion_tools.httpx, "post", fake_post)
+    long_content = "\n".join(f"line {i}" for i in range(200))
+    notion_tools.NotionCreatePage(parent_id="parent", title="T",
+                                  content=long_content).run()
+    assert len(captured["json"]["children"]) == 100
+
+
+def test_append_caps_children_at_100_blocks(token, monkeypatch):
+    captured = {}
+
+    def fake_patch(url, *a, **k):
+        captured["json"] = k.get("json")
+        return _Resp(200, {"results": []})
+
+    monkeypatch.setattr(notion_tools.httpx, "patch", fake_patch)
+    long_content = "\n".join(f"line {i}" for i in range(200))
+    notion_tools.NotionAppend(page_id="pg", content=long_content).run()
+    assert len(captured["json"]["children"]) == 100
+
+
+# ── NotionRead: honesty when the body fetch fails ───────────────────────────────
+
+def test_read_reports_body_fetch_failure(token, monkeypatch):
+    def fake_get(url, *a, **k):
+        if "/children" in url:
+            return _Resp(500)
+        return _Resp(200, {"properties": {"title": {"type": "title",
+                     "title": [{"plain_text": "Doc"}]}}})
+
+    monkeypatch.setattr(notion_tools.httpx, "get", fake_get)
+    out = notion_tools.NotionRead(page="pg").run()
+    assert "Doc" in out
+    assert "could not read page body: HTTP 500" in out
