@@ -129,6 +129,10 @@
     </div>
     <!-- Atelier core first (creates window.Atelier), then feature modules. -->
     <script defer src="app/core.js"></script>
+    <!-- tooltip.js right after core.js: DOM-only styled hover tooltips for
+         toolbar/dock buttons, delegated from document so load order against
+         the rest of the app modules does not matter. -->
+    <script defer src="app/tooltip.js"></script>
     <script defer src="app/widgets.js"></script>
     <script defer src="app/apps.js"></script>
     <script defer src="app/palette.js"></script>
