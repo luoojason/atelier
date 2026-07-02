@@ -63,7 +63,7 @@ def test_shape(client):
 
 # ── the atelier tools ────────────────────────────────────────────────────────
 
-def test_all_ten_atelier_tools_present(client):
+def test_all_atelier_tools_present(client):
     assert len(lite_server.LIGHT_TOOLS) == 16  # the card counts on all 16 (incl. 4 Notion)
     atelier = [t for t in _tools(client) if t["server"] == "atelier"]
     assert {t["name"] for t in atelier} == {
