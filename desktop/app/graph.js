@@ -159,7 +159,6 @@
         n.y += n.vy;
       });
       alpha *= 0.992;
-      if (alpha < 0.02) alpha = 0.02; // gentle idle jitter floor
     }
 
     function draw() {
@@ -222,7 +221,17 @@
       if (disposed) return;
       step();
       draw();
+      if (alpha < 0.005 && !dragNode) {
+        // settled — stop repainting until something needs it again (battery)
+        raf = 0;
+        return;
+      }
       raf = requestAnimationFrame(frame);
+    }
+
+    function kick() {
+      alpha = Math.max(alpha, 0.3);
+      if (!raf) frame();
     }
 
     function pickNode(sx, sy) {
@@ -276,6 +285,7 @@
       scale = Math.max(0.2, Math.min(5, scale * factor));
       offX = sx - before.x * scale;
       offY = sy - before.y * scale;
+      kick();
     }
     function onDown(e) {
       const rect = canvas.getBoundingClientRect();
@@ -285,6 +295,7 @@
       last = { x: sx, y: sy };
       if (n) { dragNode = n; n.moved = false; }
       else panning = true;
+      kick();
     }
     function onMove(e) {
       const rect = canvas.getBoundingClientRect();
@@ -303,8 +314,10 @@
         offY += sy - last.y;
         last = { x: sx, y: sy };
       } else {
+        const prevHover = hoverNode;
         hoverNode = pickNode(sx, sy);
         canvas.style.cursor = hoverNode ? 'pointer' : 'default';
+        if (hoverNode !== prevHover) kick();
       }
     }
     function onUp(e) {
@@ -331,7 +344,7 @@
           seed();
           indexNeighbours();
           alpha = 1;
-          if (!raf) frame();
+          kick();
         })
         .catch(() => {
           ctx.fillStyle = cssVar('--ink-dim', '#999');
