@@ -24,6 +24,10 @@ Resume the **Atelier** project. Atelier is my fork of VRSEN/OpenSwarm at `~/Desk
 
 **Round 10 done (commits `cae6017`, `dee950a`) — SDK migration SHIPPED.** lite_server's agent now runs on the official `claude-agent-sdk` (native tool_use; `shared_tools/sdk_tools.py` auto-wraps the 10 BaseTools as in-process MCP @tools; /chat = long-lived client, /open-swarm = fresh client per request; isolation unconditional via `setting_sources=[]`). Reliability probe 6/6 (was ~60% on the old fenced-JSON bridge, which stays only for the heavy swarm). The installed Atelier.app carries it (app 692M — the SDK vendors its CLI runtime, diet target). Live E2E verified: all 3 scheduled jobs produced real vault deliverables (Morning Brief, Project Rollup, digest); `max_turns` now 40 (`ATELIER_MAX_TURNS`) after the rollup blew 12 live. 269 tests.
 
+**Round 11 done (commits `6921cc4`→`22b264b`)**: chat token STREAMING (/chat/stream SSE + live-append card), app diet (604M), and deferred round 1 — marquee multi-select / tidy / live minimap, browser card TABS + OAuth popup routing, safe markdown notes, board export/import + inline rename, multi-card AGENT SESSIONS (✳ dock → per-session SDK-client chat cards, /sessions API), and a per-launch ATELIER_TOKEN shared secret on all mutating routes. 284 tests; Agent card round-trip verified live in Electron.
+
+**Remaining deferred items**: output version history (port OpenSwarm versions.py), settings/credentials panel, onboarding tour, in-place board switch, sub-agent auto-reveal (parent_session_id).
+
 **Next work areas** (see `docs/UI-BACKLOG.md` for the full 54):
 1. Markdown note editor in the note card (CodeMirror-class; currently a plain textarea).
 2. Browser card tabs + OAuth popup routing (`webview-new-window` IPC → new card, child-window allow for OAuth — OpenSwarm's exact mechanics are documented in the research notes in the wiki page).
