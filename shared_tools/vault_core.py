@@ -509,3 +509,78 @@ def write_note(folder: str, title: str, body: str, tags=None, *,
         _catalog_note(root, folder, title, section=section, name=name,
                       summary=summary or _first_line(body), when=today)
     return str(path)
+
+
+_WIKILINK_RE = re.compile(r"\[\[([^\[\]]+?)\]\]")
+
+
+def _extract_wikilinks(text: str):
+    """Return the wikilink targets in ``text`` with ``|alias`` and ``#section`` stripped."""
+    targets = []
+    for match in _WIKILINK_RE.finditer(text or ""):
+        raw = match.group(1).split("|", 1)[0].split("#", 1)[0].strip()
+        if raw:
+            targets.append(raw)
+    return targets
+
+
+def _resolve_link(target: str, by_path: dict, by_stem: dict):
+    """Resolve a wikilink target to a real node id (rel path w/o .md) or None."""
+    t = target.strip().lstrip("/")
+    if t.endswith(".md"):
+        t = t[:-3]
+    if t in by_path:
+        return t
+    hits = by_stem.get(Path(t).name.lower())
+    return hits[0] if hits else None
+
+
+def build_graph(root: Path) -> dict:
+    """Parse the vault's notes into an Obsidian-style link graph (pure, no IO deps).
+
+    Returns ``{"nodes": [...], "edges": [...]}``. A node id is the note's
+    vault-relative path without the ``.md`` suffix. Unresolved link targets
+    become ghost nodes (``path=None, ghost=True``). Sources/ + skipped dirs are
+    excluded (via _iter_notes); self-links and duplicate directed edges are
+    dropped. Never raises on unreadable files (they are skipped).
+    """
+    notes = []  # (rel_no_ext, title, text)
+    for path, rel in _iter_notes(Path(root)):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel_no_ext = rel[:-3] if rel.endswith(".md") else rel
+        notes.append((rel_no_ext, _title_for(path, text), text))
+
+    by_path = {rel: rel for rel, _, _ in notes}
+    by_stem = {}
+    for rel, _, _ in notes:
+        by_stem.setdefault(Path(rel).name.lower(), []).append(rel)
+
+    nodes = {}
+    for rel, title, _ in notes:
+        nodes[rel] = {"id": rel, "title": title, "path": rel + ".md",
+                      "degree": 0, "ghost": False}
+
+    edges = []
+    seen = set()
+    for rel, _, text in notes:
+        for target in _extract_wikilinks(text):
+            dest = _resolve_link(target, by_path, by_stem)
+            if dest is None:
+                dest = target
+                if dest not in nodes:
+                    nodes[dest] = {"id": dest, "title": target, "path": None,
+                                   "degree": 0, "ghost": True}
+            if dest == rel:
+                continue
+            key = (rel, dest)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append({"source": rel, "target": dest})
+            nodes[rel]["degree"] += 1
+            nodes[dest]["degree"] += 1
+
+    return {"nodes": list(nodes.values()), "edges": edges}

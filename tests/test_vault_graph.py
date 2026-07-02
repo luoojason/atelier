@@ -43,3 +43,44 @@ def test_vault_root_default_when_nothing_set(tmp_path, monkeypatch):
     monkeypatch.delenv("OBSIDIAN_VAULT", raising=False)
     _write_settings(tmp_path, {})
     assert vault_core.vault_root() == vault_core.Path(vault_core.DEFAULT_VAULT).expanduser()
+
+
+def _mk(root, rel, text):
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text, encoding="utf-8")
+
+
+def test_extract_wikilinks_strips_alias_and_section():
+    text = "See [[Iris]] and [[Projects/Hermes|Hermes]] plus [[Notes#Heading]]."
+    assert vault_core._extract_wikilinks(text) == ["Iris", "Projects/Hermes", "Notes"]
+
+
+def test_build_graph_nodes_edges_and_degree(tmp_path):
+    _mk(tmp_path, "Projects/Iris.md", "Iris links to [[Hermes]].")
+    _mk(tmp_path, "Projects/Hermes.md", "Hermes standalone.")
+    g = vault_core.build_graph(tmp_path)
+    ids = {n["id"] for n in g["nodes"]}
+    assert ids == {"Projects/Iris", "Projects/Hermes"}
+    assert {"source": "Projects/Iris", "target": "Projects/Hermes"} in g["edges"]
+    deg = {n["id"]: n["degree"] for n in g["nodes"]}
+    assert deg["Projects/Iris"] == 1 and deg["Projects/Hermes"] == 1
+
+
+def test_build_graph_creates_ghost_for_unresolved_link(tmp_path):
+    _mk(tmp_path, "A.md", "A points to [[Nowhere]].")
+    g = vault_core.build_graph(tmp_path)
+    ghosts = [n for n in g["nodes"] if n["ghost"]]
+    assert len(ghosts) == 1 and ghosts[0]["id"] == "Nowhere" and ghosts[0]["path"] is None
+
+
+def test_build_graph_skips_sources_and_self_links(tmp_path):
+    _mk(tmp_path, "Sources/Immutable.md", "[[A]]")   # Sources/ is skipped
+    _mk(tmp_path, "A.md", "[[A]] self link ignored.")  # self-link dropped
+    g = vault_core.build_graph(tmp_path)
+    assert {n["id"] for n in g["nodes"]} == {"A"}
+    assert g["edges"] == []
+
+
+def test_build_graph_empty_vault(tmp_path):
+    assert vault_core.build_graph(tmp_path) == {"nodes": [], "edges": []}
