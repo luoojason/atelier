@@ -730,15 +730,28 @@
       }
     });
 
+    // Mount the shared per-composer model picker (chatcontrols.js, optional).
+    // Deferred until the session id exists — the picker POSTs the per-session
+    // model endpoint, which needs it. Guarded so a missing module no-ops.
+    // Known v1 edge: if the backend evicts and send() recreates the session,
+    // the picker keeps the original id in its ctx; a stale POST 404s and the
+    // dropdown reverts with a toast (acceptable — recreation is rare).
+    function mountChatControls() {
+      const cc = window.Atelier && window.Atelier.chatcontrols;
+      if (!cc || typeof cc.mount !== 'function' || !sessionId || closed) return;
+      cc.mount(composer, { scope: 'session', sessionId, cardEl: card });
+    }
+
     if (attached) {
       // the child is usually mid-turn when revealed — poll right away so the
       // existing transcript renders (renderedCount starts at 0) and the
       // thinking state appears while the spawned task runs.
       poll();
+      mountChatControls(); // sessionId is known upfront for attached cards
     } else {
       // create the backend session up front so the card is ready to poll; a
       // failure is fine — ensureSession() retries on the first send.
-      ensureSession().catch((err) => {
+      ensureSession().then(mountChatControls).catch((err) => {
         setNote(err && err.limit
           ? 'Session limit reached — close an Agent card or wait for a turn to finish, then send.'
           : 'Backend offline — the session will be created when you send.');
