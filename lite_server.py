@@ -90,7 +90,7 @@ Your job is to help run a creative studio out of an Obsidian knowledge vault:
 
 Be concise. When you take an action with a tool, say plainly what you did and cite the note path, brief, or campaign id involved. Do not claim to have published or shipped anything that has not passed its gate.
 
-When SpawnAgent/CheckAgent are available you can delegate a subtask to a parallel sub-agent and collect its result later; sub-agents run as their own isolated sessions."""
+When SpawnAgent/CheckAgent are available you can delegate a subtask to a parallel sub-agent and collect its result later; sub-agents run as their own isolated sessions. When DelegateToSubagent is available you govern one or more existing sub-agent cards; call it with a governed card's id or name to hand it a subtask and get its reply back inline."""
 
 LIGHT_TOOLS = [
     VaultSearch,
@@ -195,6 +195,7 @@ def _resolved_model() -> str:
 def build_options(
     stream: bool = False,
     spawner_session_id: str | None = None,
+    delegator_session_id: str | None = None,
     model: str | None = None,
 ) -> ClaudeAgentOptions:
     """The single builder for BOTH the /chat client and every compat request.
@@ -248,17 +249,45 @@ def build_options(
 
     mcp_servers = {"atelier": ATELIER_SERVER}
     allowed_tools = list(ATELIER_ALLOWED_TOOLS)
-    if spawner_session_id is not None:
-        mcp_servers["orchestra"] = _build_orchestra_server(spawner_session_id)
-        allowed_tools += [
-            "mcp__orchestra__SpawnAgent",
-            "mcp__orchestra__CheckAgent",
-            "mcp__orchestra__NavigateBrowser",
-        ]
+    system_prompt = ATELIER_INSTRUCTIONS
+
+    # A depth-0 spawner gets the full orchestra (Spawn/Check/Nav). SEPARATELY,
+    # ANY session that already governs >=1 child (a back-reference by
+    # parent_id) gains DelegateToSubagent + a system-prompt line naming those
+    # children — so a depth-1+ orchestrator (chained A->B->C) can delegate to
+    # its existing cards without being able to spawn new ones. Both bind their
+    # orchestra tools to the SAME session id, so one server serves both.
+    children = (
+        [s for s in _sessions.values() if s.parent_id == delegator_session_id]
+        if delegator_session_id is not None
+        else []
+    )
+    orchestra_id = spawner_session_id or (
+        delegator_session_id if children else None
+    )
+    if orchestra_id is not None:
+        mcp_servers["orchestra"] = _build_orchestra_server(orchestra_id)
+        if spawner_session_id is not None:
+            allowed_tools += [
+                "mcp__orchestra__SpawnAgent",
+                "mcp__orchestra__CheckAgent",
+                "mcp__orchestra__NavigateBrowser",
+            ]
+        if children:
+            allowed_tools.append("mcp__orchestra__DelegateToSubagent")
+            roster = ", ".join(f'"{c.name}" ({c.id})' for c in children)
+            system_prompt = (
+                ATELIER_INSTRUCTIONS
+                + "\n\nYou govern these sub-agent cards: "
+                + roster
+                + ". Use DelegateToSubagent(subagent, task) to hand a subtask"
+                " to one of them by id or name; the sub-agent runs it and its"
+                " reply is returned to you."
+            )
 
     return ClaudeAgentOptions(
         model=model or _resolved_model(),
-        system_prompt=ATELIER_INSTRUCTIONS,
+        system_prompt=system_prompt,
         mcp_servers=mcp_servers,
         allowed_tools=allowed_tools,
         setting_sources=[],
@@ -1661,12 +1690,16 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
             return
         try:
             if sess.client is None:
-                # ONLY depth-0 (card-level) sessions get the orchestra tools;
-                # a depth-1 sub-agent gets none, so the depth cap is structural
-                # rather than an instruction the model could talk itself past.
+                # ONLY depth-0 (card-level) sessions get the spawn orchestra
+                # (Spawn/Check/Nav), so the spawn depth cap is structural rather
+                # than an instruction the model could talk itself past. EVERY
+                # session passes its own id as delegator so any session that
+                # governs children also gains DelegateToSubagent (build_options
+                # gates that on there actually being children).
                 client = ClaudeSDKClient(
                     options=build_options(
                         spawner_session_id=sess.id if sess.depth == 0 else None,
+                        delegator_session_id=sess.id,
                         model=sess.model,
                     )
                 )

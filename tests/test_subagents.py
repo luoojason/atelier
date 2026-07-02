@@ -486,6 +486,81 @@ def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
     )
 
 
+def test_build_options_attaches_delegate_when_session_has_children():
+    # a depth-1 governed orchestrator (B in A->B->C) with one child gains
+    # DelegateToSubagent but NOT SpawnAgent (the depth-0 gate is unchanged).
+    parent = lite_server._AgentSession(
+        "b" * 32, "B", parent_id="a" * 32, depth=1
+    )
+    lite_server._sessions[parent.id] = parent
+    child = lite_server._AgentSession(
+        "c" * 32, "C", parent_id=parent.id, depth=2
+    )
+    lite_server._sessions[child.id] = child
+
+    opts = lite_server.build_options(delegator_session_id=parent.id)
+    assert "orchestra" in opts.mcp_servers
+    assert "mcp__orchestra__DelegateToSubagent" in opts.allowed_tools
+    assert "mcp__orchestra__SpawnAgent" not in opts.allowed_tools
+    # the governed child is named in the system prompt (roster line)
+    assert child.id in opts.system_prompt
+    assert '"C"' in opts.system_prompt
+
+
+def test_build_options_no_delegate_when_session_has_no_children():
+    lonely = lite_server._AgentSession("d" * 32, "Lonely", depth=0)
+    lite_server._sessions[lonely.id] = lonely
+    opts = lite_server.build_options(
+        spawner_session_id=lonely.id, delegator_session_id=lonely.id
+    )
+    assert "mcp__orchestra__DelegateToSubagent" not in opts.allowed_tools
+    # a depth-0 spawner still gets the spawn tools even with no children
+    assert "mcp__orchestra__SpawnAgent" in opts.allowed_tools
+    assert opts.system_prompt == lite_server.ATELIER_INSTRUCTIONS
+
+
+def test_build_options_depth0_with_children_gets_both_spawn_and_delegate():
+    parent = lite_server._AgentSession("p" * 32, "P", depth=0)
+    lite_server._sessions[parent.id] = parent
+    child = lite_server._AgentSession(
+        "q" * 32, "Q", parent_id=parent.id, depth=1
+    )
+    lite_server._sessions[child.id] = child
+    opts = lite_server.build_options(
+        spawner_session_id=parent.id, delegator_session_id=parent.id
+    )
+    assert "mcp__orchestra__SpawnAgent" in opts.allowed_tools
+    assert "mcp__orchestra__DelegateToSubagent" in opts.allowed_tools
+    assert '"Q"' in opts.system_prompt
+
+
+def test_turn_on_orchestrator_with_child_builds_delegate_tool(
+    monkeypatch, client
+):
+    # end-to-end: _run_session_turn passes delegator_session_id, so a depth-0
+    # card that governs a child builds its client WITH DelegateToSubagent and
+    # the roster line.
+    built = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory(built=built)
+    )
+    _inline_turns(monkeypatch)
+
+    sid = client.post("/sessions", json={"name": "A"}).json()["id"]
+    child = lite_server._AgentSession(
+        "c" * 32, "B", parent_id=sid, depth=1
+    )
+    lite_server._sessions[child.id] = child
+
+    assert client.post(
+        f"/sessions/{sid}/message", json={"message": "orchestrate"}
+    ).status_code == 202
+    assert (
+        "mcp__orchestra__DelegateToSubagent" in built[0].options.allowed_tools
+    )
+    assert child.id in built[0].options.system_prompt
+
+
 # ── the raised session cap ───────────────────────────────────────────────────
 
 def test_max_sessions_default_is_12(monkeypatch):
