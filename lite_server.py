@@ -1904,17 +1904,24 @@ async def govern_session(session_id: str, req: SessionGovernRequest):
 
 @app.delete("/sessions/{session_id}/govern/{child_id}")
 async def ungovern_session(session_id: str, child_id: str):
-    """Clear a governed child's parent_id/depth (idempotent).
+    """Clear a governed child's parent_id/depth — but only if session_id is
+    actually the child's current parent (idempotent either way).
 
-    session_id is the orchestrator the arrow was drawn from, but the clear is
-    unconditional so a stale link always tears down. Unknown child -> 404
-    {"error": "unknown session"} (the existing /sessions idiom).
+    session_id is the orchestrator the arrow was drawn from; the clear only
+    applies when child.parent_id == session_id, so a DELETE against a stale
+    or wrong parent (e.g. a re-governed child whose old parent's UI hasn't
+    caught up) can never detach the child from its REAL current parent. A
+    DELETE against a link that no longer exists (mismatched parent, or the
+    child was never governed) is not an error — it just returns {"ok": true}
+    without touching the child. Unknown child -> 404 {"error": "unknown
+    session"} (the existing /sessions idiom).
     """
     child = _sessions.get(child_id)
     if child is None:
         return _unknown_session()
-    child.parent_id = None
-    child.depth = 0
+    if child.parent_id == session_id:
+        child.parent_id = None
+        child.depth = 0
     return {"ok": True}
 
 

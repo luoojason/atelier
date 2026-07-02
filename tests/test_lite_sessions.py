@@ -732,6 +732,34 @@ def test_ungovern_clears_parent_id_and_depth(client):
     ).json() == {"ok": True}
 
 
+def test_ungovern_wrong_parent_does_not_detach_real_parent(client):
+    """A DELETE naming a session that is NOT the child's actual parent must
+    be a no-op on the child (still idempotent {"ok": true}, not an error) —
+    it must never clear a link it doesn't own. The correct parent's DELETE
+    still detaches normally."""
+    real_parent = _create(client, name="Real")["id"]
+    other = _create(client, name="Other")["id"]
+    child = _create(client, name="Child")["id"]
+    assert client.post(
+        f"/sessions/{real_parent}/govern", json={"child_id": child}
+    ).status_code == 200
+
+    resp = client.delete(f"/sessions/{other}/govern/{child}")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+    detail = client.get(f"/sessions/{child}").json()
+    assert detail["parent_id"] == real_parent  # untouched by the mismatched DELETE
+    assert detail["depth"] == 1
+
+    resp2 = client.delete(f"/sessions/{real_parent}/govern/{child}")
+    assert resp2.status_code == 200
+    assert resp2.json() == {"ok": True}
+    detail2 = client.get(f"/sessions/{child}").json()
+    assert detail2["parent_id"] is None
+    assert detail2["depth"] == 0
+
+
 def test_ungovern_unknown_child_is_404(client):
     parent = _create(client, name="A")["id"]
     resp = client.delete(f"/sessions/{parent}/govern/nope")
