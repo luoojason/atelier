@@ -1283,6 +1283,27 @@ async def set_vault_path(req: VaultPathRequest):
     return {"ok": True, "obsidian_vault": path}
 
 
+@app.get("/vault/graph")
+async def vault_graph():
+    """The vault as an Obsidian-style link graph. Never 500 — degrades to empty."""
+    try:
+        return vault_core.build_graph(vault_core.vault_root())
+    except Exception:  # noqa: BLE001 - a bad vault yields an empty graph, not a 500
+        return {"nodes": [], "edges": []}
+
+
+@app.get("/vault/note")
+async def vault_note(path: str):
+    """Read one vault note's markdown by relative path/title (containment-guarded)."""
+    try:
+        text = vault_core.read_note(path)
+    except FileNotFoundError:
+        return JSONResponse({"error": "note not found"}, status_code=404)
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "could not read note"}, status_code=400)
+    return {"path": path, "markdown": text[:20000]}
+
+
 @app.get("/cc/status")
 async def cc_status():
     try:

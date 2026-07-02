@@ -103,3 +103,23 @@ def test_validate_notion_token_mocked(tmp_path, monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient", _FakeAsync)
     r = c.post("/config/notion-token/validate", json={"token": "secret_q"})
     assert r.json()["valid"] is True and r.json()["workspace"] == "My WS"
+
+
+def test_vault_graph_route(tmp_path, monkeypatch):
+    (tmp_path / "A.md").write_text("[[B]]", encoding="utf-8")
+    (tmp_path / "B.md").write_text("hi", encoding="utf-8")
+    monkeypatch.setenv("OBSIDIAN_VAULT", str(tmp_path))
+    monkeypatch.setenv("ATELIER_SETTINGS_PATH", str(tmp_path / "s.json"))
+    c = TestClient(lite_server.app)
+    g = c.get("/vault/graph").json()
+    assert {n["id"] for n in g["nodes"]} == {"A", "B"}
+    assert {"source": "A", "target": "B"} in g["edges"]
+
+
+def test_vault_note_route(tmp_path, monkeypatch):
+    (tmp_path / "A.md").write_text("# Hello\nbody", encoding="utf-8")
+    monkeypatch.setenv("OBSIDIAN_VAULT", str(tmp_path))
+    monkeypatch.setenv("ATELIER_SETTINGS_PATH", str(tmp_path / "s.json"))
+    c = TestClient(lite_server.app)
+    assert "Hello" in c.get("/vault/note", params={"path": "A"}).json()["markdown"]
+    assert c.get("/vault/note", params={"path": "nope"}).status_code == 404
