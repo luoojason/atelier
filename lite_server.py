@@ -130,9 +130,11 @@ def build_options() -> ClaudeAgentOptions:
         allowed_tools=ATELIER_ALLOWED_TOOLS,
         setting_sources=[],
         env=env,
-        # ponytail: 12 is a generous ceiling for a multi-tool studio job
-        # (search -> read -> remember -> record) without runaway loops.
-        max_turns=12,
+        # Ceiling learned live: the weekly project-rollup job (VaultSearch +
+        # reading dozens of Projects/ pages + VaultWrite) blew through 12 with
+        # "Reached maximum number of turns". 40 fits the heaviest real job;
+        # env knob for tuning without a rebuild.
+        max_turns=int(os.getenv("ATELIER_MAX_TURNS", "40")),
     )
 
 
