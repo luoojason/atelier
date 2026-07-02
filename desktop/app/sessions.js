@@ -842,11 +842,12 @@
     const registered = A.apps && A.apps.has && A.apps.has('agent');
     console.assert(registered, '[sessions] agent app type not registered');
     // The ✳ Agent button was removed; 💬 Chat (apps.js) now spawns agents.
+    const dockLabel = (b) => (b.getAttribute('data-tip') || b.getAttribute('title') || '').toLowerCase();
     const noAgentBtn = !Array.from(document.querySelectorAll('.dock-btn'))
-      .some((b) => (b.getAttribute('title') || '').toLowerCase() === 'agent');
+      .some((b) => dockLabel(b) === 'agent');
     console.assert(noAgentBtn, '[sessions] stale ✳ Agent dock button still present');
     const chatBtn = Array.from(document.querySelectorAll('.dock-btn'))
-      .some((b) => (b.getAttribute('title') || '').toLowerCase() === 'chat');
+      .some((b) => dockLabel(b) === 'chat');
     console.assert(chatBtn, '[sessions] Chat dock button missing from index.html');
     const sweepIdle = cardBySession.size === 0 && sweepTimer === null;
     console.assert(sweepIdle,

@@ -680,6 +680,9 @@
         border: 1.5px solid var(--accent); background: var(--accent-soft);
         opacity: 0.45; border-radius: 4px; }
       .minimap .mm-svg { display: block; width: 100%; height: 100%; }
+      body.sidebar-collapsed .sidebar { display: none; }
+      .atelier-panel-backdrop { position: fixed; inset: 0; z-index: 8990;
+        background: rgba(20, 15, 10, 0.10); }
     `;
     const style = document.createElement('style');
     style.id = 'atelier-core-styles';
@@ -707,8 +710,18 @@
     return t;
   }
 
-  function openPanel(title, el) {
+  function openPanel(title, el, opts) {
     ensureStyles();
+    opts = opts || {};
+    // Optional dismiss-on-click-off backdrop (Escape already closes the topmost
+    // panel in the keyboard handler below). Linked to the panel via _backdrop so
+    // an Escape close tears it down too.
+    let backdrop = null;
+    if (opts.backdrop) {
+      backdrop = document.createElement('div');
+      backdrop.className = 'atelier-panel-backdrop';
+      document.body.appendChild(backdrop);
+    }
     const panel = document.createElement('div');
     panel.className = 'atelier-panel';
     const bar = document.createElement('div');
@@ -721,7 +734,8 @@
     panel.append(bar, body);
     document.body.appendChild(panel);
 
-    const close = () => panel.remove();
+    const close = () => { panel.remove(); if (backdrop) backdrop.remove(); };
+    if (backdrop) { panel._backdrop = backdrop; backdrop.addEventListener('click', close); }
     bar.querySelector('.card-x').addEventListener('click', close);
 
     // draggable (screen-space; panels float above the canvas, unaffected by zoom)
@@ -928,13 +942,48 @@
     b.addEventListener('click', () => {
       document.querySelectorAll('.dock-btn').forEach((x) => x.classList.remove('active'));
       b.classList.add('active');
-      const t = (b.getAttribute('title') || '').toLowerCase();
+      // data-tip || title: tooltip.js strips title -> data-tip on hover, so a
+      // click-time title read would be null. (apps.js re-wires these buttons,
+      // superseding this handler, but keep it correct in case it runs first.)
+      const t = (b.getAttribute('data-tip') || b.getAttribute('title') || '').toLowerCase();
       if (t === 'chat') { inputEl.focus(); return; }
       if (t === 'apps') { spawnApp('note'); return; }
       if (t === 'campaign') { spawnApp('workflow'); return; }
       if (appRegistry.has(t)) spawnApp(t);
     });
   });
+
+  // ── topbar buttons (were decorative in the UI clone — now wired) ───────────
+  // ▨ Toggle sidebar; ‹ Back / › Forward = previous/next board. Selected by
+  // POSITION within .tb-left, not title (tooltip.js strips title on hover).
+  (function wireTopbar() {
+    ensureStyles();                                  // needs .sidebar-collapsed css
+    const btns = Array.from(document.querySelectorAll('.topbar .tb-left .icon-btn'));
+    const toggleBtn = btns[0];
+    const backBtn = btns[1];
+    const fwdBtn = btns[2];
+    if (toggleBtn) {
+      if (store.get('atelier.sidebar.collapsed') === '1') {
+        document.body.classList.add('sidebar-collapsed');
+      }
+      toggleBtn.addEventListener('click', () => {
+        const on = document.body.classList.toggle('sidebar-collapsed');
+        store.set('atelier.sidebar.collapsed', on ? '1' : '');
+      });
+    }
+    const navBoard = (dir) => {
+      const boards = window.Atelier && window.Atelier.boards;   // set by boards.js (loads later)
+      if (!boards) return;
+      const list = boards.list();
+      const act = boards.active();
+      const i = act ? list.findIndex((x) => x.id === act.id) : -1;
+      const j = i + dir;
+      if (j >= 0 && j < list.length) boards.switch(list[j].id);
+      else toast(dir < 0 ? 'Already at the first board' : 'Already at the last board');
+    };
+    if (backBtn) backBtn.addEventListener('click', () => navBoard(-1));
+    if (fwdBtn) fwdBtn.addEventListener('click', () => navBoard(1));
+  })();
 
   // ── keyboard shortcuts (Escape, Delete/Backspace, Cmd/Ctrl+M add-app) ─────
   window.addEventListener('keydown', (e) => {
@@ -946,8 +995,11 @@
       if (marq) { cancelMarquee(); return; }
       if (selected.size) { clearSelection(); return; }
       const panels = document.querySelectorAll('.atelier-panel');
-      if (panels.length) panels[panels.length - 1].remove();
-      else bus.emit('shortcut:escape');
+      if (panels.length) {
+        const p = panels[panels.length - 1];
+        if (p._backdrop) p._backdrop.remove();       // tear down the dismiss backdrop too
+        p.remove();
+      } else bus.emit('shortcut:escape');
       return;
     }
     const t = e.target;

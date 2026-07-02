@@ -587,6 +587,20 @@
         color: var(--ink); background: var(--panel); border: 1px solid var(--accent);
         border-radius: 6px; padding: 1px 5px; width: 100%; min-width: 0;
         box-sizing: border-box; outline: none; }
+      .bd-kebab-wrap { display: flex; justify-content: flex-end; padding: 8px 10px 10px; }
+      .bd-kebab { border: 1px solid var(--border); background: var(--panel); color: var(--ink-mid);
+        border-radius: 8px; padding: 1px 11px; font-size: 17px; line-height: 1.15; font-weight: 700;
+        letter-spacing: 1px; cursor: pointer; }
+      .bd-kebab:hover, .bd-kebab.open { background: var(--active); color: var(--ink);
+        border-color: var(--accent); }
+      .bd-menu { position: fixed; z-index: 10010; min-width: 158px; background: var(--panel);
+        border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow);
+        padding: 5px; display: flex; flex-direction: column; }
+      .bd-menu-item { text-align: left; border: none; background: none; color: var(--ink);
+        padding: 7px 10px; border-radius: 7px; font: inherit; font-size: 12.5px; cursor: pointer; }
+      .bd-menu-item:hover { background: var(--active); }
+      .bd-menu-item.danger { color: var(--accent); }
+      .bd-menu-item.danger:hover { background: var(--accent-soft); }
     `;
     const style = document.createElement('style');
     style.id = 'atelier-boards-styles';
@@ -644,10 +658,78 @@
     rowsHost.className = 'bd-rows';
     group.appendChild(rowsHost);
     const actions = group.querySelectorAll('.sb-head .sb-actions span');
-    if (actions[0]) { actions[0].title = 'New board'; actions[0].addEventListener('click', () => create()); }
-    if (actions[1]) { actions[1].title = 'All boards'; actions[1].addEventListener('click', openAllBoards); }
+    if (actions[0]) { actions[0].title = 'New board'; actions[0].addEventListener('click', (e) => { e.stopPropagation(); create(); }); }
+    if (actions[1]) { actions[1].title = 'All boards'; actions[1].addEventListener('click', (e) => { e.stopPropagation(); openAllBoards(); }); }
+    // Clicking the "Dashboards" header itself (icon/title, not the +/⌄ actions)
+    // opens the All boards panel — the same thing the ⌄ down-arrow does.
+    const head = group.querySelector('.sb-head');
+    if (head) {
+      head.style.cursor = 'pointer';
+      head.addEventListener('click', (e) => {
+        if (e.target.closest('.sb-actions')) return;
+        openAllBoards();
+      });
+    }
     renderSidebar();
   })();
+
+  // A kebab (⋯) button that opens a small dropdown menu of per-board actions,
+  // replacing the old row of inline buttons. items = [[label, danger, fn], …].
+  // The menu is a fixed-position element (body-appended, positioned by the
+  // button's rect) that closes on item-run, click-off, or Escape.
+  function buildKebab(items) {
+    const wrap = document.createElement('div');
+    wrap.className = 'bd-kebab-wrap';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'bd-kebab';
+    btn.textContent = '⋯';
+    btn.title = 'Board actions';
+    wrap.appendChild(btn);
+
+    let menu = null;
+    function closeMenu() {
+      if (menu) { menu.remove(); menu = null; }
+      btn.classList.remove('open');
+      document.removeEventListener('mousedown', onDocDown, true);
+      document.removeEventListener('keydown', onKey, true);
+    }
+    function onDocDown(e) {
+      if (menu && !menu.contains(e.target) && e.target !== btn) closeMenu();
+    }
+    function onKey(e) {
+      if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); closeMenu(); }
+    }
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();                           // don't bubble to card/panel/head
+      if (menu) { closeMenu(); return; }
+      menu = document.createElement('div');
+      menu.className = 'bd-menu';
+      items.forEach(([label, danger, fn]) => {
+        const mi = document.createElement('button');
+        mi.type = 'button';
+        mi.className = 'bd-menu-item' + (danger ? ' danger' : '');
+        mi.textContent = label;
+        mi.addEventListener('click', (ev) => { ev.stopPropagation(); closeMenu(); fn(); });
+        menu.appendChild(mi);
+      });
+      document.body.appendChild(menu);
+      btn.classList.add('open');
+      const r = btn.getBoundingClientRect();
+      let left = r.right - menu.offsetWidth;
+      if (left < 4) left = 4;
+      let top = r.bottom + 4;
+      if (top + menu.offsetHeight > window.innerHeight - 4) top = r.top - menu.offsetHeight - 4;
+      menu.style.left = left + 'px';
+      menu.style.top = top + 'px';
+      // defer the outside-close listeners so THIS opening click doesn't close it
+      setTimeout(() => {
+        document.addEventListener('mousedown', onDocDown, true);
+        document.addEventListener('keydown', onKey, true);
+      }, 0);
+    });
+    return wrap;
+  }
 
   // ── "All boards" panel ─────────────────────────────────────────────────────
   let allPanel = null;
@@ -719,15 +801,13 @@
         dt.className = 'bd-card-date';
         dt.textContent = 'Updated ' + (fmtDate(b.updatedAt) || '—');
         meta.append(nm, dt);
-        const actions = document.createElement('div');
-        actions.className = 'bd-card-actions';
-        actions.append(
-          actionBtn('Open', false, () => switchTo(b.id)),
-          actionBtn('Rename', false, () => startInlineRename(nm, b.id)),
-          actionBtn('Duplicate', false, () => duplicate(b.id)),
-          actionBtn('Export', false, () => exportOne(b.id)),
-          actionBtn('Delete', true, () => remove(b.id))
-        );
+        const actions = buildKebab([
+          ['Open', false, () => switchTo(b.id)],
+          ['Rename', false, () => startInlineRename(nm, b.id)],
+          ['Duplicate', false, () => duplicate(b.id)],
+          ['Export', false, () => exportOne(b.id)],
+          ['Delete', true, () => remove(b.id)],
+        ]);
         card.append(buildThumb(b.id, 'bd-cover'), meta, actions);
         grid.appendChild(card);
       });
@@ -736,7 +816,8 @@
     search.addEventListener('input', renderGrid);
     renderGrid();
     if (allPanel && document.body.contains(allPanel.el)) { try { allPanel.close(); } catch {} }
-    allPanel = A.ui.openPanel('All boards', wrap);
+    // backdrop: click off the panel to dismiss (Escape also closes it — core.js)
+    allPanel = A.ui.openPanel('All boards', wrap, { backdrop: true });
     allPanelRender = renderGrid;
   }
 

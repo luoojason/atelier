@@ -1103,7 +1103,10 @@
       fresh.addEventListener('click', () => {
         document.querySelectorAll('.dock-btn').forEach((x) => x.classList.remove('active'));
         fresh.classList.add('active');
-        const t = (fresh.getAttribute('title') || '').toLowerCase();
+        // data-tip || title: tooltip.js moves title -> data-tip on the first
+        // hover, so reading title at CLICK time returns null and the dock button
+        // silently does nothing. data-tip || title is correct before AND after.
+        const t = (fresh.getAttribute('data-tip') || fresh.getAttribute('title') || '').toLowerCase();
         // 💬 Chat spawns a fresh agent/session card (the old ✳ Agent path).
         if (t === 'chat') { if (typeof A.spawnApp === 'function') A.spawnApp('agent'); return; }
         // ▦ Apps opens the ⌘K command palette. Read lazily + guarded: palette.js
