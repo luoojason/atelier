@@ -88,3 +88,13 @@ subscription backend + the Campaign agent are built. The remainder is the
 deliberately down-ranked tier (browser-based TikTok/Instagram/X posting, HITL
 park-and-resume) — API-gated, human-tap-gated, or pay-per-use, and poor for
 unattended reliability.
+
+## Reset / uninstall
+
+Atelier keeps all its state outside the app bundle, so a full reset is three steps:
+
+1. Quit Atelier (the backend and scheduler sidecars are reaped on quit).
+2. Delete `~/.atelier` — this removes settings.json (provider/model/API key), jobs.yaml, logs/, versions/, and the isolated claude-home config dir. Delete `~/.openswarm` too if you also want the run ledger, notifications, and swarm memory gone.
+3. Clear the app's browser storage (boards, widgets, layouts): delete `~/Library/Application Support/Atelier`.
+
+Uninstall = the same three steps plus dragging /Applications/Atelier.app to the Trash. The Claude CLI login (Keychain item "Claude Code-credentials") is shared with the real claude CLI and is deliberately left alone.
