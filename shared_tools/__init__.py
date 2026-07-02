@@ -11,5 +11,6 @@ from shared_tools.RecallMemory import RecallMemory
 from shared_tools.CaptureBrief import CaptureBrief
 from shared_tools.ReadBrief import ReadBrief
 from shared_tools.web_tools import WebSearch, WebFetch
+from shared_tools.notion_tools import NotionSearch, NotionRead, NotionCreatePage, NotionAppend
 
-__all__ = ["CopyFile", "ExecuteTool", "FindTools", "ManageConnections", "SearchTools", "VaultSearch", "VaultRead", "VaultWrite", "RememberFact", "RecallMemory", "CaptureBrief", "ReadBrief", "WebSearch", "WebFetch"]
+__all__ = ["CopyFile", "ExecuteTool", "FindTools", "ManageConnections", "SearchTools", "VaultSearch", "VaultRead", "VaultWrite", "RememberFact", "RecallMemory", "CaptureBrief", "ReadBrief", "WebSearch", "WebFetch", "NotionSearch", "NotionRead", "NotionCreatePage", "NotionAppend"]

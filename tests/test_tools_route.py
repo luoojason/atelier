@@ -1,5 +1,5 @@
 """Tests for lite_server's GET /tools (r16 Feature 2) — the read-only tool
-registry the tool-inspector card renders: the 12 atelier LIGHT_TOOLS
+registry the tool-inspector card renders: the 16 atelier LIGHT_TOOLS
 introspected with the SAME schema builder sdk_tools uses to register them,
 plus the orchestra tools (SpawnAgent/CheckAgent/NavigateBrowser) with their
 declared schemas. Fixed shape, never 500, no token (read-only GET).
@@ -64,7 +64,7 @@ def test_shape(client):
 # ── the atelier tools ────────────────────────────────────────────────────────
 
 def test_all_ten_atelier_tools_present(client):
-    assert len(lite_server.LIGHT_TOOLS) == 12  # the card counts on all 12
+    assert len(lite_server.LIGHT_TOOLS) == 16  # the card counts on all 16 (incl. 4 Notion)
     atelier = [t for t in _tools(client) if t["server"] == "atelier"]
     assert {t["name"] for t in atelier} == {
         cls.__name__ for cls in lite_server.LIGHT_TOOLS

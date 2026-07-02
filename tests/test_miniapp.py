@@ -206,10 +206,14 @@ def test_options_variant_and_untouched_builder(monkeypatch, client):
     assert opts.mcp_servers == {}
 
     # the shared builder's behavior for every other caller is untouched
+    # (Notion tools are gated on a stored token — excluded here since none is set)
     base = lite_server.build_options()
     assert base.system_prompt == lite_server.ATELIER_INSTRUCTIONS
     assert "atelier" in base.mcp_servers
-    assert base.allowed_tools == list(lite_server.ATELIER_ALLOWED_TOOLS)
+    assert base.allowed_tools == [
+        t for t in lite_server.ATELIER_ALLOWED_TOOLS
+        if t not in lite_server.NOTION_TOOL_NAMES
+    ]
 
 
 def test_fresh_client_per_request(monkeypatch, client):

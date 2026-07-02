@@ -57,6 +57,10 @@ from shared_tools import (
     ReadBrief,
     WebSearch,
     WebFetch,
+    NotionSearch,
+    NotionRead,
+    NotionCreatePage,
+    NotionAppend,
 )
 from shared_tools import sdk_tools
 from shared_tools.sdk_tools import build_atelier_server
@@ -110,11 +114,31 @@ LIGHT_TOOLS = [
     CampaignStatus,
     WebSearch,
     WebFetch,
+    NotionSearch,
+    NotionRead,
+    NotionCreatePage,
+    NotionAppend,
 ]
 
 # One in-process MCP server ("atelier") wrapping all 10 BaseTool subclasses as
 # native SDK tools, plus the mcp__atelier__<ClassName> allowlist for the agent.
 ATELIER_SERVER, ATELIER_ALLOWED_TOOLS = build_atelier_server(LIGHT_TOOLS)
+
+# Notion tools are served by the atelier MCP server always, but only allowed
+# (and advertised in the system prompt) when a token is configured — same
+# conditional pattern as the govern roster. This keeps the toolset clean when
+# Notion isn't set up.
+NOTION_TOOL_NAMES = [
+    "mcp__atelier__NotionSearch",
+    "mcp__atelier__NotionRead",
+    "mcp__atelier__NotionCreatePage",
+    "mcp__atelier__NotionAppend",
+]
+_NOTION_PROMPT = (
+    "\n\nNotion is connected: use NotionSearch/NotionRead/NotionCreatePage/"
+    "NotionAppend to search, read, create, and append to the user's Notion "
+    "workspace as a knowledge base. You can create and append but never delete."
+)
 
 
 # --- Provider + model settings store --------------------------------------------
@@ -157,6 +181,12 @@ def load_settings() -> dict:
     model = data.get("model")
     if isinstance(model, str) and model:
         settings["model"] = model
+    notion = data.get("notion_token")
+    if isinstance(notion, str) and notion:
+        settings["notion_token"] = notion
+    vault = data.get("obsidian_vault")
+    if isinstance(vault, str) and vault:
+        settings["obsidian_vault"] = vault
     return settings
 
 
@@ -255,8 +285,12 @@ def build_options(
     env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = ""
 
     mcp_servers = {"atelier": ATELIER_SERVER}
-    allowed_tools = list(ATELIER_ALLOWED_TOOLS)
+    # Notion tools are gated on a stored token (removed here, re-added below).
+    allowed_tools = [t for t in ATELIER_ALLOWED_TOOLS if t not in NOTION_TOOL_NAMES]
     system_prompt = ATELIER_INSTRUCTIONS
+    if settings.get("notion_token"):
+        allowed_tools += NOTION_TOOL_NAMES
+        system_prompt += _NOTION_PROMPT
 
     # A depth-0 spawner gets the full orchestra (Spawn/Check/Nav). SEPARATELY,
     # ANY session that already governs >=1 child (a back-reference by
@@ -284,7 +318,7 @@ def build_options(
             allowed_tools.append("mcp__orchestra__DelegateToSubagent")
             roster = ", ".join(f'"{c.name}" ({c.id})' for c in children)
             system_prompt = (
-                ATELIER_INSTRUCTIONS
+                system_prompt
                 + "\n\nYou govern these sub-agent cards: "
                 + roster
                 + ". Use DelegateToSubagent(subagent, task) to hand a subtask"

@@ -450,8 +450,11 @@ def test_build_options_with_spawner_gains_orchestra():
     assert "mcp__orchestra__SpawnAgent" in opts.allowed_tools
     assert "mcp__orchestra__CheckAgent" in opts.allowed_tools
     assert "mcp__orchestra__NavigateBrowser" in opts.allowed_tools
-    # the base allowlist is intact alongside the orchestra tools
-    assert set(lite_server.ATELIER_ALLOWED_TOOLS) <= set(opts.allowed_tools)
+    # the base allowlist is intact alongside the orchestra tools (Notion tools
+    # are gated on a stored token — excluded here since none is set)
+    assert (
+        set(lite_server.ATELIER_ALLOWED_TOOLS) - set(lite_server.NOTION_TOOL_NAMES)
+    ) <= set(opts.allowed_tools)
 
 
 def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
