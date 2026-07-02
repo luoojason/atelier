@@ -9,13 +9,19 @@ A "job" is a small mapping:
     {
         "name":     "morning-standup",     # required, unique-ish label
         "schedule": "0 9 * * *"  |  "30m",  # required, cron string OR interval
-        "prompt":   "Summarize ...",        # required, text sent to the agency
+        "prompt":   "Summarize ...",        # text sent to the agency
+        "builtin":  "digest",               # OR a local builtin (no agency POST)
         "agent":    "orchestrator",         # optional recipient agent name
         "endpoint": "http://host:8080",     # optional per-job base-URL override
+        "catch_up": "1d",                   # optional whole-day catch-up window
     }
 
 ``schedule`` is either an *interval* shorthand (``30s`` / ``30m`` / ``2h`` /
-``1d``) or a 5- or 6-field *cron* string.
+``1d``) or a 5- or 6-field *cron* string. A job must carry exactly one of
+``prompt`` (fired at the agency HTTP endpoint) or ``builtin`` (run locally by
+the daemon; the only builtin is ``"digest"``). ``catch_up`` marks the job for a
+one-shot fire shortly after daemon start when the runs ledger has no "ok"
+record for it inside the window (see :func:`plan_catch_ups`).
 """
 
 from __future__ import annotations
@@ -30,9 +36,24 @@ import re
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _INTERVAL_RE = re.compile(r"^\s*(\d+)([smhd])\s*$", re.IGNORECASE)
 
-REQUIRED_FIELDS = ("name", "schedule", "prompt")
-OPTIONAL_FIELDS = ("agent", "endpoint")
-ALLOWED_FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
+REQUIRED_FIELDS = ("name", "schedule")
+PAYLOAD_FIELDS = ("prompt", "builtin")  # exactly one of these is required
+OPTIONAL_FIELDS = ("agent", "endpoint", "catch_up")
+ALLOWED_FIELDS = REQUIRED_FIELDS + PAYLOAD_FIELDS + OPTIONAL_FIELDS
+
+# The builtins the daemon can run locally (no agency POST). Kept as a tuple so
+# validate_job can reject a typo'd builtin with a clean per-job ValueError.
+BUILTIN_JOBS = ("digest",)
+
+# catch_up accepts whole days only ("1d", "7d") — deliberately stricter than
+# the interval shorthand so a junk window is caught at validation time.
+_CATCH_UP_RE = re.compile(r"^\s*(\d+)d\s*$", re.IGNORECASE)
+
+# Catch-up stagger: the first stale job fires CATCH_UP_INITIAL_DELAY seconds
+# after daemon start, each subsequent one CATCH_UP_STAGGER seconds later, so
+# several catch-ups never stampede parallel claude sessions at boot.
+CATCH_UP_INITIAL_DELAY = 20
+CATCH_UP_STAGGER = 45
 
 # --------------------------------------------------------------------------- #
 # Cron field validation
@@ -96,6 +117,31 @@ def parse_interval(text: str) -> int:
     return value * _UNIT_SECONDS[match.group(2).lower()]
 
 
+def parse_catch_up(text) -> int:
+    """Convert a catch_up window ("1d", "7d") into a number of seconds.
+
+    Strict on purpose: only positive whole days are accepted, so a junk value
+    is rejected at validation time with a clean ValueError (the same
+    per-job-never-crashes-the-daemon behavior the cron validation has).
+
+    >>> parse_catch_up("1d")
+    86400
+    >>> parse_catch_up("7d")
+    604800
+    """
+    if not isinstance(text, str):
+        raise ValueError(f"catch_up must be a string, got {type(text).__name__}")
+    match = _CATCH_UP_RE.match(text)
+    if not match:
+        raise ValueError(
+            f"invalid catch_up {text!r}; use whole days like '1d' or '7d'"
+        )
+    value = int(match.group(1))
+    if value <= 0:
+        raise ValueError(f"catch_up must be positive, got {text!r}")
+    return value * 86400
+
+
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
@@ -124,6 +170,20 @@ def validate_job(job) -> dict:
             raise ValueError(f"job field {field!r} must not be empty: {job!r}")
         normalized[field] = value
 
+    # The payload fields are individually optional but exactly one must be
+    # present (checked below); a present-but-empty one is an error, not an
+    # omission, so a blank "prompt:" line still reports "must not be empty".
+    for field in PAYLOAD_FIELDS:
+        value = job.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"job field {field!r} must be a string, got {value!r}")
+        value = value.strip()
+        if not value:
+            raise ValueError(f"job field {field!r} must not be empty: {job!r}")
+        normalized[field] = value
+
     for field in OPTIONAL_FIELDS:
         value = job.get(field)
         if value is None:
@@ -140,6 +200,24 @@ def validate_job(job) -> dict:
             f"job {normalized.get('name', '?')!r} has unknown field(s): "
             f"{sorted(unknown)}"
         )
+
+    # Exactly one of prompt|builtin: a job either POSTs a prompt at the agency
+    # or runs a local builtin, never both and never neither.
+    if ("prompt" in normalized) == ("builtin" in normalized):
+        raise ValueError(
+            f"job {normalized['name']!r} must have exactly one of "
+            f"'prompt' or 'builtin': {job!r}"
+        )
+    builtin = normalized.get("builtin")
+    if builtin is not None and builtin not in BUILTIN_JOBS:
+        raise ValueError(
+            f"job {normalized['name']!r} has unknown builtin {builtin!r}; "
+            f"allowed: {sorted(BUILTIN_JOBS)}"
+        )
+
+    # A junk catch_up window is a validation error, exactly like a junk cron.
+    if "catch_up" in normalized:
+        parse_catch_up(normalized["catch_up"])
 
     # Schedule must be a well-formed interval or cron string; build_trigger
     # raises with a precise message when it is neither.
@@ -389,6 +467,58 @@ def build_trigger(job: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Catch-up planning (pure; the daemon turns plans into one-shot fires)
+# --------------------------------------------------------------------------- #
+
+
+def has_recent_ok(records, name: str, cutoff_ts: str) -> bool:
+    """True when *records* holds an ok run of *name* at or after *cutoff_ts*.
+
+    ``records`` is a run_store ledger list (dicts with ``name`` / ``status`` /
+    ``ts``); non-dict entries are ignored. ISO timestamps compare
+    lexicographically, so a plain string comparison suffices.
+    """
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        if record.get("name") != name or record.get("status") != "ok":
+            continue
+        if str(record.get("ts") or "") >= cutoff_ts:
+            return True
+    return False
+
+
+def plan_catch_ups(jobs, records, now=None) -> list:
+    """Return staggered catch-up plans for jobs whose window has no ok run.
+
+    For each job carrying ``catch_up``, checks *records* (the runs ledger) for
+    a record with the job's name and ``status == "ok"`` newer than
+    ``now - window``; when none exists the job is planned for a one-shot fire.
+    Plans are staggered — the first at :data:`CATCH_UP_INITIAL_DELAY` seconds,
+    each subsequent one :data:`CATCH_UP_STAGGER` seconds later — so several
+    stale jobs never spawn parallel claude sessions at once.
+
+    Returns ``[{"job": <job dict>, "delay": <seconds>}, ...]`` in jobs order.
+    ``now`` (a datetime) is injectable for tests; defaults to the local clock.
+    """
+    if now is None:
+        now = datetime.datetime.now()
+    plans: list = []
+    for job in jobs:
+        window = job.get("catch_up")
+        if not window:
+            continue
+        cutoff = (
+            now - datetime.timedelta(seconds=parse_catch_up(window))
+        ).isoformat(timespec="seconds")
+        if has_recent_ok(records, job["name"], cutoff):
+            continue
+        delay = CATCH_UP_INITIAL_DELAY + CATCH_UP_STAGGER * len(plans)
+        plans.append({"job": job, "delay": delay})
+    return plans
+
+
+# --------------------------------------------------------------------------- #
 # YAML loading (pyyaml when available, tiny fallback parser otherwise)
 # --------------------------------------------------------------------------- #
 
@@ -436,6 +566,47 @@ def load_jobs(path: str) -> list:
         raise ValueError(f"duplicate job name(s): {sorted(dupes)}")
 
     return jobs
+
+
+def load_jobs_lenient(path: str) -> tuple:
+    """Like ``load_jobs`` but per-job problems are collected, not raised.
+
+    Returns ``(jobs, errors)``: the valid job dicts in file order, plus a
+    human-readable string for every entry that failed validation or reused an
+    earlier name (first occurrence wins). The daemon uses this so one typo in
+    the user-editable jobs file skips that job instead of killing every other
+    job at boot. File-level problems (unreadable file, unparseable YAML, wrong
+    top-level shape) still raise — nothing there is salvageable to schedule.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+
+    try:
+        import yaml  # type: ignore
+
+        data = yaml.safe_load(text)
+    except ImportError:
+        data = _tiny_yaml_load(text)
+
+    raw_jobs = _extract_job_list(data)
+
+    jobs: list = []
+    errors: list = []
+    seen: set = set()
+    for index, item in enumerate(raw_jobs):
+        try:
+            job = validate_job(item)
+        except ValueError as exc:
+            name = item.get("name") if isinstance(item, dict) else None
+            label = repr(name) if isinstance(name, str) and name else f"#{index + 1}"
+            errors.append(f"job {label}: {exc}")
+            continue
+        if job["name"] in seen:
+            errors.append(f"job {job['name']!r}: duplicate name (first occurrence wins)")
+            continue
+        seen.add(job["name"])
+        jobs.append(job)
+    return jobs, errors
 
 
 def _strip_inline_comment(value: str) -> str:

@@ -19,7 +19,8 @@ echo "==> installing backend deps into the env"
 # Exactly what lite_server.py's import graph needs; iterate here if boot smoke fails.
 uv pip install --python "$ENV_DIR/bin/python3" \
   "agency-swarm==1.10.2" "fastapi==0.138.2" "uvicorn==0.49.0" \
-  "composio-openai-agents==0.8.0"
+  "composio-openai-agents==0.8.0" \
+  "apscheduler==3.11.3" "httpx==0.28.1" "pyyaml"
 
 echo "==> stripping caches + pip"
 find "$ENV_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} +
@@ -30,6 +31,6 @@ find "$ENV_DIR" \( -name '*.so' -o -name '*.dylib' \) -exec codesign --force -s 
 codesign --force -s - "$ENV_DIR/bin/python3.13"
 
 echo "==> smoke test: imports + lite_server boot"
-"$ENV_DIR/bin/python3" -c "import fastapi, uvicorn, agency_swarm; print('imports ok')"
+"$ENV_DIR/bin/python3" -c "import fastapi, uvicorn, agency_swarm, apscheduler, httpx, yaml; print('imports ok')"
 du -sh "$ENV_DIR"
 echo "done"

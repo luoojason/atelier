@@ -1,0 +1,24 @@
+# Atelier default jobs — the seed template for the desktop app.
+#
+# At first boot the app copies this file to ~/.atelier/jobs.yaml and points the
+# scheduler daemon at it (SWARM_JOBS_FILE); edit THAT copy, not this one.
+# Field reference: scheduler/jobs.example.yaml. Two additions used here:
+#   catch_up  fire once shortly after daemon start when the runs ledger has no
+#             "ok" record for the job inside the window ("1d", "7d").
+#   builtin   run a local builtin instead of a prompt ("digest" summarizes the
+#             runs ledger into a vault note — no agent tokens).
+jobs:
+  - name: morning-brief
+    schedule: "0 7 * * *"
+    catch_up: "1d"
+    prompt: |
+      Write today's Morning Brief note for the studio vault. Steps: (1) VaultRead "log.md" and look at the most recent ~30 entries; (2) RecallMemory for open follow-ups; (3) VaultWrite a note titled "Morning Brief <today YYYY-MM-DD>" into "Sessions/" (catalog it) with three short sections: Yesterday (what actually changed, from the log), Today (2-3 highest-leverage next moves grounded in active projects), Watch (anything stale or blocked). Under 300 words, concrete project names and paths, no filler. If a brief for today already exists, update it instead of duplicating.
+  - name: project-rollup
+    schedule: "0 18 * * 0"
+    catch_up: "7d"
+    prompt: |
+      Weekly project rollup. Use VaultSearch/VaultRead over the Projects/ folder and the tail of log.md to find: active projects with no log activity for 14+ days, and projects with explicit open next steps. VaultWrite "Project Rollup <today YYYY-MM-DD>" into "Analysis/" (catalog it): a table of project | last activity | state | suggested next step, then the 3 projects most worth touching this week. Only state what the vault actually shows; never invent status.
+  - name: overnight-digest
+    schedule: "0 6 * * *"
+    catch_up: "1d"
+    builtin: digest

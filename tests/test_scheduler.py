@@ -226,6 +226,90 @@ def test_load_jobs_example():
 
 
 # --------------------------------------------------------------------------- #
+# load_jobs_lenient (the daemon's boot loader — one typo must not kill the rest)
+# --------------------------------------------------------------------------- #
+
+
+def test_load_jobs_lenient_skips_invalid_jobs_keeps_valid():
+    # The app seeds a user-editable jobs file, so the daemon loads it leniently:
+    # a bad entry (junk catch_up, missing prompt, duplicate name) is skipped and
+    # reported, while every valid job still schedules. load_jobs stays strict.
+    import tempfile
+    from pathlib import Path
+
+    from scheduler.jobs_core import load_jobs_lenient
+
+    text = (
+        "jobs:\n"
+        "  - name: good\n"
+        "    schedule: 30m\n"
+        "    prompt: hi\n"
+        "  - name: bad-window\n"
+        "    schedule: 30m\n"
+        "    prompt: hi\n"
+        '    catch_up: "1w"\n'
+        "  - schedule: 30m\n"
+        "    prompt: no name\n"
+        "  - name: good\n"
+        "    schedule: 45m\n"
+        "    prompt: duplicate of the first\n"
+        "  - name: also-good\n"
+        '    schedule: "0 7 * * *"\n'
+        "    prompt: hi\n"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "jobs.yaml"
+        path.write_text(text)
+
+        jobs, errors = load_jobs_lenient(str(path))
+        assert [j["name"] for j in jobs] == ["good", "also-good"], jobs
+        assert len(errors) == 3, errors
+        joined = "\n".join(errors)
+        assert "bad-window" in joined, errors
+        assert "#3" in joined, errors  # the nameless entry is labeled by position
+        assert "duplicate" in joined.lower(), errors
+
+        # Strict load_jobs still rejects the same file outright.
+        try:
+            load_jobs(str(path))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("load_jobs should reject the invalid file")
+
+
+def test_load_jobs_lenient_file_level_problems_still_raise():
+    # Nothing is salvageable from a missing file or a wrong top-level shape:
+    # those still raise so main() can surface one clear config error and exit.
+    import tempfile
+    from pathlib import Path
+
+    from scheduler.jobs_core import load_jobs_lenient
+
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            load_jobs_lenient(str(Path(tmp) / "missing.yaml"))
+        except OSError:
+            pass
+        else:
+            raise AssertionError("a missing jobs file should raise")
+
+        bad_shape = Path(tmp) / "shape.yaml"
+        bad_shape.write_text("jobs: not-a-list\n")
+        try:
+            load_jobs_lenient(str(bad_shape))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("a non-list jobs value should raise")
+
+    # A clean file yields no errors and matches strict load_jobs.
+    jobs, errors = load_jobs_lenient(EXAMPLE)
+    assert errors == [], errors
+    assert [j["name"] for j in jobs] == [j["name"] for j in load_jobs(EXAMPLE)]
+
+
+# --------------------------------------------------------------------------- #
 # fallback YAML parser (the no-PyYAML path)
 # --------------------------------------------------------------------------- #
 
@@ -1167,6 +1251,61 @@ def test_make_runner_transport_failure_is_error_not_http0():
     finally:
         sched.client.send = original_send
         retry.time.sleep = saved_sleep
+
+
+def test_make_runner_2xx_error_flag_is_failure_not_ok():
+    # The lite backend's compat route never 500s: an agent-level failure comes
+    # back as HTTP 200 + {"response": "<error text>", "error": true}. make_runner
+    # must record that run as "error" (so it notifies, shows red in the app, and
+    # catch_up re-fires it on the next launch), lifting the useful text out of
+    # "response" — NOT as a green "ok" with error_text "True".
+    import tempfile
+    from pathlib import Path
+
+    import scheduler.scheduler as sched
+
+    fake = _FakeClient(
+        _FakeResponse(
+            200,
+            {
+                "response": "Atelier hit an error and could not finish that turn: boom",
+                "error": True,
+            },
+        )
+    )
+    original_send = client.send
+    sched.client.send = lambda *a, **k: original_send(*a, client=fake, **k)
+    try:
+        with tempfile.TemporaryDirectory() as tmp, _scoped_env(
+            SWARM_RUNS_JSONL=str(Path(tmp) / "runs.jsonl"),
+            SWARM_NOTIFICATIONS=str(Path(tmp) / "notifications.jsonl"),
+            SWARM_AIEOS_URL=None,
+        ):
+            log_path = Path(tmp) / "runs.log"
+            job = {"name": "brief", "schedule": "30m", "prompt": "hi"}
+            sched.make_runner(job, "http://h:8080", "open-swarm", None, log_path)()
+
+            assert "\tbrief\terror\t" in log_path.read_text()
+
+            records = run_store.read_records(str(Path(tmp) / "runs.jsonl"))
+            assert len(records) == 1, records
+            rec = records[0]
+            assert rec["status"] == "error", rec
+            assert rec["status_code"] == 200
+            # The error text is the payload's response, never str(True).
+            assert "boom" in (rec["error"] or ""), rec
+            assert rec["error"] != "True", rec
+
+            # The agent-level failure alerts like any other failure.
+            notes = notify.read_notifications(str(Path(tmp) / "notifications.jsonl"))
+            assert len(notes) == 1 and notes[0]["name"] == "brief", notes
+
+            # And has_recent_ok must NOT count it, so catch_up re-fires the job.
+            from scheduler.jobs_core import has_recent_ok
+
+            assert has_recent_ok(records, "brief", "2000-01-01T00:00:00") is False
+    finally:
+        sched.client.send = original_send
 
 
 def test_make_runner_runlog_write_failure_does_not_suppress_ledger_and_alert():

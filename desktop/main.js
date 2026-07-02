@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, dialog, ipcMain, screen, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, powerSaveBlocker, screen, shell } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -30,6 +30,12 @@ const BACKEND_PY = app.isPackaged
   ? path.join(process.resourcesPath, 'python-env', 'bin', 'python3')
   : path.join(DEV_REPO, '.venv-ext', 'bin', 'python');
 const HEALTH_URL = `http://127.0.0.1:${PORT}/health`;
+
+// Jobs file for BOTH sidecars: the scheduler daemon fires it, and the backend's
+// GET /jobs reads it (via SWARM_JOBS_FILE) so the Workflow/Calendar cards show
+// the SAME file the daemon runs — not the repo's example fallback.
+const JOBS_FILE = path.join(os.homedir(), '.atelier', 'jobs.yaml');
+const JOBS_TEMPLATE = path.join(BACKEND_DIR, 'scheduler', 'jobs.atelier.yaml');
 
 let backendProc = null;
 let mainWindow = null;
@@ -84,6 +90,7 @@ function startBackend() {
       PATH: FULL_PATH,
       DEFAULT_MODEL: 'claude-cli',
       PORT: String(PORT),
+      SWARM_JOBS_FILE: JOBS_FILE, // GET /jobs must read the daemon's file, not the repo fallback
       PYTHONUNBUFFERED: '1',
       PYTHONDONTWRITEBYTECODE: '1', // never write .pyc into the sealed Resources tree
       CLAUDE_ISOLATED: '1',
@@ -140,6 +147,98 @@ function killBackend() {
   if (!backendProc) return;
   const proc = backendProc;
   backendProc = null;
+  try {
+    proc.kill('SIGTERM');
+    setTimeout(() => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }, 2000);
+  } catch {
+    /* already gone */
+  }
+}
+
+// ── scheduler daemon ────────────────────────────────────────────────────────
+// Second sidecar: scheduler/scheduler.py fires the vault jobs in
+// ~/.atelier/jobs.yaml (JOBS_FILE, declared with the config up top) at the lite
+// backend (POST /open-swarm/get_response), populating ~/.openswarm/runs.jsonl
+// so the app's live widgets show real data.
+
+let schedulerProc = null;
+let powerBlockerId = null;
+
+function stopPowerBlocker() {
+  if (powerBlockerId === null) return;
+  try { powerSaveBlocker.stop(powerBlockerId); } catch { /* already stopped */ }
+  powerBlockerId = null;
+}
+
+// Seed the jobs file from the shipped template on first boot only — an
+// existing file is the user's and is never overwritten.
+function ensureJobsFile() {
+  if (fs.existsSync(JOBS_FILE)) return true;
+  try {
+    fs.mkdirSync(path.dirname(JOBS_FILE), { recursive: true });
+    fs.copyFileSync(JOBS_TEMPLATE, JOBS_FILE);
+    logLine(`[sched] seeded ${JOBS_FILE} from template`);
+    return true;
+  } catch (err) {
+    logLine(`[sched] could not seed jobs file from ${JOBS_TEMPLATE}: ${err} — scheduler not started`);
+    return false;
+  }
+}
+
+function startScheduler() {
+  if (schedulerProc || intentionalKill) return;
+  if (!ensureJobsFile()) return;
+  schedulerProc = cp.spawn(BACKEND_PY, [path.join(BACKEND_DIR, 'scheduler', 'scheduler.py')], {
+    cwd: BACKEND_DIR,
+    env: {
+      ...process.env,
+      PATH: FULL_PATH,
+      SWARM_BASE_URL: `http://127.0.0.1:${PORT}`,
+      SWARM_JOBS_FILE: JOBS_FILE,
+      SWARM_AIEOS_URL: 'http://127.0.0.1:7824',
+      PYTHONUNBUFFERED: '1',
+      PYTHONDONTWRITEBYTECODE: '1', // never write .pyc into the sealed Resources tree
+    },
+  });
+
+  // A 7am job must fire even with the lid closed at 6:59.
+  // ponytail: blanket blocker while the daemon lives; scoping it to due-jobs
+  // windows is the upgrade.
+  if (powerBlockerId === null) powerBlockerId = powerSaveBlocker.start('prevent-app-suspension');
+
+  schedulerProc.stdout.on('data', (chunk) => {
+    process.stdout.write(`[sched] ${chunk}`);
+    logLine(`[sched] ${chunk}`.trimEnd());
+  });
+  schedulerProc.stderr.on('data', (chunk) => {
+    process.stderr.write(`[sched-err] ${chunk}`);
+    logLine(`[sched] ${chunk}`.trimEnd());
+  });
+  schedulerProc.on('error', (err) => {
+    console.error('[sched] failed to spawn:', err);
+    logLine(`[sched] spawn error: ${err}`);
+  });
+  schedulerProc.on('close', (code, signal) => {
+    logLine(`[sched] scheduler exited code=${code} signal=${signal}`);
+    schedulerProc = null;
+    stopPowerBlocker();
+    // ponytail: no respawn for the daemon in v1 — missed fires are covered by
+    // catch_up on next launch, and a daemon that dies twice is a bug to read
+    // in the log, not to paper over.
+  });
+}
+
+function killScheduler() {
+  stopPowerBlocker();
+  if (!schedulerProc) return;
+  const proc = schedulerProc;
+  schedulerProc = null;
   try {
     proc.kill('SIGTERM');
     setTimeout(() => {
@@ -264,6 +363,13 @@ if (!app.requestSingleInstanceLock()) {
     createWindow();
 
     const ready = await waitForBackend();
+    // Spawn the scheduler after the health wait either way. Sequencing behind a
+    // healthy backend is only a nicety (a job firing into a dead backend just
+    // burns a retry, and the daemon's retry/notify machinery tolerates it);
+    // never spawning it — a cold import slower than the 45s wait, a backend
+    // that comes up via the respawn path — would silently lose every cron fire
+    // and catch-up for the whole session.
+    startScheduler();
     if (!ready) {
       console.warn('[backend] not ready after 45s — the window is open; it will connect when the backend answers.');
       // Only surface a dialog if the backend is not currently alive (a respawn
@@ -295,12 +401,14 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on('window-all-closed', () => {
     intentionalKill = true;
+    killScheduler();
     killBackend();
     app.quit();
   });
 
   app.on('before-quit', () => {
     intentionalKill = true;
+    killScheduler();
     killBackend();
   });
 }

@@ -87,16 +87,26 @@ LIGHT_TOOLS = [
 ]
 
 # --- Build ONE agent on the subscription and wrap it in a single Agency. ---
-agent = agency_swarm.Agent(
-    name="Atelier",
-    instructions=ATELIER_INSTRUCTIONS,
-    model=config.get_default_model(),
-    tools=LIGHT_TOOLS,
-)
+def build_agency():
+    """Build a FRESH Atelier Agent + Agency (same instructions/tools/model).
+
+    The single construction path for BOTH the module-level chat agency below
+    and the per-request agencies of the scheduler compat route, so the two can
+    never drift. A fresh Agency shares no conversation state with any other
+    instance.
+    """
+    agent = agency_swarm.Agent(
+        name="Atelier",
+        instructions=ATELIER_INSTRUCTIONS,
+        model=config.get_default_model(),
+        tools=LIGHT_TOOLS,
+    )
+    return agency_swarm.Agency(agent, name="Atelier")
+
 
 # Module-level agency, reused across every /chat call so the conversation keeps
 # continuity (memory of prior turns) within the process.
-agency = agency_swarm.Agency(agent, name="Atelier")
+agency = build_agency()
 
 
 app = FastAPI(title="Atelier Lite")
@@ -132,6 +142,13 @@ async def _reject_foreign_origins(request: Request, call_next):
 
 class ChatRequest(BaseModel):
     message: str
+
+
+class AgencyResponseRequest(BaseModel):
+    """Body shape of the agency server's get_response route (scheduler compat)."""
+
+    message: str
+    recipient_agent: str | None = None
 
 
 @app.get("/health")
@@ -288,6 +305,36 @@ async def chat(req: ChatRequest):
             text = str(result)
         return {"response": str(text)}
     except Exception as exc:  # noqa: BLE001 - never 500 the UI
+        return {
+            "response": f"Atelier hit an error and could not finish that turn: {exc}",
+            "error": True,
+        }
+
+
+@app.post("/open-swarm/get_response")
+async def get_response_compat(req: AgencyResponseRequest):
+    """Scheduler compat route: the agency server's POST /{agency}/get_response.
+
+    scheduler/client.py fires each job here as {"message", "recipient_agent"?}.
+    Every call runs on a FRESH agency from build_agency() — never the
+    module-level chat agency — so a scheduled 7am brief cannot pollute the
+    user's chat context, and it is safe to run concurrently with /chat.
+    """
+
+    def _run():
+        fresh = build_agency()
+        kwargs = {}
+        if req.recipient_agent:
+            kwargs["recipient_agent"] = req.recipient_agent
+        return fresh.get_response_sync(req.message, **kwargs)
+
+    try:
+        result = await run_in_threadpool(_run)
+        text = getattr(result, "final_output", None)
+        if text is None:
+            text = str(result)
+        return {"response": str(text)}
+    except Exception as exc:  # noqa: BLE001 - mirror /chat: never 500 the caller
         return {
             "response": f"Atelier hit an error and could not finish that turn: {exc}",
             "error": True,

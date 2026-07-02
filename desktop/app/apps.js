@@ -13,8 +13,10 @@
                  'persist:atelier-browser') with back/forward/reload/URL/open
                  toolbar; falls back to an <iframe> in a plain browser or when
                  webviewTag is off.
-     workflow  — live list of scheduler jobs from GET /jobs.
-     calendar  — the same jobs as a compact readable schedule list.
+     workflow  — live list of scheduler jobs from GET /jobs, refreshed
+                 every 30s.
+     calendar  — the same jobs as a compact readable schedule list,
+                 refreshed every 30s.
      history   — live run ledger (GET /runs) + notifications
                  (GET /notifications), refreshed every 20s.
 
@@ -60,10 +62,12 @@
      4. Campaign (↺) → one row per scheduler job: name, verbatim schedule
         pill, first-80-chars prompt excerpt, agent when set; the jobs file
         path is the footer. Calendar (🗓) → the same jobs as one line each:
-        "name — cron 0 9 * * 1" or "name — every 30m".
+        "name — cron 0 9 * * 1" or "name — every 30m". Both re-poll /jobs
+        every 30s, so an edit to the jobs file shows up without respawning.
      5. Notes (🗒): type text, reload (Cmd-R) → the note reopens at its
         position with the text intact.
-     6. Close a History card (×) → its 20s poll stops (watch the Network tab).
+     6. Close a History, Campaign, or Calendar card (×) → its poll stops
+        (watch the Network tab).
    =========================================================================== */
 
 (function () {
@@ -234,6 +238,14 @@
   }
 
   const INTERVAL_RE = /^\s*(\d+)\s*([smhd])\s*$/i;   // scheduler shorthand: 30s/30m/2h/1d
+
+  // Live-card poll shared by History/Workflow/Calendar: run refresh now, again
+  // every `ms`, and stop the timer when the card closes.
+  function pollWhileOpen(ctl, refresh, ms) {
+    refresh();
+    const timer = setInterval(refresh, ms);
+    ctl.onRemove(() => clearInterval(timer));
+  }
 
   // ── builders (function declarations so TYPES below can reference them) ─────
   function buildNote(body, cfg, ctl) {
@@ -457,12 +469,10 @@
       }
     }
 
-    refresh();
-    const timer = setInterval(refresh, 20000);
-    ctl.onRemove(() => clearInterval(timer));
+    pollWhileOpen(ctl, refresh, 20000);
   }
 
-  function buildWorkflow(body) {
+  function buildWorkflow(body, cfg, ctl) {
     body.classList.add('atl-list-body');
     const host = document.createElement('div');
     host.appendChild(noteEl('Loading jobs…'));
@@ -470,70 +480,78 @@
     foot.className = 'atl-foot';
     body.append(host, foot);
 
-    api('/jobs').then((data) => {
-      host.textContent = '';
-      const jobs = (data && data.jobs) || [];
-      if (data && data.error) host.appendChild(noteEl(String(data.error)));
-      if (!jobs.length) {
-        if (!(data && data.error)) host.appendChild(noteEl('No scheduled jobs.'));
-      } else {
-        jobs.forEach((j) => {
-          const row = document.createElement('div');
-          row.className = 'atl-row';
-          const main = document.createElement('div');
-          main.className = 'atl-row-main';
-          const t = document.createElement('div');
-          t.className = 'atl-row-title';
-          t.textContent = j.name || '(unnamed)';
-          const s = document.createElement('div');
-          s.className = 'atl-row-sub';
-          const excerpt = String(j.prompt || '').slice(0, 80);
-          s.textContent = excerpt + (j.agent ? ' · ' + j.agent : '');
-          main.append(t, s);
-          const pill = document.createElement('span');
-          pill.className = 'atl-pill';
-          pill.textContent = String(j.schedule || '');
-          row.append(main, pill);
-          host.appendChild(row);
-        });
-      }
-      foot.textContent = (data && data.file) ? String(data.file) : '';
-    }).catch(() => {
-      host.textContent = '';
-      host.appendChild(noteEl('Backend offline — jobs unavailable.'));
-    });
+    function refresh() {
+      api('/jobs').then((data) => {
+        host.textContent = '';
+        const jobs = (data && data.jobs) || [];
+        if (data && data.error) host.appendChild(noteEl(String(data.error)));
+        if (!jobs.length) {
+          if (!(data && data.error)) host.appendChild(noteEl('No scheduled jobs.'));
+        } else {
+          jobs.forEach((j) => {
+            const row = document.createElement('div');
+            row.className = 'atl-row';
+            const main = document.createElement('div');
+            main.className = 'atl-row-main';
+            const t = document.createElement('div');
+            t.className = 'atl-row-title';
+            t.textContent = j.name || '(unnamed)';
+            const s = document.createElement('div');
+            s.className = 'atl-row-sub';
+            const excerpt = String(j.prompt || '').slice(0, 80);
+            s.textContent = excerpt + (j.agent ? ' · ' + j.agent : '');
+            main.append(t, s);
+            const pill = document.createElement('span');
+            pill.className = 'atl-pill';
+            pill.textContent = String(j.schedule || '');
+            row.append(main, pill);
+            host.appendChild(row);
+          });
+        }
+        foot.textContent = (data && data.file) ? String(data.file) : '';
+      }).catch(() => {
+        host.textContent = '';
+        host.appendChild(noteEl('Backend offline — jobs unavailable.'));
+      });
+    }
+
+    pollWhileOpen(ctl, refresh, 30000);
   }
 
   // ponytail: a readable schedule list, not a month grid — grid is decoration
   // until jobs carry dates.
-  function buildCalendar(body) {
+  function buildCalendar(body, cfg, ctl) {
     body.classList.add('atl-list-body');
     const host = document.createElement('div');
     host.appendChild(noteEl('Loading schedule…'));
     body.appendChild(host);
 
-    api('/jobs').then((data) => {
-      host.textContent = '';
-      const jobs = (data && data.jobs) || [];
-      if (!jobs.length) {
-        host.appendChild(noteEl((data && data.error) ? String(data.error) : 'No scheduled jobs.'));
-        return;
-      }
-      jobs.forEach((j) => {
-        const line = document.createElement('div');
-        line.className = 'atl-sched-row';
-        const name = j.name || '(unnamed)';
-        const sched = String(j.schedule || '');
-        const m = INTERVAL_RE.exec(sched);
-        line.textContent = m
-          ? name + ' — every ' + m[1] + m[2].toLowerCase()
-          : name + ' — cron ' + sched;
-        host.appendChild(line);
+    function refresh() {
+      api('/jobs').then((data) => {
+        host.textContent = '';
+        const jobs = (data && data.jobs) || [];
+        if (!jobs.length) {
+          host.appendChild(noteEl((data && data.error) ? String(data.error) : 'No scheduled jobs.'));
+          return;
+        }
+        jobs.forEach((j) => {
+          const line = document.createElement('div');
+          line.className = 'atl-sched-row';
+          const name = j.name || '(unnamed)';
+          const sched = String(j.schedule || '');
+          const m = INTERVAL_RE.exec(sched);
+          line.textContent = m
+            ? name + ' — every ' + m[1] + m[2].toLowerCase()
+            : name + ' — cron ' + sched;
+          host.appendChild(line);
+        });
+      }).catch(() => {
+        host.textContent = '';
+        host.appendChild(noteEl('Backend offline — schedule unavailable.'));
       });
-    }).catch(() => {
-      host.textContent = '';
-      host.appendChild(noteEl('Backend offline — schedule unavailable.'));
-    });
+    }
+
+    pollWhileOpen(ctl, refresh, 30000);
   }
 
   // ── type table ────────────────────────────────────────────────────────────
