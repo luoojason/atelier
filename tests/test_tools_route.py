@@ -27,7 +27,12 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 
 ENTRY_KEYS = {"name", "description", "input_schema", "server", "availability"}
-ORCHESTRA_NAMES = {"SpawnAgent", "CheckAgent", "NavigateBrowser"}
+ORCHESTRA_NAMES = {
+    "SpawnAgent",
+    "CheckAgent",
+    "NavigateBrowser",
+    "DelegateToSubagent",
+}
 
 
 @pytest.fixture
@@ -88,6 +93,10 @@ def test_orchestra_entries_present(client):
     assert orchestra["CheckAgent"]["input_schema"]["required"] == ["agent_id"]
     assert orchestra["NavigateBrowser"]["input_schema"]["required"] == ["url"]
     assert "linked" in orchestra["NavigateBrowser"]["description"]
+    assert orchestra["DelegateToSubagent"]["input_schema"]["required"] == [
+        "subagent",
+        "task",
+    ]
 
 
 # ── schemas carry properties/required ────────────────────────────────────────

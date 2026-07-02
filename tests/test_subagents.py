@@ -95,9 +95,14 @@ def _inline_turns(monkeypatch):
 
 def _handlers(parent_id):
     """The (SpawnAgent, CheckAgent, NavigateBrowser) handler coroutines bound
-    to parent_id."""
-    spawn, check, nav = lite_server._orchestra_tools(parent_id)
+    to parent_id. Tolerates extra orchestra tools (DelegateToSubagent)."""
+    spawn, check, nav, *_ = lite_server._orchestra_tools(parent_id)
     return spawn.handler, check.handler, nav.handler
+
+
+def _delegate_handler(parent_id):
+    """The DelegateToSubagent handler coroutine (the 4th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[3].handler
 
 
 def _call(handler, args):
@@ -423,7 +428,7 @@ def test_detail_carries_browser_nav_and_list_does_not(client, captured):
 
 
 def test_navigate_tool_description_mentions_the_link_requirement():
-    _, _, nav_tool = lite_server._orchestra_tools("p")
+    _, _, nav_tool, *_ = lite_server._orchestra_tools("p")
     assert nav_tool.name == "NavigateBrowser"
     assert "linked" in nav_tool.description
 
@@ -488,3 +493,136 @@ def test_max_sessions_default_is_12(monkeypatch):
     assert lite_server._max_sessions() == 12
     monkeypatch.setenv("ATELIER_MAX_SESSIONS", "not-a-number")
     assert lite_server._max_sessions() == 12
+
+
+# ── DelegateToSubagent ───────────────────────────────────────────────────────
+
+_NO_MATCH = (
+    'No governed sub-agent matches "{ref}". Govern a card first, or use'
+    " its exact id or name."
+)
+
+
+def _govern(parent, name, sid=None, depth=None):
+    """Register an already-governed child (parent_id == parent.id)."""
+    child = lite_server._AgentSession(
+        sid or uuid_like(name),
+        name,
+        parent_id=parent.id,
+        depth=(parent.depth + 1) if depth is None else depth,
+    )
+    lite_server._sessions[child.id] = child
+    return child
+
+
+def uuid_like(seed):
+    # a 32-hex id derived from the name, unique per test child
+    import hashlib
+    return hashlib.md5(seed.encode()).hexdigest()
+
+
+def test_delegate_runs_a_turn_on_the_governed_child_and_returns_its_reply(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory()
+    )
+    parent = _register_parent()
+    child = _govern(parent, "Scout")
+    delegate = _delegate_handler(parent.id)
+
+    reply = _text(
+        _call(delegate, {"subagent": child.id, "task": "summarize the vault"})
+    )
+    assert reply == 'Sub-agent "Scout" replied: scripted reply'
+    assert child.status == "idle"
+    assert [(m["role"], m["text"]) for m in child.messages] == [
+        ("user", "summarize the vault"),
+        ("assistant", "scripted reply"),
+    ]
+
+
+def test_delegate_resolves_child_by_name(monkeypatch):
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory()
+    )
+    parent = _register_parent()
+    _govern(parent, "Scout")
+    delegate = _delegate_handler(parent.id)
+    assert _text(_call(delegate, {"subagent": "Scout", "task": "t"})) == (
+        'Sub-agent "Scout" replied: scripted reply'
+    )
+
+
+def test_delegate_rejects_a_non_governed_target(monkeypatch):
+    # containment: a foreign card / sibling's child / junk are all "no match",
+    # and none of them is ever run.
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory()
+    )
+    parent = _register_parent()
+    other = lite_server._AgentSession("othercard0", "Other")
+    lite_server._sessions[other.id] = other
+    delegate = _delegate_handler(parent.id)
+    for ref in (other.id, "Other", "nope"):
+        assert _text(_call(delegate, {"subagent": ref, "task": "t"})) == (
+            _NO_MATCH.format(ref=ref)
+        )
+    assert other.messages == []  # the foreign session never ran
+
+
+def test_delegate_by_name_is_ambiguous_when_two_children_share_a_name(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory()
+    )
+    parent = _register_parent()
+    _govern(parent, "Twin", sid="twin000000000000000000000000000a")
+    _govern(parent, "Twin", sid="twin000000000000000000000000000b")
+    delegate = _delegate_handler(parent.id)
+    assert _text(_call(delegate, {"subagent": "Twin", "task": "t"})) == (
+        'Multiple governed sub-agents are named "Twin"; delegate by id instead.'
+    )
+
+
+def test_delegate_rejects_a_busy_child(monkeypatch):
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory()
+    )
+    parent = _register_parent()
+    child = _govern(parent, "Scout")
+    child.status = "running"
+    delegate = _delegate_handler(parent.id)
+    assert _text(_call(delegate, {"subagent": "Scout", "task": "t"})) == (
+        'Sub-agent "Scout" is busy with another turn; try again shortly.'
+    )
+    # nothing appended: the turn was refused before it ran
+    assert child.messages == []
+
+
+def test_delegate_with_parent_gone():
+    delegate = _delegate_handler("deadbeef00000000deadbeef00000000")
+    assert _text(_call(delegate, {"subagent": "x", "task": "t"})) == (
+        "Your session is gone; cannot delegate."
+    )
+
+
+def test_delegate_blocked_at_max_depth():
+    # a session already at the depth cap cannot delegate further down the
+    # chain (bounds A->B->C->... recursion); the child is never run.
+    parent = lite_server._AgentSession(
+        "deepparent00000000000000000000aa",
+        "Deep",
+        parent_id="p" * 32,
+        depth=lite_server._MAX_DEPTH,
+    )
+    parent.status = "running"
+    lite_server._sessions[parent.id] = parent
+    child = _govern(parent, "Child", depth=lite_server._MAX_DEPTH + 1)
+    delegate = _delegate_handler(parent.id)
+    assert _text(_call(delegate, {"subagent": child.id, "task": "t"})) == (
+        f"Max delegation depth ({lite_server._MAX_DEPTH}) reached — cannot"
+        " delegate further down this chain."
+    )
+    assert child.messages == []

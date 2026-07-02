@@ -2061,7 +2061,91 @@ def _orchestra_tools(parent_id: str) -> list:
             " user to shift-drag a box around a browser card and this card)."
         )
 
-    return [_spawn_agent, _check_agent, _navigate_browser]
+    @tool(
+        "DelegateToSubagent",
+        "Delegate a subtask to one of the sub-agent cards you already govern"
+        " (an existing card on the canvas), identified by its session id or"
+        " its display name. The sub-agent runs the task in its own session and"
+        " its reply is returned to you. Use this to hand work to a specific"
+        " governed card rather than spawning a brand-new one with SpawnAgent.",
+        {
+            "type": "object",
+            "properties": {
+                "subagent": {
+                    "type": "string",
+                    "description": "The governed sub-agent to delegate to, by"
+                    " its session id or its exact display name.",
+                },
+                "task": {
+                    "type": "string",
+                    "description": "The subtask for the sub-agent to work on,"
+                    " written as a complete standalone instruction.",
+                },
+            },
+            "required": ["subagent", "task"],
+        },
+    )
+    async def _delegate_agent(args):
+        parent = _sessions.get(parent_id)
+        if parent is None:
+            # The delegator was deleted/evicted mid-turn.
+            return _tool_text("Your session is gone; cannot delegate.")
+        if parent.depth >= _MAX_DEPTH:
+            # Bound the chain (A->B->C->...): a session at the cap cannot push
+            # work one level deeper. Normally unreachable because govern caps
+            # child depth at _MAX_DEPTH, so a capped session has no children —
+            # kept as a defensive runtime gate.
+            return _tool_text(
+                f"Max delegation depth ({_MAX_DEPTH}) reached — cannot"
+                " delegate further down this chain."
+            )
+        ref = (args.get("subagent") or "").strip()
+        children = [
+            s for s in _sessions.values() if s.parent_id == parent_id
+        ]
+        # Resolve by exact id first, then by exact name (containment: only this
+        # session's OWN governed children are reachable — never a foreign card).
+        child = next((s for s in children if s.id == ref), None)
+        if child is None:
+            named = [s for s in children if s.name == ref]
+            if len(named) > 1:
+                return _tool_text(
+                    f'Multiple governed sub-agents are named "{ref}";'
+                    " delegate by id instead."
+                )
+            child = named[0] if named else None
+        if child is None:
+            return _tool_text(
+                f'No governed sub-agent matches "{ref}". Govern a card first,'
+                " or use its exact id or name."
+            )
+        if child.status == "running":
+            return _tool_text(
+                f'Sub-agent "{child.name}" is busy with another turn; try'
+                " again shortly."
+            )
+        # Run the turn on the EXISTING child inline (synchronous delegation):
+        # its card streams the delegated task + reply through its normal poll,
+        # and we hand the reply straight back to the delegating model. Mirror
+        # _start_turn's pre-run bookkeeping (append user msg, mark running,
+        # touch LRU) since _run_session_turn assumes the caller did it.
+        _append_session_message(child, "user", args["task"])
+        child.status = "running"
+        _touch_session(child)
+        await _run_session_turn(child, args["task"])
+        last_reply = next(
+            (
+                m["text"]
+                for m in reversed(child.messages)
+                if m["role"] == "assistant"
+            ),
+            "(no reply)",
+        )
+        return _tool_text(
+            f'Sub-agent "{child.name}" replied: {last_reply}'
+        )
+
+    return [_spawn_agent, _check_agent, _navigate_browser, _delegate_agent]
 
 
 def _build_orchestra_server(parent_id: str):
