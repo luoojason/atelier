@@ -188,7 +188,7 @@ def test_create_list_get_shapes(client):
     detail = client.get(f"/sessions/{made['id']}").json()
     assert detail == {
         "id": made["id"], "name": "Research", "status": "idle", "messages": [],
-        "parent_id": None, "depth": 0, "browser_nav": None,
+        "parent_id": None, "depth": 0, "model": None, "browser_nav": None,
     }
 
 
@@ -451,3 +451,46 @@ def test_create_rejects_unknown_model(client):
 def test_create_without_model_defaults_to_none(client):
     sid = _create(client)["id"]
     assert lite_server._sessions[sid].model is None
+
+
+def test_set_session_model_happy_path(client):
+    sid = _create(client)["id"]
+    r = client.post(f"/sessions/{sid}/model", json={"model": "haiku"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "model": "haiku"}
+    assert lite_server._sessions[sid].model == "haiku"
+
+
+def test_set_session_model_unknown_session_404(client):
+    r = client.post("/sessions/nope/model", json={"model": "haiku"})
+    assert r.status_code == 404
+    assert r.json() == {"error": "unknown session"}
+
+
+def test_set_session_model_rejects_unknown_model(client):
+    sid = _create(client)["id"]
+    r = client.post(f"/sessions/{sid}/model", json={"model": "gpt-4o"})
+    assert r.status_code == 400
+    assert r.json() == {"error": "unknown model"}
+    assert lite_server._sessions[sid].model is None  # unchanged
+
+
+def test_get_session_surfaces_model(client):
+    sid = _create(client)["id"]
+    assert client.get(f"/sessions/{sid}").json()["model"] is None
+    client.post(f"/sessions/{sid}/model", json={"model": "opus"})
+    assert client.get(f"/sessions/{sid}").json()["model"] == "opus"
+
+
+def test_set_session_model_token_gated(monkeypatch, client):
+    monkeypatch.setenv("ATELIER_TOKEN", "sekret")
+    hdr = {"X-Atelier-Token": "sekret"}
+    sid = client.post("/sessions", json={}, headers=hdr).json()["id"]
+    assert client.post(
+        f"/sessions/{sid}/model", json={"model": "opus"}
+    ).status_code == 403
+    r = client.post(
+        f"/sessions/{sid}/model", json={"model": "opus"}, headers=hdr
+    )
+    assert r.status_code == 200
+    assert lite_server._sessions[sid].model == "opus"

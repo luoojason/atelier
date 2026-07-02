@@ -1752,8 +1752,29 @@ async def get_session(session_id: str):
         "messages": list(sess.messages),
         "parent_id": sess.parent_id,
         "depth": sess.depth,
+        "model": sess.model,
         "browser_nav": sess.browser_nav,
     }
+
+
+@app.post("/sessions/{session_id}/model")
+async def set_session_model(session_id: str, req: ModelRequest):
+    """Set this session's model override (same allowlist as POST /config/model).
+
+    Resolution at turn time is (session.model or _resolved_model()). Dropping
+    the lazily-built client while idle makes the change take effect on the next
+    turn; a fresh card has no client yet (no-op), and a running turn keeps its
+    client (it picks the new model up on its next rebuild).
+    """
+    sess = _sessions.get(session_id)
+    if sess is None:
+        return _unknown_session()
+    if req.model not in _ALLOWED_MODELS:
+        return JSONResponse({"error": "unknown model"}, status_code=400)
+    sess.model = req.model
+    if sess.status != "running":
+        await _close_session_client(sess)
+    return {"ok": True, "model": sess.model}
 
 
 @app.post("/sessions/{session_id}/message")
