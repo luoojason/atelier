@@ -441,6 +441,30 @@ ipcMain.handle('atelier:save-text', async (event, payload) => {
   }
 });
 
+// atelier:save-binary — write base64-encoded bytes (e.g. a .pptx from the Deck
+// card) to a user-chosen path. base64 travels over IPC cleanly; the main
+// process decodes and writes it. Returns { saved } | { canceled } | { error }.
+ipcMain.handle('atelier:save-binary', async (event, payload) => {
+  const b64 = payload && typeof payload.b64 === 'string' ? payload.b64 : '';
+  const suggested = (payload && payload.name) ? String(payload.name) : 'file';
+  const ext = (payload && payload.ext) ? String(payload.ext).replace(/[^\w]/g, '').slice(0, 8) : 'bin';
+  const safe = suggested.replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'file';
+  if (!b64) return { error: 'nothing to save' };
+  try {
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const { filePath, canceled } = await dialog.showSaveDialog(parent, {
+      title: 'Save',
+      defaultPath: safe + '.' + (ext || 'bin'),
+      filters: [{ name: (payload && payload.filterName) || (ext || 'bin').toUpperCase(), extensions: [ext || 'bin'] }],
+    });
+    if (canceled || !filePath) return { canceled: true };
+    fs.writeFileSync(filePath, Buffer.from(b64, 'base64'));
+    return { saved: filePath };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
+
 // ── boot ────────────────────────────────────────────────────────────────────
 
 // Single-instance lock: a second launch must not spawn a second backend that

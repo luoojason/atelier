@@ -1846,6 +1846,215 @@ async def research(req: ResearchRequest):
     return {"html": html, "title": (req.title or _document_title(html))}
 
 
+# --- Slide deck deliverable (POST /deck, POST /deck/pptx) -------------------------
+#
+# The OpenSwarm slides_agent capability in Atelier's zero-key idiom, WITHOUT its
+# heavy toolchain (LibreOffice + Node html2pptx + Poppler + playwright). The
+# model authors a STRUCTURED deck (JSON: title/subtitle + slides of title +
+# bullets + notes); the backend renders an HTML preview from that structure and
+# builds a real, editable .pptx with python-pptx (pure Python, bundled in the
+# app's python-env). No native binaries, no keys.
+
+import base64 as _base64
+import html as _html
+import json as _json
+
+_MAX_DECK_SLIDES = 40
+_MAX_DECK_BULLETS = 12
+
+DECK_INSTRUCTIONS = """You are a presentation designer. Given the user's request, design a clear, well-structured slide deck and return it as ONE JSON object — nothing before or after it, optionally inside a ```json fenced block.
+
+Schema:
+{
+  "title": "Deck title",
+  "subtitle": "one-line subtitle or context (optional)",
+  "slides": [
+    {"title": "Slide title", "bullets": ["concise point", "concise point"], "notes": "speaker notes for this slide (optional)"}
+  ]
+}
+
+Rules:
+- 5 to 15 content slides is usually right; never exceed 40. Each slide: a short title and 2-6 concise bullet points (not paragraphs). Add brief speaker "notes" where useful.
+- Write genuinely useful, well-organized content for the request — this is a real deliverable, not a placeholder.
+- Output ONLY the JSON object."""
+
+
+def _deck_options() -> ClaudeAgentOptions:
+    """build_options() variant for the deck generator (no tools; see /miniapp)."""
+    return dataclasses.replace(
+        build_options(),
+        system_prompt=DECK_INSTRUCTIONS,
+        max_turns=6,
+        allowed_tools=[],
+        mcp_servers={},
+    )
+
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _extract_deck(text: str) -> dict | None:
+    """Parse the deck JSON from a reply: a fenced block first, else the first
+    balanced {...} object. Returns a normalized {title, subtitle, slides} dict
+    (slides capped, each slide's fields coerced/capped) or None if unusable."""
+    candidates = []
+    m = _JSON_FENCE_RE.search(text)
+    if m:
+        candidates.append(m.group(1))
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(text[start:end + 1])
+    for raw in candidates:
+        try:
+            obj = _json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        slides_in = obj.get("slides")
+        if not isinstance(slides_in, list) or not slides_in:
+            continue
+        slides = []
+        for s in slides_in[:_MAX_DECK_SLIDES]:
+            if not isinstance(s, dict):
+                continue
+            bullets = s.get("bullets")
+            bullets = [str(b) for b in bullets[:_MAX_DECK_BULLETS]] if isinstance(bullets, list) else []
+            slides.append({
+                "title": str(s.get("title") or ""),
+                "bullets": bullets,
+                "notes": str(s.get("notes") or ""),
+            })
+        if not slides:
+            continue
+        return {
+            "title": str(obj.get("title") or "Presentation"),
+            "subtitle": str(obj.get("subtitle") or ""),
+            "slides": slides,
+        }
+    return None
+
+
+def _render_deck_html(deck: dict) -> str:
+    """A self-contained, script-free HTML preview of the deck (16:9 slide cards).
+    Every value is HTML-escaped — the deck content is model-generated text."""
+    esc = _html.escape
+    parts = [
+        "<!doctype html><html><head><meta charset='utf-8'><style>",
+        "body{margin:0;background:#ece7dd;font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#2c2016;padding:18px}",
+        ".slide{background:#fff;aspect-ratio:16/9;border:1px solid #d9cdba;border-radius:10px;box-shadow:0 2px 10px rgba(60,48,34,.08);margin:0 auto 18px;max-width:640px;padding:26px 30px;display:flex;flex-direction:column;overflow:hidden}",
+        ".slide.title-slide{justify-content:center;align-items:center;text-align:center;background:linear-gradient(135deg,#fff,#f6efe4)}",
+        ".slide h1{font-size:26px;margin:0 0 8px}.slide .sub{color:#7c6c58;font-size:15px}",
+        ".slide h2{font-size:20px;margin:0 0 14px;padding-bottom:8px;border-bottom:2px solid #c05c37;color:#3c3022}",
+        ".slide ul{margin:0;padding-left:20px}.slide li{margin:0 0 8px;font-size:15px}",
+        ".pagenum{margin-top:auto;align-self:flex-end;font-size:11px;color:#a89a86}",
+        "</style></head><body>",
+    ]
+    parts.append(
+        "<div class='slide title-slide'><div><h1>" + esc(deck["title"]) + "</h1>"
+        + ("<div class='sub'>" + esc(deck["subtitle"]) + "</div>" if deck["subtitle"] else "")
+        + "</div></div>"
+    )
+    for i, s in enumerate(deck["slides"], 1):
+        lis = "".join("<li>" + esc(b) + "</li>" for b in s["bullets"])
+        parts.append(
+            "<div class='slide'><h2>" + esc(s["title"] or ("Slide " + str(i))) + "</h2>"
+            + ("<ul>" + lis + "</ul>" if lis else "")
+            + "<div class='pagenum'>" + str(i) + "</div></div>"
+        )
+    parts.append("</body></html>")
+    return "".join(parts)
+
+
+def _build_pptx(deck: dict) -> bytes:
+    """Build a real, editable .pptx from the structured deck (python-pptx,
+    lazy-imported so the LIGHT import path stays dependency-free)."""
+    import io
+    from pptx import Presentation  # lazy: heavy dep, only on export
+
+    prs = Presentation()
+    title_slide = prs.slides.add_slide(prs.slide_layouts[0])
+    title_slide.shapes.title.text = deck["title"] or "Presentation"
+    if deck.get("subtitle") and len(title_slide.placeholders) > 1:
+        title_slide.placeholders[1].text = deck["subtitle"]
+    for s in deck["slides"]:
+        slide = prs.slides.add_slide(prs.slide_layouts[1])  # Title and Content
+        slide.shapes.title.text = s.get("title") or ""
+        bullets = s.get("bullets") or []
+        if bullets and len(slide.placeholders) > 1:
+            tf = slide.placeholders[1].text_frame
+            tf.text = bullets[0]
+            for b in bullets[1:]:
+                tf.add_paragraph().text = b
+        if s.get("notes"):
+            slide.notes_slide.notes_text_frame.text = s["notes"]
+    buf = io.BytesIO()
+    prs.save(buf)
+    return buf.getvalue()
+
+
+class DeckRequest(BaseModel):
+    description: str = Field(min_length=3, max_length=4000)
+    title: str | None = Field(default=None, max_length=200)
+
+
+@app.post("/deck")
+async def deck(req: DeckRequest):
+    """Generate a structured slide deck + an HTML preview. Token-gated (POST).
+    {"deck","html","title"} on success, {"error"} on any failure — never 500s."""
+    prompt = req.description
+    if req.title:
+        prompt = f'Deck title: "{req.title}"\n\n{req.description}'
+    try:
+        async with ClaudeSDKClient(options=_deck_options()) as client:
+            await client.query(prompt)
+            result = await _collect_response(client)
+    except Exception as exc:  # noqa: BLE001 - never 500 the card
+        return {"error": f"deck generation failed: {exc}"}
+    if result.get("error"):
+        return {"error": result["response"]}
+    parsed = _extract_deck(result["response"])
+    if parsed is None:
+        return {"error": "the model did not return a usable slide deck"}
+    if req.title:
+        parsed["title"] = req.title
+    return {"deck": parsed, "html": _render_deck_html(parsed), "title": parsed["title"]}
+
+
+class DeckSlideModel(BaseModel):
+    title: str = ""
+    bullets: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+
+class DeckPptxRequest(BaseModel):
+    title: str = Field(default="Presentation", max_length=200)
+    subtitle: str = Field(default="", max_length=400)
+    slides: list[DeckSlideModel] = Field(default_factory=list)
+
+
+@app.post("/deck/pptx")
+async def deck_pptx(req: DeckPptxRequest):
+    """Build a .pptx from a structured deck and return it base64-encoded.
+    Token-gated (POST). {"pptx_b64","title"} on success, {"error"} on failure."""
+    if not req.slides:
+        return JSONResponse({"error": "no slides to export"}, status_code=400)
+    deck_obj = {
+        "title": req.title,
+        "subtitle": req.subtitle,
+        "slides": [
+            {"title": s.title, "bullets": list(s.bullets[:_MAX_DECK_BULLETS]), "notes": s.notes}
+            for s in req.slides[:_MAX_DECK_SLIDES]
+        ],
+    }
+    try:
+        data = _build_pptx(deck_obj)
+    except Exception as exc:  # noqa: BLE001 - never 500 the card
+        return JSONResponse({"error": f"pptx build failed: {exc}"}, status_code=500)
+    return {"pptx_b64": _base64.b64encode(data).decode("ascii"), "title": req.title}
+
+
 # --- Multi-card agent sessions ------------------------------------------------
 #
 # Each Agent card in the desktop app owns ONE of these sessions: a fresh

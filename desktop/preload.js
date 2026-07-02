@@ -58,4 +58,8 @@ contextBridge.exposeInMainWorld('atelier', {
   saveText: (text, name, ext) =>
     ipcRenderer.invoke('atelier:save-text', { text, name, ext })
       .catch((e) => ({ error: String((e && e.message) || e) })),
+  // Save base64-encoded bytes (e.g. a .pptx from the Deck card) to a path.
+  saveBinary: (b64, name, ext, filterName) =>
+    ipcRenderer.invoke('atelier:save-binary', { b64, name, ext, filterName })
+      .catch((e) => ({ error: String((e && e.message) || e) })),
 });
