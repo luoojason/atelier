@@ -6,8 +6,9 @@
    Multi-card agent sessions: every "Agent" card is its OWN conversation on
    the backend's sessions API (each backend session owns a fresh
    ClaudeSDKClient — separate from the main chat card's client and from
-   scheduled jobs). Registers the 'agent' app type via Atelier.registerApp
-   and wires the ✳ Agent dock button.
+   scheduled jobs). Registers the 'agent' app type via Atelier.registerApp;
+   the 💬 Chat dock button (apps.js) spawns cards via A.spawnApp('agent') —
+   this module wires no dock button of its own.
 
    Backend contract (lite_server.py, fixed shapes):
      POST   /sessions                {"name"?}   -> {"id","name"}
@@ -82,13 +83,10 @@
    set only exists to stop the background sweep from resurrecting
    user-closed children, and a user click is fresh intent.
 
-   Dock note: core.js's dock handler would spawn any registered type by
-   lowercased button title, but apps.js CLONE-REPLACES every .dock-btn at load
-   (stripping core's listeners) and its replacement handler only knows its own
-   DOCK_MAP types — 'agent' is not among them. This module loads after
-   apps.js, so it attaches the one real click handler to the ✳ button itself
-   (apps.js's handler still runs first and only toggles the active class; no
-   double spawn).
+   Dock note: the standalone ✳ Agent dock button was removed (index.html) once
+   the 💬 Chat button started spawning agent cards directly via
+   A.spawnApp('agent') (apps.js). This module registers the 'agent' app type
+   for that call to find but no longer attaches any dock click handler.
 
    Contract: builds ONLY against window.Atelier + fetch. Injects its own CSS.
    Does not touch core.js, apps.js, boards.js, or styles.css.
@@ -113,9 +111,9 @@
    ── MANUAL TEST ────────────────────────────────────────────────────────────
    1. Start the backend (PORT=8765 .venv-ext/bin/python lite_server.py) and
       `npm start` in desktop/ — or open index.html in a plain browser.
-   2. Click the ✳ Agent dock button → an "Agent 1" card spawns (messages list
+   2. Click the 💬 Chat dock button → an "Agent 1" card spawns (messages list
       + its own composer). Click again → "Agent 2". Network tab shows one
-      POST /sessions per card.
+      POST /sessions per card. The dock has no ✳ button.
    3. Type "remember the word mango" ↵ in Agent 1 → your bubble appears
       right-aligned, an italic "Thinking…" bubble follows, and the card polls
       GET /sessions/{id} every 1.5s until the reply lands.
@@ -810,13 +808,10 @@
     },
   };
 
-  // ── dock wiring (see header: apps.js stripped core's dock handler) ────────
-  (function wireDock() {
-    const btn = Array.from(document.querySelectorAll('.dock-btn'))
-      .find((b) => (b.getAttribute('title') || '').toLowerCase() === 'agent');
-    if (!btn) { console.warn('[sessions] no Agent dock button found.'); return; }
-    btn.addEventListener('click', () => { A.spawnApp('agent'); });
-  })();
+  // ── dock wiring ────────────────────────────────────────────────────────────
+  // The ✳ Agent dock button was removed. The 💬 Chat button (wired in apps.js)
+  // now spawns agent cards via A.spawnApp('agent'). No Agent-specific dock
+  // handler lives in this module anymore.
 
   // ── board switch ───────────────────────────────────────────────────────────
   // Nothing to do here on purpose. Agent cards are ordinary addCard cards, so
@@ -833,9 +828,13 @@
   (function selfCheck() {
     const registered = A.apps && A.apps.has && A.apps.has('agent');
     console.assert(registered, '[sessions] agent app type not registered');
-    const btn = Array.from(document.querySelectorAll('.dock-btn'))
+    // The ✳ Agent button was removed; 💬 Chat (apps.js) now spawns agents.
+    const noAgentBtn = !Array.from(document.querySelectorAll('.dock-btn'))
       .some((b) => (b.getAttribute('title') || '').toLowerCase() === 'agent');
-    console.assert(btn, '[sessions] Agent dock button missing from index.html');
+    console.assert(noAgentBtn, '[sessions] stale ✳ Agent dock button still present');
+    const chatBtn = Array.from(document.querySelectorAll('.dock-btn'))
+      .some((b) => (b.getAttribute('title') || '').toLowerCase() === 'chat');
+    console.assert(chatBtn, '[sessions] Chat dock button missing from index.html');
     const sweepIdle = cardBySession.size === 0 && sweepTimer === null;
     console.assert(sweepIdle,
       '[sessions] child sweep must stay idle until a card owns a session');
@@ -857,10 +856,10 @@
     const flashCssOk = /atl-agent-reveal-flash/
       .test((document.getElementById('atl-sessions-styles') || {}).textContent || '');
     console.assert(flashCssOk, '[sessions] reveal flash keyframes not injected');
-    if (registered && btn && sweepIdle && linksOk && accessorOk && flashCssOk) {
+    if (registered && noAgentBtn && chatBtn && sweepIdle && linksOk && accessorOk && flashCssOk) {
       console.log('[sessions] self-check passed — agent app registered, '
-        + 'dock wired, child sweep idle, links access guarded, '
-        + 'AtelierSessions.reveal published.');
+        + '✳ button removed (💬 Chat spawns agents), child sweep idle, '
+        + 'links access guarded, AtelierSessions.reveal published.');
     }
   })();
 })();
