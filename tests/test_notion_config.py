@@ -123,3 +123,38 @@ def test_vault_note_route(tmp_path, monkeypatch):
     c = TestClient(lite_server.app)
     assert "Hello" in c.get("/vault/note", params={"path": "A"}).json()["markdown"]
     assert c.get("/vault/note", params={"path": "nope"}).status_code == 404
+
+
+def test_vault_gets_token_gated_when_token_set(tmp_path, monkeypatch):
+    (tmp_path / "A.md").write_text("# Hello\nbody", encoding="utf-8")
+    monkeypatch.setenv("OBSIDIAN_VAULT", str(tmp_path))
+    monkeypatch.setenv("ATELIER_SETTINGS_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setenv("ATELIER_TOKEN", "tok")
+    c = TestClient(lite_server.app)
+
+    # No header -> rejected, same shape as the mutating-method gate.
+    no_token = c.get("/vault/graph")
+    assert no_token.status_code == 403
+    assert no_token.json() == {"detail": "missing or bad token"}
+    no_token_note = c.get("/vault/note", params={"path": "A"})
+    assert no_token_note.status_code == 403
+    assert no_token_note.json() == {"detail": "missing or bad token"}
+
+    # With the header -> the routes work as before.
+    ok_graph = c.get("/vault/graph", headers={"X-Atelier-Token": "tok"})
+    assert ok_graph.status_code == 200
+    assert {n["id"] for n in ok_graph.json()["nodes"]} == {"A"}
+    ok_note = c.get(
+        "/vault/note", params={"path": "A"}, headers={"X-Atelier-Token": "tok"}
+    )
+    assert ok_note.status_code == 200
+    assert "Hello" in ok_note.json()["markdown"]
+
+
+def test_other_gets_not_token_gated(tmp_path, monkeypatch):
+    """Sanity: the token gate is scoped to /vault/* only, not every GET."""
+    monkeypatch.setenv("ATELIER_SETTINGS_PATH", str(tmp_path / "s.json"))
+    monkeypatch.setenv("ATELIER_TOKEN", "tok")
+    c = TestClient(lite_server.app)
+    assert c.get("/config").status_code == 200
+    assert c.get("/health").status_code == 200

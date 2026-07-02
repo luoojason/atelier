@@ -453,6 +453,14 @@ _ORIGIN_RE = r"^(null|file://|https?://(localhost|127\.0\.0\.1)(:\d+)?)$"
 _origin_ok = re.compile(_ORIGIN_RE).match
 _MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
+# The vault GETs are the one read surface that's NOT safe to leave open like
+# the rest of the read-only GETs above: /vault/graph + /vault/note expose the
+# whole Obsidian vault's link graph and note contents, so a hostile "null"
+# origin page (CORS-allowed for the Electron renderer) could exfiltrate it
+# cross-origin. Every other GET stays ungated per the accepted-risk note
+# above; these two get the same token gate the mutating methods use.
+_TOKEN_GATED_GET_PATHS = ("/vault/graph", "/vault/note")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=_ORIGIN_RE,
@@ -468,7 +476,11 @@ async def _reject_foreign_origins(request: Request, call_next):
     if origin is not None and not _origin_ok(origin):
         return JSONResponse({"detail": "origin not allowed"}, status_code=403)
     token = os.getenv("ATELIER_TOKEN", "")  # call-time read so tests can tune it
-    if token and request.method in _MUTATING_METHODS:
+    needs_token = (
+        request.method in _MUTATING_METHODS
+        or request.url.path in _TOKEN_GATED_GET_PATHS
+    )
+    if token and needs_token:
         supplied = request.headers.get("x-atelier-token", "")
         if not secrets.compare_digest(supplied, token):
             return JSONResponse({"detail": "missing or bad token"}, status_code=403)

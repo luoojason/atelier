@@ -236,9 +236,16 @@
       return null;
     }
 
+    function authHeaders() {
+      const h = {};
+      if (window.atelier && window.atelier.token) h['X-Atelier-Token'] = window.atelier.token;
+      return h;
+    }
+
     function openNote(n) {
       if (!n || n.ghost || !n.path) return;
-      fetch(BASE + '/vault/note?path=' + encodeURIComponent(n.id))
+      fetch(BASE + '/vault/note?path=' + encodeURIComponent(n.id),
+            { headers: authHeaders() })
         .then((r) => r.json())
         .then((d) => {
           const md = (d && d.markdown) || '';
@@ -314,7 +321,7 @@
     window.addEventListener('resize', onResize);
 
     function load() {
-      fetch(BASE + '/vault/graph')
+      fetch(BASE + '/vault/graph', { headers: authHeaders() })
         .then((r) => r.json())
         .then((d) => {
           if (disposed) return;
