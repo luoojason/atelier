@@ -176,13 +176,19 @@ def test_create_list_get_shapes(client):
     assert set(listing) == {"sessions"}
     assert {s["id"] for s in listing["sessions"]} == {made["id"], auto["id"]}
     for s in listing["sessions"]:
-        assert set(s) == {"id", "name", "status", "messages_len"}
+        assert set(s) == {
+            "id", "name", "status", "messages_len", "parent_id", "depth",
+        }
         assert s["status"] == "idle"
         assert s["messages_len"] == 0
+        # card-created sessions are always depth-0 roots
+        assert s["parent_id"] is None
+        assert s["depth"] == 0
 
     detail = client.get(f"/sessions/{made['id']}").json()
     assert detail == {
         "id": made["id"], "name": "Research", "status": "idle", "messages": [],
+        "parent_id": None, "depth": 0,
     }
 
 

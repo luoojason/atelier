@@ -11,13 +11,26 @@
 
    Backend contract (lite_server.py, fixed shapes):
      POST   /sessions                {"name"?}   -> {"id","name"}
-     GET    /sessions/{id}                       -> {id,name,status,messages:[{role,text,ts}]}
+     GET    /sessions                            -> {"sessions":[{id,name,status,
+                                                    messages_len,parent_id,depth}]}
+     GET    /sessions/{id}                       -> {id,name,status,parent_id,
+                                                    depth,messages:[{role,text,ts}]}
      POST   /sessions/{id}/message   {"message"} -> 202 {"status":"running"}
                                        (409 {"error":"turn in progress"} mid-turn)
      DELETE /sessions/{id}                       -> {"ok":true}
    Fire-and-poll: send POSTs the message, then this card polls GET every 1.5s
    while status is "running" and appends any new messages. Turn errors come
    back as an assistant message with status "error" — rendered like any reply.
+
+   Sub-agent auto-reveal: depth-0 agent sessions can spawn children server-side
+   (the backend's SpawnAgent orchestra tool). ONE module-level sweep polls
+   GET /sessions every 2.5s — only while at least one card here owns a session
+   id — and any listed session whose parent_id belongs to a card on this canvas
+   and that has no card of its own is revealed as an ATTACHED card beside its
+   parent. Attach mode never POSTs /sessions (the card is a live view onto the
+   existing child session) and never recreates it on 404 (a fresh session would
+   orphan the parent link). When app/arrows.js is loaded, a parent→child arrow
+   is drawn; window.Atelier.arrows is optional and guarded at every use.
 
    Direct-fetch pattern (same as core's streamChat + the widget fetches):
    plain fetch to http://127.0.0.1:8765 — no preload hop needed.
@@ -58,7 +71,20 @@
    7. Stop the backend, send → the message returns to the composer with an
       inline "Could not reach the Atelier backend" note. Restart the backend,
       send again → works (a fresh session is created if the old one is gone).
-   8. Console shows "[sessions] self-check passed" and no assert failures.
+   8. Sub-agents: in Agent 1 ask "spawn a sub-agent to write a haiku about
+      rivers, then collect its result" → within ~2.5s a new card appears to
+      the right of Agent 1 (hollow title-bar dot + "Sub-agent" tooltip) and
+      its transcript streams in live via the normal poll. With app/arrows.js
+      loaded, an arrow links parent → child. A second child of the same
+      parent stacks 210px below the first. Network tab shows the sweep's
+      GET /sessions every 2.5s ONLY while agent cards exist.
+   9. Close the parent card → the child card stays (it owns its own poll).
+      Closing a child card DELETEs its backend session like any Agent card
+      (the parent's CheckAgent then reports it gone — that is expected).
+  10. Restart the backend, then send in a revealed child card → the inline
+      sub-agent-expired note appears and the card does NOT create a fresh
+      session; the message stays in the composer.
+  11. Console shows "[sessions] self-check passed" and no assert failures.
    =========================================================================== */
 
 (function () {
@@ -72,6 +98,11 @@
   const POLL_MS = 1500;
   const CARD_W = 380;
   const CARD_H = 340;
+  const SWEEP_MS = 2500; // child-discovery sweep cadence (GET /sessions list)
+  const CHILD_DX = 70;   // revealed child sits this far right of its parent
+  const CHILD_DY = 210;  // vertical step per already-revealed sibling
+  const CHILD_GONE_NOTE = 'This sub-agent session expired on the backend — '
+    + 'it cannot be restarted from this card.';
 
   let agentSeq = 0; // 'Agent N' naming for cards spawned this page-load
 
@@ -111,6 +142,8 @@
         border-radius: 9px; background: var(--accent); color: #fff;
         cursor: pointer; font-size: 13px; }
       .atl-agent-send:disabled { opacity: 0.5; }
+      .atl-agent-subdot { background: #fff; border: 2px solid var(--accent);
+        box-sizing: border-box; }
     `;
     const style = document.createElement('style');
     style.id = 'atl-sessions-styles';
@@ -132,10 +165,94 @@
     return { ok: res.ok, status: res.status, data };
   }
 
+  // ── sub-agent auto-reveal (module-level, one sweep for every card) ────────
+  // cardBySession tracks EVERY live card that owns a backend session id
+  // (fresh cards register when POST /sessions resolves; attached cards
+  // immediately). The sweep runs only while that map is non-empty, so an
+  // agent-free canvas makes zero background requests.
+  const cardBySession = new Map(); // session id -> card element
+  // ids the user closed: the DELETE is fired async, so a sweep response
+  // already in flight can still list the child — without this the card would
+  // resurrect as a dead "expired" ghost the user has to close twice.
+  // Grow-only on purpose: uuid4 ids never recur, and a desktop session
+  // closes a handful of cards at most.
+  const dismissedSessions = new Set();
+  let sweepTimer = null;
+  let sweeping = false; // one fetch at a time; a slow backend must not stack
+
+  function syncSweep() {
+    if (cardBySession.size > 0 && sweepTimer == null) {
+      sweepTimer = setInterval(sweepForChildren, SWEEP_MS);
+    } else if (cardBySession.size === 0 && sweepTimer != null) {
+      clearInterval(sweepTimer);
+      sweepTimer = null;
+    }
+  }
+  function trackSession(id, cardEl) { cardBySession.set(id, cardEl); syncSweep(); }
+  function untrackSession(id) { cardBySession.delete(id); syncSweep(); }
+
+  // k in the reveal-position formula: children of this parent already on
+  // canvas (the sweep stamps data-atl-parent-session on each revealed card,
+  // and card:removed drops the map entry, so the count is self-maintaining).
+  function revealedChildCount(parentId) {
+    let n = 0;
+    cardBySession.forEach((el) => {
+      if (el.dataset.atlParentSession === parentId) n += 1;
+    });
+    return n;
+  }
+
+  async function sweepForChildren() {
+    if (sweeping) return;
+    sweeping = true;
+    try {
+      const r = await apiJson('/sessions', { method: 'GET' });
+      if (!r.ok || !r.data || !Array.isArray(r.data.sessions)) return;
+      for (const item of r.data.sessions) {
+        if (!item || !item.id || item.parent_id == null) continue;
+        if (dismissedSessions.has(item.id)) continue; // closed; DELETE racing
+        const parentEl = cardBySession.get(item.parent_id);
+        if (!parentEl || cardBySession.has(item.id)) continue;
+        // reveal beside the parent; siblings stack downward
+        const k = revealedChildCount(item.parent_id);
+        const pos = {
+          x: (parseFloat(parentEl.style.left) || 0) + parentEl.offsetWidth + CHILD_DX,
+          y: (parseFloat(parentEl.style.top) || 0) + k * CHILD_DY,
+        };
+        const childEl = createAgentCard(pos, {
+          id: String(item.id),
+          name: String(item.name || 'Sub-agent'),
+          parentEl,
+        });
+        if (!childEl) continue;
+        childEl.dataset.atlParentSession = String(item.parent_id);
+        // arrows.js loads separately and may be absent (plain-browser test);
+        // it auto-unlinks on card:removed, so the unlink handle can be dropped
+        const arrows = window.Atelier && window.Atelier.arrows;
+        if (arrows && typeof arrows.link === 'function') {
+          arrows.link(parentEl, childEl);
+        }
+      }
+    } catch {
+      // backend unreachable — each card's own poll already reports that
+    } finally {
+      sweeping = false;
+    }
+  }
+
   // ── one agent card ─────────────────────────────────────────────────────────
-  function createAgentCard(worldPos) {
-    agentSeq += 1;
-    const name = 'Agent ' + agentSeq;
+  // attach = null (fresh card: creates its own backend session) or
+  // {id, name, parentEl} (sub-agent reveal: a view onto an EXISTING session —
+  // no POST /sessions, transcript arrives via the first poll).
+  function createAgentCard(worldPos, attach) {
+    const attached = !!(attach && attach.id);
+    let name;
+    if (attached) {
+      name = attach.name || 'Sub-agent';
+    } else {
+      agentSeq += 1;
+      name = 'Agent ' + agentSeq;
+    }
 
     // shell (same structure core's addCard expects: .card-bar / .card-x)
     const card = document.createElement('section');
@@ -151,6 +268,11 @@
     closeX.className = 'card-x';
     closeX.textContent = '×';
     bar.append(dot, title, closeX);
+    if (attached) {
+      // sub-agent hint: hollow dot + tooltip; .card-bar structure untouched
+      dot.classList.add('atl-agent-subdot');
+      bar.title = 'Sub-agent — spawned by another agent card';
+    }
 
     const body = document.createElement('div');
     body.className = 'app-body atl-agent-body';
@@ -172,12 +294,15 @@
     card.append(bar, body);
 
     // state
-    let sessionId = null;
+    let sessionId = attached ? attach.id : null;
     let renderedCount = 0;  // server messages already in the DOM
     let running = false;
     let closed = false;
+    let expired = false;    // attached only: child session gone, never rebuilt
     let pollTimer = null;
     let thinkingRow = null;
+
+    if (attached) trackSession(sessionId, card); // fresh cards register in ensureSession
 
     function setNote(text) { note.textContent = text || ''; }
 
@@ -215,6 +340,12 @@
 
     async function ensureSession() {
       if (sessionId) return sessionId;
+      if (attached) {
+        // this card views a session another agent owns — never recreate it
+        const e = new Error('sub-agent session gone');
+        e.expired = true;
+        throw e;
+      }
       const r = await apiJson('/sessions', {
         method: 'POST',
         body: JSON.stringify({ name }),
@@ -230,6 +361,7 @@
       if (!r.ok || !r.data || !r.data.id) throw new Error('session create failed');
       sessionId = r.data.id;
       renderedCount = 0; // fresh server session starts with an empty ledger
+      if (!closed) trackSession(sessionId, card); // card:removed cleans this up
       return sessionId;
     }
 
@@ -255,9 +387,18 @@
         return;
       }
       if (r.status === 404) {
-        // evicted server-side (LRU cap / restart) — next send starts fresh
         hideThinking();
         settle();
+        if (attached) {
+          // the parent-spawned session is gone (backend restart / LRU after
+          // it finished). Recreating would orphan the parent link, so this
+          // card only reports it; sends fail gracefully with the same note.
+          expired = true;
+          setNote(CHILD_GONE_NOTE);
+          return;
+        }
+        // evicted server-side (LRU cap / restart) — next send starts fresh
+        untrackSession(sessionId);
         sessionId = null;
         setNote('This session expired on the backend — the next message starts a fresh one.');
         return;
@@ -277,6 +418,7 @@
     async function send() {
       const text = ta.value.trim();
       if (!text || running || closed) return;
+      if (attached && expired) { setNote(CHILD_GONE_NOTE); return; }
       ta.value = '';
       setNote('');
       const optimistic = addBubble('user', text);
@@ -287,7 +429,15 @@
         const body = { method: 'POST', body: JSON.stringify({ message: text }) };
         let r = await apiJson('/sessions/' + sessionId + '/message', body);
         if (r.status === 404) {
+          if (attached) {
+            // child session gone mid-conversation — same no-recreate rule
+            expired = true;
+            const e = new Error('sub-agent session gone');
+            e.expired = true;
+            throw e;
+          }
           // session evicted between turns — recreate once and retry
+          untrackSession(sessionId);
           sessionId = null;
           await ensureSession();
           r = await apiJson('/sessions/' + sessionId + '/message', body);
@@ -313,11 +463,13 @@
         settle();
         setNote(err && err.busy
           ? 'Atelier is still on the previous turn — try again in a moment.'
-          : err && err.limit
-            ? 'Session limit reached — close an Agent card or wait for a turn to finish, then try again.'
-            : err && err.full
-              ? 'This conversation is full — close this card and start a fresh Agent.'
-              : 'Could not reach the Atelier backend. It may still be starting — try again in a moment.');
+          : err && err.expired
+            ? CHILD_GONE_NOTE
+            : err && err.limit
+              ? 'Session limit reached — close an Agent card or wait for a turn to finish, then try again.'
+              : err && err.full
+                ? 'This conversation is full — close this card and start a fresh Agent.'
+                : 'Could not reach the Atelier backend. It may still be starting — try again in a moment.');
       }
     }
 
@@ -347,20 +499,38 @@
       clearTimeout(pollTimer);
       off();
       if (sessionId) {
-        // best-effort: the backend also reclaims leaked sessions via LRU cap
+        untrackSession(sessionId);
+        // dismissed BEFORE the async DELETE: a sweep response already in
+        // flight can still list this child, and without the set it would be
+        // re-revealed as a dead card mid-deletion.
+        dismissedSessions.add(sessionId);
+        // best-effort: the backend also reclaims leaked sessions via LRU cap.
+        // An attached card deletes the CHILD session too — same close
+        // semantics as any Agent card; the parent's CheckAgent then reports
+        // the child gone, which the backend handles gracefully. ponytail: a
+        // detach-without-delete close is the upgrade.
         apiJson('/sessions/' + sessionId, { method: 'DELETE' }).catch(() => {});
       }
     });
 
-    // create the backend session up front so the card is ready to poll; a
-    // failure is fine — ensureSession() retries on the first send.
-    ensureSession().catch((err) => {
-      setNote(err && err.limit
-        ? 'Session limit reached — close an Agent card or wait for a turn to finish, then send.'
-        : 'Backend offline — the session will be created when you send.');
-    });
+    if (attached) {
+      // the child is usually mid-turn when revealed — poll right away so the
+      // existing transcript renders (renderedCount starts at 0) and the
+      // thinking state appears while the spawned task runs.
+      poll();
+    } else {
+      // create the backend session up front so the card is ready to poll; a
+      // failure is fine — ensureSession() retries on the first send.
+      ensureSession().catch((err) => {
+        setNote(err && err.limit
+          ? 'Session limit reached — close an Agent card or wait for a turn to finish, then send.'
+          : 'Backend offline — the session will be created when you send.');
+      });
+    }
 
-    ta.focus();
+    // an auto-revealed child must not yank focus from wherever the user is
+    // typing (the sweep spawns it in the background); fresh cards keep it
+    if (!attached) ta.focus();
     return handle.el; // spawnApp sees dataset.cardId and won't re-add the card
   }
 
@@ -386,8 +556,12 @@
     const btn = Array.from(document.querySelectorAll('.dock-btn'))
       .some((b) => (b.getAttribute('title') || '').toLowerCase() === 'agent');
     console.assert(btn, '[sessions] Agent dock button missing from index.html');
-    if (registered && btn) {
-      console.log('[sessions] self-check passed — agent app registered, dock wired.');
+    const sweepIdle = cardBySession.size === 0 && sweepTimer === null;
+    console.assert(sweepIdle,
+      '[sessions] child sweep must stay idle until a card owns a session');
+    if (registered && btn && sweepIdle) {
+      console.log('[sessions] self-check passed — agent app registered, '
+        + 'dock wired, child sweep idle.');
     }
   })();
 })();

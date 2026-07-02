@@ -395,10 +395,12 @@ def test_corrupt_transcript_never_500(monkeypatch, tmp_path, client):
 # --------------------------------------------------------------------------- #
 
 
-def test_config_shape_defaults(monkeypatch, client):
+def test_config_shape_defaults(monkeypatch, tmp_path, client):
     monkeypatch.delenv("ATELIER_TOKEN", raising=False)
     monkeypatch.delenv("ATELIER_MAX_TURNS", raising=False)
     monkeypatch.delenv("SWARM_JOBS_FILE", raising=False)
+    # missing settings file -> the subscription/no-key defaults
+    monkeypatch.setenv("ATELIER_SETTINGS_PATH", str(tmp_path / "settings.json"))
     body = client.get("/config").json()
     assert body == {
         "model": lite_server._resolved_model(),
@@ -407,6 +409,9 @@ def test_config_shape_defaults(monkeypatch, client):
         "jobs_file": "",
         "auth_mode": "origin-gate",
         "token_present": False,
+        "provider": "subscription",
+        "api_key_present": False,
+        "api_key_hint": "",
     }
 
 

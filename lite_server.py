@@ -41,6 +41,8 @@ from claude_agent_sdk import (
     ResultMessage,
     StreamEvent,
     TextBlock,
+    create_sdk_mcp_server,
+    tool,
 )
 
 # --- LIGHT tools (all verified to import under .venv-ext) ---
@@ -80,7 +82,9 @@ Your job is to help run a creative studio out of an Obsidian knowledge vault:
 - Capture and read structured Briefs (CaptureBrief, ReadBrief) so intent is written down before work starts.
 - Plan and track gated campaigns (StartCampaign, RecordDeliverable, CampaignStatus): decompose a goal into deliverables, and only treat a deliverable as publishable once it has a shippable verdict.
 
-Be concise. When you take an action with a tool, say plainly what you did and cite the note path, brief, or campaign id involved. Do not claim to have published or shipped anything that has not passed its gate."""
+Be concise. When you take an action with a tool, say plainly what you did and cite the note path, brief, or campaign id involved. Do not claim to have published or shipped anything that has not passed its gate.
+
+When SpawnAgent/CheckAgent are available you can delegate a subtask to a parallel sub-agent and collect its result later; sub-agents run as their own isolated sessions."""
 
 LIGHT_TOOLS = [
     VaultSearch,
@@ -105,7 +109,67 @@ def _resolved_model() -> str:
     return os.getenv("CLAUDE_CLI_MODEL") or "sonnet"
 
 
-def build_options(stream: bool = False) -> ClaudeAgentOptions:
+# --- Provider settings store (dual auth) ----------------------------------------
+#
+# One tiny JSON file holds the user's provider choice + optional API key:
+#   {"provider": "subscription"|"api", "anthropic_api_key": "<str>"}
+# Read at CALL time (no caching) so a settings change is picked up by the very
+# next build_options() without a restart. Every failure mode — missing file,
+# corrupt JSON, wrong types, unknown provider — degrades to the safe default
+# {"provider": "subscription"} with no key; loading NEVER raises.
+
+
+def _settings_path() -> Path:
+    return Path(
+        os.getenv("ATELIER_SETTINGS_PATH") or "~/.atelier/settings.json"
+    ).expanduser()
+
+
+def load_settings() -> dict:
+    """The persisted provider settings, degraded to a safe default on any failure."""
+    try:
+        data = json.loads(_settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"provider": "subscription"}
+    if not isinstance(data, dict):
+        return {"provider": "subscription"}
+    settings = {"provider": "subscription"}
+    if data.get("provider") in ("subscription", "api"):
+        settings["provider"] = data["provider"]
+    key = data.get("anthropic_api_key")
+    if isinstance(key, str) and key:
+        settings["anthropic_api_key"] = key
+    return settings
+
+
+def save_settings(d: dict) -> None:
+    """Atomic write (tmp + os.replace) with the final file chmod'd 0600.
+
+    The tmp file is CREATED 0600 (not chmod'd after the write) so the settings
+    file — which can hold a real API key — is never observable with looser
+    perms, not even between create and write.
+    """
+    path = _settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        os.fchmod(fd, 0o600)  # O_CREAT's mode is skipped on a leftover tmp
+        f.write(json.dumps(d, indent=2))
+    os.replace(tmp, path)
+
+
+def _effective_provider(settings: dict | None = None) -> str:
+    """'api' ONLY when chosen AND a key is stored; else 'subscription' (no dead state)."""
+    s = load_settings() if settings is None else settings
+    if s.get("provider") == "api" and s.get("anthropic_api_key"):
+        return "api"
+    return "subscription"
+
+
+def build_options(
+    stream: bool = False, spawner_session_id: str | None = None
+) -> ClaudeAgentOptions:
     """The single builder for BOTH the /chat client and every compat request.
 
     Resolves model + isolation env + the atelier MCP server + allowed_tools +
@@ -115,29 +179,60 @@ def build_options(stream: bool = False) -> ClaudeAgentOptions:
     ``stream=True`` enables include_partial_messages so /chat/stream can emit
     token deltas. Harmless for the non-streaming drain (it ignores StreamEvent).
 
+    ``spawner_session_id``: when set, this run belongs to a depth-0 agent-card
+    session and gains a per-call "orchestra" MCP server (SpawnAgent/CheckAgent
+    bound to that session id). The chat client, the compat route, and depth-1
+    sub-agent sessions all pass None, so sub-agents structurally cannot spawn
+    their own sub-agents.
+
     Isolation (unconditional for the app agent): a private CLAUDE_CONFIG_DIR
     (respect an existing override, else ~/.atelier/claude-home, created if
     missing), an empty CLAUDE_SECURESTORAGE_CONFIG_DIR (keeps Max OAuth on the
     default Keychain item), stripped inherited API keys, and setting_sources=[]
     (no CLAUDE.md / hooks / plugins / skills / auto-memory).
+
+    Provider (dual auth): with settings provider "api" AND a stored key, the
+    isolation env carries ANTHROPIC_API_KEY=<key> instead (auth token still
+    stripped) so the CLI bills the user's own API key; otherwise both are
+    stripped (empty-string overrides — see the comment at the strip site) and
+    the run stays on the Max OAuth login.
     """
     config_dir = os.environ.get(
         "CLAUDE_CONFIG_DIR", os.path.expanduser("~/.atelier/claude-home")
     )
     os.makedirs(config_dir, exist_ok=True)
 
+    settings = load_settings()
+
     env = {k: v for k, v in os.environ.items()}
-    # Strip any inherited API/auth keys so the run stays on the Max OAuth login.
-    env.pop("ANTHROPIC_API_KEY", None)
-    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    # Strip any inherited API/auth keys so the run stays on the Max OAuth
+    # login. These MUST be empty-string overrides, not pops: the SDK transport
+    # spawns the CLI with {**os.environ, **options.env}, so a key merely
+    # popped here resurrects from the inherited process env and silently
+    # bills the user's API key while the UI reports "subscription". The CLI
+    # treats an empty value as unset (verified live: a bogus inherited key
+    # hijacks auth with "Invalid API key"; "" falls back to the OAuth login).
+    env["ANTHROPIC_API_KEY"] = ""
+    env["ANTHROPIC_AUTH_TOKEN"] = ""
+    if _effective_provider(settings) == "api":
+        env["ANTHROPIC_API_KEY"] = settings["anthropic_api_key"]
     env["CLAUDE_CONFIG_DIR"] = config_dir
     env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = ""
+
+    mcp_servers = {"atelier": ATELIER_SERVER}
+    allowed_tools = list(ATELIER_ALLOWED_TOOLS)
+    if spawner_session_id is not None:
+        mcp_servers["orchestra"] = _build_orchestra_server(spawner_session_id)
+        allowed_tools += [
+            "mcp__orchestra__SpawnAgent",
+            "mcp__orchestra__CheckAgent",
+        ]
 
     return ClaudeAgentOptions(
         model=_resolved_model(),
         system_prompt=ATELIER_INSTRUCTIONS,
-        mcp_servers={"atelier": ATELIER_SERVER},
-        allowed_tools=ATELIER_ALLOWED_TOOLS,
+        mcp_servers=mcp_servers,
+        allowed_tools=allowed_tools,
         setting_sources=[],
         env=env,
         # Ceiling learned live: the weekly project-rollup job (VaultSearch +
@@ -295,10 +390,14 @@ class AgencyResponseRequest(BaseModel):
 
 @app.get("/health")
 async def health():
+    provider = _effective_provider()
     return {
         "ok": True,
         "model": _resolved_model(),
-        "subscription": True,
+        # Kept a bool for existing consumers; true exactly when the effective
+        # provider is the Max subscription.
+        "subscription": provider == "subscription",
+        "provider": provider,
     }
 
 
@@ -452,17 +551,26 @@ async def notifications(limit: int = 20):
 _CC_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
 
 
+def _api_key_hint(key: str) -> str:
+    """The only display form a stored key ever takes: '…' + its last 4 chars."""
+    return "…" + key[-4:] if key else ""
+
+
 @app.get("/config")
 async def config():
     """Effective backend configuration for the Settings view.
 
-    NEVER the token value — only whether one is set.
+    NEVER the token value — only whether one is set. Same rule for the API
+    key: presence + a last-4 hint only; the key itself never leaves the
+    settings file (not in responses, logs, or error strings).
     """
     token_present = bool(os.getenv("ATELIER_TOKEN", ""))
     try:
         max_turns = int(os.getenv("ATELIER_MAX_TURNS", "40"))
     except ValueError:
         max_turns = 40
+    settings = load_settings()
+    key = settings.get("anthropic_api_key") or ""
     return {
         "model": _resolved_model(),
         "max_turns": max_turns,
@@ -473,7 +581,110 @@ async def config():
         "jobs_file": os.getenv("SWARM_JOBS_FILE") or "",
         "auth_mode": "token" if token_present else "origin-gate",
         "token_present": token_present,
+        "provider": _effective_provider(settings),
+        "api_key_present": bool(key),
+        "api_key_hint": _api_key_hint(key),
     }
+
+
+class ProviderRequest(BaseModel):
+    provider: str
+
+
+class ApiKeyRequest(BaseModel):
+    api_key: str
+
+
+class ApiKeyValidateRequest(BaseModel):
+    api_key: str | None = None
+
+
+# Anthropic API keys are 'sk-ant-' + a base64url-ish tail; the length band is
+# deliberately loose (10..200) so future key formats keep working while junk
+# ("sk-ant-x", pasted prose) is still rejected before it can be persisted.
+_API_KEY_RE = re.compile(r"^sk-ant-[A-Za-z0-9_-]{10,200}$")
+
+
+@app.post("/config/provider")
+async def set_provider(req: ProviderRequest):
+    """Persist the provider choice. POST -> token-gated by the middleware.
+
+    _reset_chat_client() drops the long-lived chat client so the NEXT chat
+    turn rebuilds on the new provider; existing agent-session clients keep
+    their transport until they naturally rebuild (error teardown or delete).
+    """
+    if req.provider not in ("subscription", "api"):
+        return JSONResponse(
+            {"error": 'provider must be "subscription" or "api"'}, status_code=400
+        )
+    settings = load_settings()
+    if req.provider == "api" and not settings.get("anthropic_api_key"):
+        return JSONResponse({"error": "no API key saved"}, status_code=400)
+    settings["provider"] = req.provider
+    save_settings(settings)
+    await _reset_chat_client()
+    return {"ok": True, "provider": _effective_provider(settings)}
+
+
+@app.post("/config/api-key")
+async def set_api_key(req: ApiKeyRequest):
+    """Store a (shape-validated) API key. Provider choice is left untouched."""
+    key = req.api_key.strip()
+    if not _API_KEY_RE.match(key):
+        return JSONResponse(
+            {"error": "that does not look like an Anthropic API key"},
+            status_code=400,
+        )
+    settings = load_settings()
+    settings["anthropic_api_key"] = key
+    save_settings(settings)
+    return {
+        "ok": True,
+        "api_key_present": True,
+        "api_key_hint": _api_key_hint(key),
+    }
+
+
+@app.delete("/config/api-key")
+async def delete_api_key():
+    """Remove the stored key; provider "api" flips to "subscription" (no dead state)."""
+    settings = load_settings()
+    settings.pop("anthropic_api_key", None)
+    settings["provider"] = "subscription"
+    save_settings(settings)
+    await _reset_chat_client()
+    return {"ok": True, "provider": "subscription", "api_key_present": False}
+
+
+@app.post("/config/api-key/validate")
+async def validate_api_key(req: ApiKeyValidateRequest | None = None):
+    """Live-check a key (supplied, else stored) against the Anthropic API.
+
+    Never 500 and never echoes the key: every outcome is a fixed
+    {"valid", "detail"} shape with the key appearing only in the outbound
+    x-api-key header.
+    """
+    supplied = (req.api_key if req else None) or ""
+    key = supplied.strip() or (load_settings().get("anthropic_api_key") or "")
+    if not key:
+        return {"valid": False, "detail": "no key to validate"}
+    # Imported here so the module never pays for (or hard-requires) httpx on
+    # the paths that never validate a key.
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as hc:
+            resp = await hc.get(
+                "https://api.anthropic.com/v1/models",
+                headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+            )
+    except Exception:  # noqa: BLE001 - DNS/refused/timeout all mean "unreachable"
+        return {"valid": False, "detail": "could not reach api.anthropic.com"}
+    if resp.status_code == 200:
+        return {"valid": True, "detail": "key accepted"}
+    if resp.status_code in (401, 403):
+        return {"valid": False, "detail": "key rejected by Anthropic"}
+    return {"valid": False, "detail": f"unexpected response {resp.status_code}"}
 
 
 @app.get("/cc/status")
@@ -658,8 +869,8 @@ async def get_response_compat(req: AgencyResponseRequest):
 #
 # Shape (fixed contract with app/sessions.js + tests):
 #   POST   /sessions                {"name"?}    -> {"id","name"}
-#   GET    /sessions                             -> {"sessions":[{id,name,status,messages_len}]}
-#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}]}
+#   GET    /sessions                             -> {"sessions":[{id,name,status,messages_len,parent_id,depth}]}
+#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}],parent_id,depth}
 #   POST   /sessions/{id}/message   {"message"}  -> 202 {"status":"running"} (fire-and-poll)
 #   DELETE /sessions/{id}                        -> {"ok":true}
 #   unknown id -> 404 {"error":"unknown session"}; a turn error sets
@@ -669,11 +880,24 @@ async def get_response_compat(req: AgencyResponseRequest):
 
 
 class _AgentSession:
-    """One card-scoped conversation: lazy client + status + message ledger."""
+    """One card-scoped conversation: lazy client + status + message ledger.
 
-    def __init__(self, session_id: str, name: str):
+    ``parent_id``/``depth`` mark sub-agent sessions: a card session is depth 0
+    with no parent; a session spawned by SpawnAgent is depth 1 with parent_id
+    pointing at its spawner. Depth never exceeds 1 (see _run_session_turn).
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        name: str,
+        parent_id: str | None = None,
+        depth: int = 0,
+    ):
         self.id = session_id
         self.name = name
+        self.parent_id = parent_id
+        self.depth = depth
         self.client: ClaudeSDKClient | None = None  # lazy: built on first message
         self.lock = asyncio.Lock()
         self.status = "idle"  # "idle" | "running" | "error"
@@ -689,11 +913,15 @@ _session_tasks: set = set()
 
 
 def _max_sessions() -> int:
-    """The session cap, read from env at call time so tests can tune it."""
+    """The session cap, read from env at call time so tests can tune it.
+
+    12 (was 6): each depth-0 card can hold up to 4 live sub-agents, so the
+    old cap would starve spawning with just two busy cards.
+    """
     try:
-        return max(1, int(os.getenv("ATELIER_MAX_SESSIONS", "6")))
+        return max(1, int(os.getenv("ATELIER_MAX_SESSIONS", "12")))
     except ValueError:
-        return 6
+        return 12
 
 
 def _touch_session(sess: _AgentSession) -> None:
@@ -730,11 +958,38 @@ async def _close_session_client(sess: _AgentSession) -> None:
             pass
 
 
+async def _make_room() -> bool:
+    """Evict idle/error LRU sessions until the cap has room; False = all running.
+
+    Shared by create_session (a new card) and SpawnAgent (a new sub-agent):
+    evictable = any session NOT mid-turn ("idle" or "error" — an errored card
+    is just as reclaimable).
+    """
+    while len(_sessions) >= _max_sessions():
+        evictable = [s for s in _sessions.values() if s.status != "running"]
+        if not evictable:
+            return False
+        victim = min(evictable, key=lambda s: s.last_used)
+        _sessions.pop(victim.id, None)
+        await _close_session_client(victim)
+    return True
+
+
 async def _spawn_session_turn(coro) -> None:
     """Fire-and-forget one turn. Tests monkeypatch this to await inline."""
     task = asyncio.create_task(coro)
     _session_tasks.add(task)
     task.add_done_callback(_session_tasks.discard)
+
+
+async def _start_turn(sess: _AgentSession, message: str) -> None:
+    """Kick off one fire-and-poll turn (shared by session_message + SpawnAgent):
+    append the user message, mark running, touch the LRU clock, spawn the task.
+    Callers gate on status/ledger BEFORE calling this."""
+    _append_session_message(sess, "user", message)
+    sess.status = "running"
+    _touch_session(sess)
+    await _spawn_session_turn(_run_session_turn(sess, message))
 
 
 async def _run_session_turn(sess: _AgentSession, message: str) -> None:
@@ -757,7 +1012,14 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
             return
         try:
             if sess.client is None:
-                client = ClaudeSDKClient(options=build_options())
+                # ONLY depth-0 (card-level) sessions get the orchestra tools;
+                # a depth-1 sub-agent gets none, so the depth cap is structural
+                # rather than an instruction the model could talk itself past.
+                client = ClaudeSDKClient(
+                    options=build_options(
+                        spawner_session_id=sess.id if sess.depth == 0 else None
+                    )
+                )
                 await client.connect()
                 sess.client = client
             await sess.client.query(message)
@@ -794,15 +1056,9 @@ class SessionMessageRequest(BaseModel):
 
 @app.post("/sessions")
 async def create_session(req: SessionCreateRequest | None = None):
-    # Cap with LRU eviction: evictable = any session NOT mid-turn ("idle" or
-    # "error" — an errored card is just as reclaimable). All running -> 409.
-    while len(_sessions) >= _max_sessions():
-        evictable = [s for s in _sessions.values() if s.status != "running"]
-        if not evictable:
-            return JSONResponse({"error": "session limit"}, status_code=409)
-        victim = min(evictable, key=lambda s: s.last_used)
-        _sessions.pop(victim.id, None)
-        await _close_session_client(victim)
+    # Cap with LRU eviction (see _make_room). All running -> 409.
+    if not await _make_room():
+        return JSONResponse({"error": "session limit"}, status_code=409)
 
     name = ((req.name if req else None) or "").strip() or f"Agent {next(_session_seq)}"
     sess = _AgentSession(uuid.uuid4().hex, name)
@@ -819,6 +1075,8 @@ async def list_sessions():
                 "name": s.name,
                 "status": s.status,
                 "messages_len": len(s.messages),
+                "parent_id": s.parent_id,
+                "depth": s.depth,
             }
             for s in _sessions.values()
         ]
@@ -835,6 +1093,8 @@ async def get_session(session_id: str):
         "name": sess.name,
         "status": sess.status,
         "messages": list(sess.messages),
+        "parent_id": sess.parent_id,
+        "depth": sess.depth,
     }
 
 
@@ -848,10 +1108,7 @@ async def session_message(session_id: str, req: SessionMessageRequest):
     # +1 leaves room for the assistant reply this turn will append.
     if len(sess.messages) + 1 >= _MAX_SESSION_MESSAGES:
         return JSONResponse({"error": "session ledger full"}, status_code=413)
-    _append_session_message(sess, "user", req.message)
-    sess.status = "running"
-    _touch_session(sess)
-    await _spawn_session_turn(_run_session_turn(sess, req.message))
+    await _start_turn(sess, req.message)
     return JSONResponse({"status": "running"}, status_code=202)
 
 
@@ -867,6 +1124,140 @@ async def delete_session(session_id: str):
     # disconnect drops its client in its finally block.
     await _close_session_client(sess)
     return {"ok": True}
+
+
+# --- Sub-agent orchestration (the "orchestra" MCP server) -----------------------
+#
+# Each depth-0 session's client gets its OWN in-process orchestra server whose
+# two tools close over that session's id (see build_options). A spawned child
+# is just another _AgentSession — same isolation, same /sessions surface, so
+# the desktop app can reveal it as a card — with parent_id/depth marking the
+# relationship. Tool results are plain text: the model reads them, and the
+# text convention mirrors shared_tools/sdk_tools.py's wrap_tool.
+
+_subagent_seq = itertools.count(1)  # 'Sub-agent N' default names
+_MAX_CHILDREN = 4  # live children per parent; keeps one card from eating the cap
+
+
+def _tool_text(text: str) -> dict:
+    return {"content": [{"type": "text", "text": text}]}
+
+
+def _orchestra_tools(parent_id: str) -> list:
+    """The SpawnAgent/CheckAgent SdkMcpTools, closed over the spawner's id.
+
+    Factored from _build_orchestra_server so tests can invoke the handlers
+    directly (the SDK server config does not expose them back).
+    """
+
+    @tool(
+        "SpawnAgent",
+        "Spawn a parallel sub-agent session to delegate a subtask. The"
+        " sub-agent starts working on the task immediately in its own isolated"
+        " session; use CheckAgent with the returned id to collect its result.",
+        {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The subtask for the sub-agent to work on,"
+                    " written as a complete standalone instruction.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Optional short display name for the"
+                    " sub-agent.",
+                },
+            },
+            "required": ["task"],
+        },
+    )
+    async def _spawn_agent(args):
+        if parent_id not in _sessions:
+            # The spawner was deleted/evicted mid-turn; its child would be
+            # orphaned before it started.
+            return _tool_text("Your session is gone; cannot spawn.")
+        children = [
+            s for s in _sessions.values() if s.parent_id == parent_id
+        ]
+        if len(children) >= _MAX_CHILDREN:
+            return _tool_text(
+                f"Child limit ({_MAX_CHILDREN}) reached — use CheckAgent on"
+                " your existing sub-agents instead."
+            )
+        # The parent is mid-turn ("running"), so _make_room can never evict it.
+        if not await _make_room():
+            return _tool_text(
+                "Session limit reached — no room for a sub-agent right now."
+            )
+        # Re-check after _make_room: it can suspend awaiting a victim's
+        # disconnect, and a DELETE of the parent landing in that window would
+        # otherwise register an orphan child (no card, no reachable
+        # CheckAgent) that burns a full turn before LRU eviction finds it.
+        if parent_id not in _sessions:
+            return _tool_text("Your session is gone; cannot spawn.")
+        name = (args.get("name") or "").strip() or f"Sub-agent {next(_subagent_seq)}"
+        child = _AgentSession(
+            uuid.uuid4().hex, name, parent_id=parent_id, depth=1
+        )
+        _sessions[child.id] = child
+        await _start_turn(child, args["task"])
+        return _tool_text(
+            f'Spawned sub-agent "{child.name}" (id: {child.id}). It is working'
+            " now; call CheckAgent with this id to collect its result."
+        )
+
+    @tool(
+        "CheckAgent",
+        "Check a sub-agent's status and result. Pass the id returned by"
+        " SpawnAgent; when the sub-agent has finished, its last reply is"
+        " returned.",
+        {
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "The sub-agent session id from SpawnAgent.",
+                },
+            },
+            "required": ["agent_id"],
+        },
+    )
+    async def _check_agent(args):
+        child = _sessions.get(args.get("agent_id") or "")
+        # A live session that is NOT this parent's child (another card, or a
+        # sibling parent's sub-agent) is treated as unknown: one card's model
+        # must never read another conversation through this tool.
+        if child is None or child.parent_id != parent_id:
+            return _tool_text("No such sub-agent session.")
+        if child.status == "running":
+            return _tool_text(
+                f'Sub-agent "{child.name}" ({child.id}) is still working'
+                f" ({len(child.messages)} messages so far)."
+            )
+        last_reply = next(
+            (
+                m["text"]
+                for m in reversed(child.messages)
+                if m["role"] == "assistant"
+            ),
+            "(no reply)",
+        )
+        finished = (
+            "finished with an error" if child.status == "error" else "finished"
+        )
+        return _tool_text(
+            f'Sub-agent "{child.name}" {finished}. Last reply: {last_reply}'
+        )
+
+    return [_spawn_agent, _check_agent]
+
+
+def _build_orchestra_server(parent_id: str):
+    """One per-call orchestra server bound to the spawning session's id."""
+    return create_sdk_mcp_server(
+        name="orchestra", version="1.0.0", tools=_orchestra_tools(parent_id)
+    )
 
 
 if __name__ == "__main__":

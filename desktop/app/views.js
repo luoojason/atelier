@@ -72,12 +72,24 @@
    7. u() (the returned unregister) → the Demo row disappears; with 'demo.sub'
       also unregistered the whole Analytics group vanishes (never empty).
    8. Click the footer "Settings" row → the Settings view opens: warm-cream
-      cards for Backend configuration (Model / Max turns / Scheduler /
-      Jobs file / Auth mode from GET /config — all "unavailable" if the
-      backend is down), Appearance (theme/accent/grid from customization),
-      Connection (live backend status — stop lite_server and within ~4s it
+      cards for Model provider (segmented "Claude Max subscription" /
+      "Anthropic API key" control + API key save/validate/remove — controls
+      disabled and "unavailable" shown if the backend is down), Backend
+      configuration (Model / Max turns / Scheduler / Jobs file / Auth mode
+      from GET /config — all "unavailable" if the backend is down),
+      Appearance (theme/accent/grid from customization), Connection (live
+      backend status "online — on subscription" / "online — on API key"
+      tracking the effective provider — stop lite_server and within ~4s it
       flips to "offline"), Security (token presence text only, NEVER the
       value). Header has ↻ (re-fetches /config) and ×.
+   9. Model provider card: with no key saved, clicking "Anthropic API key"
+      surfaces the backend's 400 error text inline ("no API key saved").
+      Paste a key and Save → the input clears and a "Saved key: …last4"
+      line appears with a Remove button (the full key is never rendered).
+      Validate → "✓ key accepted" or "✗ <detail>" inline. Remove → the hint
+      line disappears and the provider flips back to subscription. Every
+      button disables while its request is in flight, and stays disabled
+      even if the header ↻ lands a /config response mid-flight.
    =========================================================================== */
 
 (function () {
@@ -129,6 +141,29 @@
       .vw-kv .k { color: var(--ink-mid); flex: 0 0 auto; }
       .vw-kv .v { color: var(--ink); font-weight: 600; text-align: right;
         overflow-wrap: anywhere; min-width: 0; }
+      /* Model provider card — interactive rows (settings view, dual auth) */
+      .vw-kv.vw-ctl { align-items: center; }
+      .vw-seg { display: inline-flex; border: 1px solid var(--border);
+        border-radius: 9px; overflow: hidden; }
+      .vw-seg button { border: none; background: var(--panel); color: var(--ink-mid);
+        font: inherit; font-size: 12.5px; padding: 6px 12px; cursor: pointer; }
+      .vw-seg button + button { border-left: 1px solid var(--border); }
+      .vw-seg button.active { background: var(--active); color: var(--ink); font-weight: 600; }
+      .vw-seg button:disabled { opacity: .5; cursor: default; }
+      .vw-key-ctl { display: flex; align-items: center; gap: 8px; flex: 1;
+        justify-content: flex-end; min-width: 0; }
+      .vw-key-input { flex: 1; min-width: 0; max-width: 260px; border: 1px solid var(--border);
+        border-radius: 8px; padding: 6px 9px; font: inherit; font-size: 12.5px;
+        background: var(--panel); color: var(--ink); }
+      .vw-key-input:disabled { opacity: .5; }
+      .vw-btn { border: 1px solid var(--border); background: var(--panel);
+        color: var(--ink-mid); border-radius: 8px; padding: 6px 10px; cursor: pointer;
+        font: inherit; font-size: 12.5px; }
+      .vw-btn:hover:not(:disabled) { background: var(--active); color: var(--ink); }
+      .vw-btn:disabled { opacity: .5; cursor: default; }
+      .vw-note { font-size: 12.5px; color: var(--ink-mid); padding: 6px 0 2px; }
+      .vw-note.ok { color: var(--ok); }
+      .vw-note.err { color: var(--accent); }
     `;
     const style = document.createElement('style');
     style.id = 'atelier-views-styles';
@@ -408,8 +443,10 @@
 /* ===========================================================================
    Settings view — the first consumer of Atelier.views (section 'foot').
    Reads GET /config (never the token value), the customization theme state,
-   and the live backend status off the bus. Registered from its own IIFE so
-   it exercises exactly the surface analytics.js will.
+   and the live backend status off the bus, and drives the dual-auth provider
+   routes (POST /config/provider, POST/DELETE /config/api-key, validate — all
+   token-gated). Registered from its own IIFE so it exercises exactly the
+   surface analytics.js will.
    =========================================================================== */
 (function () {
   const A = window.Atelier;
@@ -418,8 +455,21 @@
     return;
   }
 
-  const CONFIG_URL = 'http://127.0.0.1:8765/config';
+  const BASE = 'http://127.0.0.1:8765';
+  const CONFIG_URL = BASE + '/config';
   let refreshHook = null;    // set by the live mount; onRefresh calls through it
+
+  // Fetch JSON against the backend; resolves {ok, status, data}, throws only
+  // on network failure. Mutating routes need the shared-secret header when
+  // main.js minted one (window.atelier.token via preload) — sessions.js idiom.
+  async function api(path, opts) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (window.atelier && window.atelier.token) headers['X-Atelier-Token'] = window.atelier.token;
+    const res = await fetch(BASE + path, Object.assign({ headers }, opts || {}));
+    let data = null;
+    try { data = await res.json(); } catch { /* empty/non-JSON body */ }
+    return { ok: res.ok, status: res.status, data };
+  }
 
   function mountSettings(container) {
     let disposed = false;
@@ -450,7 +500,200 @@
       return c;
     }
 
+    // ── Model provider card (dual auth) ────────────────────────────────────
+    // Interactive, so built bespoke — card() above only does static rows.
+    // provider / api_key_present / api_key_hint arrive on the same GET
+    // /config the read-only card uses; loadConfig below feeds both. The key
+    // VALUE never enters the DOM — only the server's …last4 hint.
+    function btn(label, cls) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      if (cls) b.className = cls;
+      b.textContent = label;
+      return b;
+    }
+    function noteLine() {
+      const n = document.createElement('div');
+      n.className = 'vw-note';
+      n.style.display = 'none';
+      return n;
+    }
+    function setNote(el, text, kind) {       // kind: 'ok' | 'err' | undefined
+      el.textContent = text || '';
+      el.className = 'vw-note' + (kind ? ' ' + kind : '');
+      el.style.display = text ? '' : 'none';
+    }
+
+    const provCard = document.createElement('div');
+    provCard.className = 'vw-card';
+    const provTitle = document.createElement('div');
+    provTitle.className = 'vw-card-title';
+    provTitle.textContent = 'Model provider';
+
+    const provRow = document.createElement('div');
+    provRow.className = 'vw-kv vw-ctl';
+    const provLabel = document.createElement('span');
+    provLabel.className = 'k';
+    provLabel.textContent = 'Provider';
+    const seg = document.createElement('div');
+    seg.className = 'vw-seg';
+    const segSub = btn('Claude Max subscription');
+    const segApi = btn('Anthropic API key');
+    seg.append(segSub, segApi);
+    provRow.append(provLabel, seg);
+    const provNote = noteLine();
+
+    const keyRow = document.createElement('div');
+    keyRow.className = 'vw-kv vw-ctl';
+    const keyLabel = document.createElement('span');
+    keyLabel.className = 'k';
+    keyLabel.textContent = 'API key';
+    const keyCtl = document.createElement('span');
+    keyCtl.className = 'vw-key-ctl';
+    const keyInput = document.createElement('input');
+    keyInput.type = 'password';
+    keyInput.className = 'vw-key-input';
+    keyInput.placeholder = 'sk-ant-…';
+    keyInput.autocomplete = 'off';
+    const saveBtn = btn('Save', 'vw-btn');
+    const validateBtn = btn('Validate', 'vw-btn');
+    keyCtl.append(keyInput, saveBtn, validateBtn);
+    keyRow.append(keyLabel, keyCtl);
+
+    const hintRow = document.createElement('div');
+    hintRow.className = 'vw-kv vw-ctl';
+    hintRow.style.display = 'none';          // shown only while a key is stored
+    const hintText = document.createElement('span');
+    hintText.className = 'k';
+    const removeBtn = btn('Remove', 'vw-btn');
+    hintRow.append(hintText, removeBtn);
+    const keyNote = noteLine();
+
+    provCard.append(provTitle, provRow, provNote, keyRow, hintRow, keyNote);
+
+    const provControls = [segSub, segApi, keyInput, saveBtn, validateBtn, removeBtn];
+    function setProvEnabled(on) {
+      provControls.forEach((el) => { el.disabled = !on; });
+    }
+    setProvEnabled(false);                   // until the first /config lands
+
+    let provReachable = false;               // last GET /config outcome
+    let provBusy = false;                    // a provider POST/DELETE in flight
+    function applyProviderCfg(cfg) {
+      provReachable = true;
+      const p = cfg.provider === 'api' ? 'api' : 'subscription';
+      segSub.classList.toggle('active', p === 'subscription');
+      segApi.classList.toggle('active', p === 'api');
+      setProvider(p);                        // Connection card status text
+      const present = !!cfg.api_key_present;
+      hintText.textContent = present ? 'Saved key: ' + String(cfg.api_key_hint || '') : '';
+      hintRow.style.display = present ? '' : 'none';
+      // clear only the degrade text — action errors stay visible until acted on
+      if (provNote.textContent === 'unavailable') setNote(provNote, '');
+      // the header ↻ can land a /config response while a provider request is
+      // in flight — re-enabling under it would allow a concurrent second POST
+      if (!provBusy) setProvEnabled(true);
+    }
+    function degradeProviderCard() {
+      provReachable = false;
+      setProvEnabled(false);
+      segSub.classList.remove('active');
+      segApi.classList.remove('active');
+      hintRow.style.display = 'none';
+      setNote(provNote, 'unavailable');
+      setNote(keyNote, '');
+    }
+
+    // One in-flight provider request at a time: the whole cluster disables,
+    // then re-enables from the last-known reachability when it settles (a
+    // loadConfig kicked off inside re-affirms right after). provBusy keeps
+    // applyProviderCfg from re-enabling mid-flight (see above).
+    async function provAction(fn) {
+      provBusy = true;
+      setProvEnabled(false);
+      try { await fn(); }
+      finally {
+        provBusy = false;
+        if (!disposed) setProvEnabled(provReachable);
+      }
+    }
+
+    function pickProvider(p) {
+      // skip the no-op click: re-POSTing the active provider would only cost
+      // the server a pointless chat-client reset
+      if ((p === 'api' ? segApi : segSub).classList.contains('active')) return;
+      provAction(async () => {
+        setNote(provNote, '');
+        try {
+          const r = await api('/config/provider', {
+            method: 'POST', body: JSON.stringify({ provider: p }),
+          });
+          if (disposed) return;
+          if (r.ok) loadConfig();            // reflect the effective provider
+          else setNote(provNote, (r.data && r.data.error) ||
+            ('provider switch failed (HTTP ' + r.status + ')'), 'err');
+        } catch {
+          if (!disposed) setNote(provNote, 'backend unreachable', 'err');
+        }
+      });
+    }
+    segSub.addEventListener('click', () => pickProvider('subscription'));
+    segApi.addEventListener('click', () => pickProvider('api'));
+
+    saveBtn.addEventListener('click', () => provAction(async () => {
+      setNote(keyNote, '');
+      const v = keyInput.value.trim();
+      if (!v) { setNote(keyNote, 'enter a key first', 'err'); return; }
+      try {
+        const r = await api('/config/api-key', {
+          method: 'POST', body: JSON.stringify({ api_key: v }),
+        });
+        if (disposed) return;
+        if (r.ok) {
+          keyInput.value = '';
+          setNote(keyNote, 'key saved', 'ok');
+          loadConfig();                      // refresh the Saved key hint row
+        } else {
+          setNote(keyNote, (r.data && r.data.error) ||
+            ('save failed (HTTP ' + r.status + ')'), 'err');
+        }
+      } catch {
+        if (!disposed) setNote(keyNote, 'backend unreachable', 'err');
+      }
+    }));
+
+    removeBtn.addEventListener('click', () => provAction(async () => {
+      setNote(keyNote, '');
+      try {
+        const r = await api('/config/api-key', { method: 'DELETE' });
+        if (disposed) return;
+        if (r.ok) { setNote(keyNote, 'key removed', 'ok'); loadConfig(); }
+        else setNote(keyNote, (r.data && r.data.error) ||
+          ('remove failed (HTTP ' + r.status + ')'), 'err');
+      } catch {
+        if (!disposed) setNote(keyNote, 'backend unreachable', 'err');
+      }
+    }));
+
+    validateBtn.addEventListener('click', () => provAction(async () => {
+      setNote(keyNote, 'validating…');
+      const v = keyInput.value.trim();
+      try {
+        // empty JSON body means "validate the stored key" server-side
+        const r = await api('/config/api-key/validate', {
+          method: 'POST', body: JSON.stringify(v ? { api_key: v } : {}),
+        });
+        if (disposed) return;
+        const d = r.data || {};
+        if (d.valid === true) setNote(keyNote, '✓ key accepted', 'ok');
+        else setNote(keyNote, '✗ ' + String(d.detail || 'validation failed'), 'err');
+      } catch {
+        if (!disposed) setNote(keyNote, 'backend unreachable', 'err');
+      }
+    }));
+
     wrap.append(
+      provCard,
       card('Backend configuration', [
         ['Model', 'model', 'loading…'],
         ['Max turns', 'max_turns', 'loading…'],
@@ -495,17 +738,33 @@
 
     // Backend status — live off the bus (core polls /health every 4s), seeded
     // with one direct health() call so the row is right before the next poll.
+    // The "on …" suffix tracks the EFFECTIVE provider (/health and /config
+    // both carry it); the bus event only says {ok}, so the last-seen provider
+    // fills in and applyProviderCfg re-renders on a switch.
+    let statusProvider = 'subscription';
+    let statusOk = null;
     function setStatus(ok) {
+      statusOk = ok;
       val.status.textContent =
-        ok === true ? 'online — on subscription'
+        ok === true
+          ? 'online — on ' + (statusProvider === 'api' ? 'API key' : 'subscription')
           : ok === false ? 'offline'
             : 'connecting…';
+    }
+    function setProvider(p) {
+      if (p !== 'api' && p !== 'subscription') return;
+      statusProvider = p;
+      setStatus(statusOk);
     }
     const unsub = A.bus.on('backend:status', (d) => {
       if (!disposed) setStatus(d ? d.ok : null);
     });
     A.backend.health()
-      .then((h) => { if (!disposed) setStatus(!!(h && (h.ok === true || h.status === 'ok'))); })
+      .then((h) => {
+        if (disposed) return;
+        if (h) setProvider(h.provider);
+        setStatus(!!(h && (h.ok === true || h.status === 'ok')));
+      })
       .catch(() => { if (!disposed) setStatus(false); });
 
     // /config — read-only GET; every failure path degrades to 'unavailable'.
@@ -529,11 +788,13 @@
           val.token.textContent = cfg.token_present
             ? 'minted — mutating routes protected'
             : 'not enforced (dev)';
+          applyProviderCfg(cfg);
         })
         .catch(() => {
           if (disposed) return;
           ['model', 'max_turns', 'scheduler', 'jobs_file', 'auth_mode', 'token']
             .forEach((k) => { val[k].textContent = 'unavailable'; });
+          degradeProviderCard();
         });
     }
     loadConfig();

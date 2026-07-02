@@ -137,6 +137,9 @@
     <!-- boards.js loads last: it snapshot-swaps the other modules' state. A
          missing file 404s harmlessly under defer and must not break boot. -->
     <script defer src="app/boards.js"></script>
+    <!-- arrows.js before sessions.js: sessions auto-reveal links sub-agent
+         cards through Atelier.arrows (guarded, so a 404 here stays harmless). -->
+    <script defer src="app/arrows.js"></script>
     <script defer src="app/sessions.js"></script>
     <!-- Analytics stack: vendored Chart.js, then the views overlay system,
          then the analytics views. Any of these missing at boot 404s
