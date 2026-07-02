@@ -92,7 +92,13 @@ body {
 
 /* ── Canvas ──────────────────────────────────────────── */
 .canvas {
-  position: relative; flex: 1; overflow: hidden;
+  /* overflow: clip (not hidden): #content overflows the canvas box, so
+     `hidden` creates a scroll container that scrollIntoView / input-focus can
+     scroll — dragging the bottom-anchored dock, minimap and zoombar up with
+     it (they are absolute children of .canvas). `clip` clips identically but
+     is never scrollable, so those overlays stay pinned. Panning is a #content
+     transform, not canvas scroll, so nothing here depends on scrollability. */
+  position: relative; flex: 1; overflow: clip;
   background-color: var(--canvas);
   background-image: radial-gradient(var(--dot) 1.4px, transparent 1.4px);
   background-size: 22px 22px;
