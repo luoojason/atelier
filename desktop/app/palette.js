@@ -28,6 +28,9 @@
    6. Run "Toggle grid" — the dotted grid disappears / reappears. Run
       "Theme: Slate" then "Theme: Cream (default)" — palette + canvas retint and
       restore. DevTools console shows "[palette] ready — self-check passed."
+   7. DevTools console: `window.Atelier.palette.open()` — the palette overlay
+      opens, input focused. `window.Atelier.palette.close()` — it closes.
+   8. `typeof window.Atelier.palette.toggle` is "function".
    =========================================================================== */
 
 (function () {
@@ -366,6 +369,12 @@
 
   function toggle() { isOpen ? close() : open(); }
 
+  // ── public surface: let other modules (e.g. the ▦ Apps dock button in
+  //    apps.js) open the palette without re-implementing the ⌘K wiring.
+  //    apps.js loads BEFORE this file, so it reads A.palette lazily at click
+  //    time and guards it — a 404 of this module simply leaves ▦ Apps inert.
+  A.palette = { open, close, toggle };
+
   // ── ⌘K / Ctrl+K global shortcut ───────────────────────────────────────────
   window.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
@@ -399,9 +408,14 @@
     const hasNote = cmds.some((c) => /note/i.test(c.label) && c.section === 'Create');
     const hasWidget = cmds.some((c) => c.id === 'widget.pick');
     const hasThemeEvt = typeof A.bus.emit === 'function';
-    const ok = hasNote && hasWidget && hasThemeEvt && THEMES.length >= 1;
+    const apiOk = !!A.palette
+      && typeof A.palette.open === 'function'
+      && typeof A.palette.close === 'function'
+      && typeof A.palette.toggle === 'function';
+    const ok = hasNote && hasWidget && hasThemeEvt && apiOk && THEMES.length >= 1;
     console.assert(hasNote, '[palette] expected an "Add app: Note" command');
     console.assert(hasWidget, '[palette] expected an "Add widget…" command');
+    console.assert(apiOk, '[palette] window.Atelier.palette API incomplete:', A.palette);
     if (ok) console.log('[palette] ready — self-check passed (' + cmds.length + ' commands, ⌘K to open).');
     A.bus.emit('palette:ready', { count: cmds.length });
   })();
