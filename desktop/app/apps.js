@@ -824,6 +824,9 @@
       }
       return { url: currentUrl(), title };
     };
+    // r16 (agent-driven linked browser): navigate THIS card's ACTIVE tab
+    // through the exact normalize/load path the URL bar submit uses above.
+    cardApi.navigate = (u) => { loadInTab(activeTab(), normalizeUrl(u)); };
 
     // ── boot tabs (legacy configs carry a single `url`) ─────────────────────
     // Scheme allowlist, not just "non-empty string": boards.js import writes
@@ -1132,7 +1135,22 @@
     }
     return null;
   }
-  window.AtelierApps = { browserInfo };
+  // browserNavigate(cardEl, url) -> boolean (r16): navigate a LIVE browser
+  // card's ACTIVE tab. Only http(s) URLs are accepted; a non-browser card,
+  // a removed card, or any other scheme is refused with false. Delegates to
+  // the card's own navigate closure — the same normalize/load path as its
+  // URL bar — so title sync, loading state, and persistence all apply.
+  function browserNavigate(cardEl, url) {
+    if (!cardEl || typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false;
+    for (const c of browserCards) {
+      if (c.el === cardEl && typeof c.navigate === 'function') {
+        c.navigate(url);
+        return true;
+      }
+    }
+    return false;
+  }
+  window.AtelierApps = { browserInfo, browserNavigate };
 
   // ── self-check ────────────────────────────────────────────────────────────
   (function selfCheck() {

@@ -78,7 +78,8 @@
       configuration (Model segmented picker + Max turns / Scheduler /
       Jobs file / Auth mode from GET /config — rows "unavailable" and the
       picker disabled if the backend is down),
-      Appearance (theme/accent/grid from customization), Connection (live
+      Appearance (theme/accent/grid from customization, plus a "Tour" row
+      with a Restart tour button), Connection (live
       backend status "online — on subscription" / "online — on API key"
       tracking the effective provider — stop lite_server and within ~4s it
       flips to "offline"), Security (token presence text only, NEVER the
@@ -105,6 +106,12 @@
       the env and the fourth segment disappears on the next /config load.
       Like the provider card, a header ↻ /config response landing mid-POST
       must not re-enable the segments.
+   11. Appearance card "Tour" row: click "Restart tour" → the Settings view
+      closes FIRST (its mount cleanup runs and 'view.current' clears, same
+      close discipline as step 4 — the overlay would otherwise cover the
+      tour's anchors) and the spotlight tour starts over the live canvas.
+      With tour.js absent (window.Atelier.tour undefined) the click is a
+      guarded no-op: the view stays open, no error thrown.
    =========================================================================== */
 
 (function () {
@@ -815,14 +822,38 @@
       modelBtns[m].addEventListener('click', () => pickModel(m));
     });
 
+    // ── Appearance card + Tour row (r16) ────────────────────────────────────
+    // A 'Tour' row whose value is a Restart-tour button. Clicking it closes
+    // the Settings view FIRST — the overlay covers the canvas, dock and
+    // zoombar, i.e. the tour's anchors — then starts the tour. Guarded:
+    // tour.js may not be loaded, in which case the click is a no-op and the
+    // view stays open. Cleanup discipline: the listener lives on a button
+    // inside this mount's DOM, so close()'s teardown discards it — nothing
+    // to add to the cleanup fn (no timers, no bus subscriptions).
+    const appearCard = card('Appearance', [
+      ['Theme', 'theme', '—'],
+      ['Accent', 'accent', '—'],
+      ['Dotted grid', 'grid', '—'],
+    ]);
+    const tourRow = document.createElement('div');
+    tourRow.className = 'vw-kv vw-ctl';
+    const tourLabel = document.createElement('span');
+    tourLabel.className = 'k';
+    tourLabel.textContent = 'Tour';
+    const tourBtn = btn('Restart tour', 'vw-btn');
+    tourRow.append(tourLabel, tourBtn);
+    appearCard.appendChild(tourRow);
+    tourBtn.addEventListener('click', () => {
+      const tour = window.Atelier && window.Atelier.tour;
+      if (!tour || typeof tour.start !== 'function') return;
+      A.views.close();                       // anchors visible before spotlight
+      tour.start();
+    });
+
     wrap.append(
       provCard,
       backendCard,
-      card('Appearance', [
-        ['Theme', 'theme', '—'],
-        ['Accent', 'accent', '—'],
-        ['Dotted grid', 'grid', '—'],
-      ]),
+      appearCard,
       card('Connection', [
         ['Backend status', 'status', 'connecting…'],
       ]),

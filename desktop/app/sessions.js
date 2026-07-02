@@ -14,7 +14,8 @@
      GET    /sessions                            -> {"sessions":[{id,name,status,
                                                     messages_len,parent_id,depth}]}
      GET    /sessions/{id}                       -> {id,name,status,parent_id,
-                                                    depth,messages:[{role,text,ts}]}
+                                                    depth,browser_nav,
+                                                    messages:[{role,text,ts}]}
      POST   /sessions/{id}/message   {"message"} -> 202 {"status":"running"}
                                        (409 {"error":"turn in progress"} mid-turn)
      DELETE /sessions/{id}                       -> {"ok":true}
@@ -47,6 +48,20 @@
    'linked to browser — page context rides along' — it renders only when the
    error note is empty (link status never clobbers an error). Every
    Atelier.links access is guarded: without link.js nothing changes.
+
+   Agent-driven navigation (round 16): the backend's NavigateBrowser orchestra
+   tool lets an agent REQUEST that the user-linked browser card open a URL —
+   no CDP, no autonomous browsing; the user creates the link, the navigation
+   is visible. The session detail (GET /sessions/{id}) carries browser_nav =
+   {url, seq} | null. Each card gates on a monotonic lastNavSeq (start 0):
+   polls re-deliver the same detail every 1.5s, so only seq > lastNavSeq
+   fires, exactly once per tool call. When link.js holds a browser for this
+   card (Atelier.links.browserElFor) AND apps.js is loaded
+   (AtelierApps.browserNavigate), the linked browser's active tab navigates
+   and the note reports it; with no linked browser the note explains nothing
+   was linked. Both modules are optional and guarded at every access — the
+   r15 note-clobbering rule stays (the link-status note yields to any note
+   text, including these).
 
    Dock note: core.js's dock handler would spawn any registered type by
    lowercased button title, but apps.js CLONE-REPLACES every .dock-btn at load
@@ -127,7 +142,17 @@
       the same pair again (unlink) → the link note vanishes. Without
       app/link.js loaded everything behaves exactly as before (all
       Atelier.links access is guarded).
-  13. Console shows "[sessions] self-check passed" and no assert failures.
+  13. Agent-driven navigation (round 16): with the browser still linked from
+      step 12, tell the agent "open https://example.com in my browser" → its
+      NavigateBrowser tool stamps the session, the next poll carries
+      browser_nav, the LINKED browser card's active tab loads the page and
+      the note reads 'Agent opened https://example.com in the linked
+      browser'. The navigation fires exactly once (seq-gated) even though
+      every subsequent poll repeats the same browser_nav payload. Unlink and
+      ask again → the browser stays put and the note explains no browser is
+      linked (shift-drag a box around a browser card and this card). Without
+      app/link.js or app/apps.js loaded, sends and polls behave as before.
+  14. Console shows "[sessions] self-check passed" and no assert failures.
    =========================================================================== */
 
 (function () {
@@ -368,6 +393,7 @@
     let expired = false;    // attached only: child session gone, never rebuilt
     let pollTimer = null;
     let thinkingRow = null;
+    let lastNavSeq = 0;     // r16: highest agent-requested browser_nav.seq handled
 
     if (attached) trackSession(sessionId, card); // fresh cards register in ensureSession
 
@@ -393,6 +419,37 @@
       if (closed) return;
       const show = !!browserLinkInfo() && !note.textContent;
       linkNote.textContent = show ? 'linked to browser — page context rides along' : '';
+    }
+
+    // Agent-driven linked-browser navigation (round 16). The backend's
+    // NavigateBrowser tool sets browser_nav = {url, seq} on the session; the
+    // detail poll re-delivers it every cycle, so the monotonic lastNavSeq
+    // gate fires each request exactly once. link.js (Atelier.links) and
+    // apps.js (AtelierApps.browserNavigate) are BOTH optional modules —
+    // every access is guarded, and without them the payload is consumed
+    // (seq still advances) but nothing else happens beyond the note.
+    // The url is server-derived and only ever lands via setNote/textContent.
+    function handleBrowserNav(nav) {
+      if (closed || !nav || typeof nav.seq !== 'number') return;
+      if (nav.seq <= lastNavSeq) return; // already handled (polls repeat it)
+      lastNavSeq = nav.seq;
+      const url = String(nav.url || '');
+      const links = window.Atelier && window.Atelier.links;
+      const browserEl = (links && typeof links.browserElFor === 'function')
+        ? links.browserElFor(card)
+        : null;
+      const api = window.AtelierApps;
+      if (browserEl && api && typeof api.browserNavigate === 'function') {
+        let done = false;
+        try { done = api.browserNavigate(browserEl, url); } catch { done = false; }
+        setNote(done
+          ? 'Agent opened ' + url + ' in the linked browser'
+          : 'Agent asked to open ' + url + ' but the linked browser card refused it.');
+      } else {
+        setNote('Agent asked to open ' + url + ' but no browser card is '
+          + 'linked — shift-drag a box around a browser card and this card '
+          + 'to link one.');
+      }
     }
 
     function addBubble(role, text) {
@@ -450,6 +507,12 @@
       if (!r.ok || !r.data || !r.data.id) throw new Error('session create failed');
       sessionId = r.data.id;
       renderedCount = 0; // fresh server session starts with an empty ledger
+      // r16: reset the nav high-water mark with the session. The server's
+      // browser_nav counter is module-wide and restarts at 1 with the
+      // backend; a stale lastNavSeq from the previous session would make
+      // handleBrowserNav silently drop every new request until the fresh
+      // counter climbed past it.
+      lastNavSeq = 0;
       if (!closed) trackSession(sessionId, card); // card:removed cleans this up
       return sessionId;
     }
@@ -496,6 +559,10 @@
       setNote('');
       hideThinking(); // new messages must land ABOVE the thinking bubble
       renderNew(r.data.messages || []);
+      // r16: AFTER the routine setNote('') so a fresh nav request's note
+      // wins this cycle (the next healthy poll clears it — transient by
+      // design; a nav landing on the turn's final poll stays visible).
+      handleBrowserNav(r.data.browser_nav);
       if (r.data.status === 'running') {
         showThinking();
         schedulePoll();
@@ -686,11 +753,15 @@
     console.assert(sweepIdle,
       '[sessions] child sweep must stay idle until a card owns a session');
     // link.js loads AFTER this module, so Atelier.links is normally absent
-    // here — that is the guarded path send() must survive. If some load-order
-    // change put it first, it must expose the accessor send() calls.
-    const linksOk = !A.links || typeof A.links.browserFor === 'function';
+    // here — that is the guarded path send() and handleBrowserNav must
+    // survive. If some load-order change put it first, it must expose both
+    // accessors this module calls (browserFor in send, browserElFor in the
+    // r16 nav handler).
+    const linksOk = !A.links ||
+      (typeof A.links.browserFor === 'function' &&
+       typeof A.links.browserElFor === 'function');
     console.assert(linksOk,
-      '[sessions] Atelier.links present but missing browserFor()');
+      '[sessions] Atelier.links present but missing browserFor()/browserElFor()');
     if (registered && btn && sweepIdle && linksOk) {
       console.log('[sessions] self-check passed — agent app registered, '
         + 'dock wired, child sweep idle, links access guarded.');

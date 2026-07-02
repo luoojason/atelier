@@ -188,7 +188,7 @@ def test_create_list_get_shapes(client):
     detail = client.get(f"/sessions/{made['id']}").json()
     assert detail == {
         "id": made["id"], "name": "Research", "status": "idle", "messages": [],
-        "parent_id": None, "depth": 0,
+        "parent_id": None, "depth": 0, "browser_nav": None,
     }
 
 

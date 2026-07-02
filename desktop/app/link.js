@@ -38,6 +38,10 @@
          LIVE read: resolves the linked browser card's ACTIVE tab through
          window.AtelierApps.browserInfo at CALL time — never cached, so the
          rider always carries the page showing right now.
+     browserElFor(agentEl) -> the linked browser card ELEMENT | null
+         (round 16) the raw element straight from the link Map — no tab
+         resolution. sessions.js hands it to AtelierApps.browserNavigate
+         when the agent requests navigation of the user-linked browser.
      unlink(agentEl)  -> true if a link was removed
      count()          -> number of live links
 
@@ -169,6 +173,14 @@
       if (!entry) return null;
       return browserInfo(entry.browserEl);
     },
+    // round 16: the linked browser card ELEMENT (or null) — the same Map
+    // read browserFor starts from, without the active-tab resolution.
+    // sessions.js passes it to AtelierApps.browserNavigate when the agent's
+    // NavigateBrowser tool requests a page load in the user-linked browser.
+    browserElFor(agentEl) {
+      const entry = links.get(agentEl);
+      return entry ? entry.browserEl : null;
+    },
     unlink(agentEl) { return dropLink(agentEl); },
     count() { return links.size; },
   };
@@ -178,10 +190,12 @@
     const api = window.Atelier.links;
     const ok = api &&
       typeof api.browserFor === 'function' &&
+      typeof api.browserElFor === 'function' &&
       typeof api.unlink === 'function' &&
       typeof api.count === 'function' &&
       api.count() === 0 &&
-      api.browserFor(document.body) === null;
+      api.browserFor(document.body) === null &&
+      api.browserElFor(document.body) === null;
     console.assert(ok, '[link] API surface incomplete:', api);
     if (ok) console.log('[link] ready');
   })();

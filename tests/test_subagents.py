@@ -1,7 +1,8 @@
 """Tests for lite_server's sub-agent orchestration (contract part B) — the
 orchestra SpawnAgent/CheckAgent tools, parent_id/depth on the /sessions
 surface, the factored _make_room / _start_turn helpers, and the structural
-depth cap (only depth-0 sessions get the orchestra server).
+depth cap (only depth-0 sessions get the orchestra server) — plus the r16
+NavigateBrowser tool (browser_nav on the parent session + the detail route).
 
 Same idioms as test_lite_sessions.py: fastapi TestClient, ClaudeSDKClient
 monkeypatched at its boundary, _spawn_session_turn monkeypatched to either a
@@ -93,9 +94,10 @@ def _inline_turns(monkeypatch):
 
 
 def _handlers(parent_id):
-    """The (SpawnAgent, CheckAgent) handler coroutines bound to parent_id."""
-    spawn, check = lite_server._orchestra_tools(parent_id)
-    return spawn.handler, check.handler
+    """The (SpawnAgent, CheckAgent, NavigateBrowser) handler coroutines bound
+    to parent_id."""
+    spawn, check, nav = lite_server._orchestra_tools(parent_id)
+    return spawn.handler, check.handler, nav.handler
 
 
 def _call(handler, args):
@@ -160,7 +162,7 @@ def client():
 def test_list_and_detail_carry_parent_id_and_depth(client, captured):
     parent_id = client.post("/sessions", json={"name": "Card"}).json()["id"]
     lite_server._sessions[parent_id].status = "running"  # mid-turn spawner
-    spawn, _ = _handlers(parent_id)
+    spawn, _, _ = _handlers(parent_id)
     reply = _text(_call(spawn, {"task": "dig into X", "name": "Scout"}))
     child_id = _SPAWNED_RE.match(reply).group("id")
 
@@ -186,7 +188,7 @@ def test_list_and_detail_carry_parent_id_and_depth(client, captured):
 
 def test_spawn_creates_running_child_with_task_as_first_message(captured):
     parent = _register_parent()
-    spawn, _ = _handlers(parent.id)
+    spawn, _, _ = _handlers(parent.id)
 
     reply = _text(_call(spawn, {"task": "summarize the vault", "name": " Scout "}))
     match = _SPAWNED_RE.match(reply)
@@ -204,14 +206,14 @@ def test_spawn_creates_running_child_with_task_as_first_message(captured):
 
 def test_spawn_without_name_gets_subagent_counter_name(captured):
     parent = _register_parent()
-    spawn, _ = _handlers(parent.id)
+    spawn, _, _ = _handlers(parent.id)
     reply = _text(_call(spawn, {"task": "t"}))
     assert _SPAWNED_RE.match(reply).group("name").startswith("Sub-agent ")
 
 
 def test_spawn_child_cap_is_4(captured):
     parent = _register_parent()
-    spawn, _ = _handlers(parent.id)
+    spawn, _, _ = _handlers(parent.id)
 
     for i in range(4):
         assert _SPAWNED_RE.match(_text(_call(spawn, {"task": f"t{i}"})))
@@ -228,7 +230,7 @@ def test_spawn_child_cap_is_4(captured):
 
 
 def test_spawn_with_parent_gone(captured):
-    spawn, _ = _handlers("deadbeef00000000deadbeef00000000")
+    spawn, _, _ = _handlers("deadbeef00000000deadbeef00000000")
     assert _text(_call(spawn, {"task": "t"})) == (
         "Your session is gone; cannot spawn."
     )
@@ -239,7 +241,7 @@ def test_spawn_with_no_room_left(monkeypatch, captured):
     # cap 1, and the only session (the parent) is running -> _make_room False
     monkeypatch.setenv("ATELIER_MAX_SESSIONS", "1")
     parent = _register_parent(status="running")
-    spawn, _ = _handlers(parent.id)
+    spawn, _, _ = _handlers(parent.id)
     assert _text(_call(spawn, {"task": "t"})) == (
         "Session limit reached — no room for a sub-agent right now."
     )
@@ -251,7 +253,7 @@ def test_spawn_parent_deleted_during_make_room(monkeypatch, captured):
     # a DELETE of the parent landing in that window must not leave an orphan
     # child registered and running at real token cost.
     parent = _register_parent()
-    spawn, _ = _handlers(parent.id)
+    spawn, _, _ = _handlers(parent.id)
 
     async def _room_then_parent_gone():
         lite_server._sessions.pop(parent.id, None)  # the interleaved DELETE
@@ -269,7 +271,7 @@ def test_spawn_parent_deleted_during_make_room(monkeypatch, captured):
 
 def test_check_unknown_id(captured):
     parent = _register_parent()
-    _, check = _handlers(parent.id)
+    _, check, _ = _handlers(parent.id)
     assert _text(_call(check, {"agent_id": "nope"})) == (
         "No such sub-agent session."
     )
@@ -285,12 +287,12 @@ def test_check_foreign_session_is_unknown(captured):
     other_parent = lite_server._AgentSession("otherpar00", "Other parent")
     other_parent.status = "running"
     lite_server._sessions[other_parent.id] = other_parent
-    other_spawn, _ = _handlers(other_parent.id)
+    other_spawn, _, _ = _handlers(other_parent.id)
     foreign_child_id = _SPAWNED_RE.match(
         _text(_call(other_spawn, {"task": "t"}))
     ).group("id")
 
-    _, check = _handlers(parent.id)
+    _, check, _ = _handlers(parent.id)
     for sid in (other_card.id, foreign_child_id, parent.id):
         assert _text(_call(check, {"agent_id": sid})) == (
             "No such sub-agent session."
@@ -299,7 +301,7 @@ def test_check_foreign_session_is_unknown(captured):
 
 def test_check_running_child(captured):
     parent = _register_parent()
-    spawn, check = _handlers(parent.id)
+    spawn, check, _ = _handlers(parent.id)
     reply = _text(_call(spawn, {"task": "t", "name": "Scout"}))
     child_id = _SPAWNED_RE.match(reply).group("id")
 
@@ -310,7 +312,7 @@ def test_check_running_child(captured):
 
 def test_check_finished_child_returns_last_reply(captured):
     parent = _register_parent()
-    spawn, check = _handlers(parent.id)
+    spawn, check, _ = _handlers(parent.id)
     child_id = _SPAWNED_RE.match(
         _text(_call(spawn, {"task": "t", "name": "Scout"}))
     ).group("id")
@@ -325,7 +327,7 @@ def test_check_finished_child_returns_last_reply(captured):
 
 def test_check_finished_with_error(captured):
     parent = _register_parent()
-    spawn, check = _handlers(parent.id)
+    spawn, check, _ = _handlers(parent.id)
     child_id = _SPAWNED_RE.match(
         _text(_call(spawn, {"task": "t", "name": "Scout"}))
     ).group("id")
@@ -343,7 +345,7 @@ def test_check_finished_with_error(captured):
 
 def test_check_finished_with_no_reply(captured):
     parent = _register_parent()
-    spawn, check = _handlers(parent.id)
+    spawn, check, _ = _handlers(parent.id)
     child_id = _SPAWNED_RE.match(
         _text(_call(spawn, {"task": "t", "name": "Scout"}))
     ).group("id")
@@ -353,6 +355,77 @@ def test_check_finished_with_no_reply(captured):
     assert _text(_call(check, {"agent_id": child_id})) == (
         'Sub-agent "Scout" finished. Last reply: (no reply)'
     )
+
+
+# ── NavigateBrowser ──────────────────────────────────────────────────────────
+
+def test_navigate_sets_browser_nav_and_seq_increments(captured):
+    parent = _register_parent()
+    _, _, nav = _handlers(parent.id)
+    assert parent.browser_nav is None
+
+    reply = _text(_call(nav, {"url": "https://example.com/a"}))
+    assert reply == (
+        "Navigation requested — https://example.com/a will load in the"
+        " browser card the user linked to this conversation (if none is"
+        " linked, ask the user to shift-drag a box around a browser card and"
+        " this card)."
+    )
+    first = parent.browser_nav
+    assert set(first) == {"url", "seq"}
+    assert first["url"] == "https://example.com/a"
+    assert isinstance(first["seq"], int)
+
+    # a second request (even a plain http one) strictly advances seq, so the
+    # poller can distinguish it from the one it already acted on
+    _call(nav, {"url": "http://example.org/b"})
+    second = parent.browser_nav
+    assert second["url"] == "http://example.org/b"
+    assert second["seq"] == first["seq"] + 1
+
+
+def test_navigate_rejects_non_http_urls(captured):
+    parent = _register_parent()
+    _, _, nav = _handlers(parent.id)
+    for args in (
+        {"url": "ftp://example.com"},
+        {"url": "javascript:alert(1)"},
+        {"url": "file:///etc/passwd"},
+        {"url": "example.com"},
+        {"url": ""},
+        {},
+    ):
+        assert _text(_call(nav, args)) == "Only http(s) URLs can be opened."
+    assert parent.browser_nav is None  # nothing was ever recorded
+
+
+def test_navigate_with_parent_gone(captured):
+    _, _, nav = _handlers("deadbeef00000000deadbeef00000000")
+    assert _text(_call(nav, {"url": "https://example.com"})) == (
+        "Your session is gone; cannot navigate."
+    )
+
+
+def test_detail_carries_browser_nav_and_list_does_not(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["browser_nav"] is None
+
+    _, _, nav = _handlers(sid)
+    _call(nav, {"url": "https://example.com/page"})
+
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["browser_nav"]["url"] == "https://example.com/page"
+    assert detail["browser_nav"]["seq"] >= 1
+
+    # the list route deliberately does NOT carry browser_nav
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "browser_nav" not in s
+
+
+def test_navigate_tool_description_mentions_the_link_requirement():
+    _, _, nav_tool = lite_server._orchestra_tools("p")
+    assert nav_tool.name == "NavigateBrowser"
+    assert "linked" in nav_tool.description
 
 
 # ── the structural depth cap ─────────────────────────────────────────────────
@@ -371,7 +444,8 @@ def test_build_options_with_spawner_gains_orchestra():
     assert "atelier" in opts.mcp_servers  # the base server is untouched
     assert "mcp__orchestra__SpawnAgent" in opts.allowed_tools
     assert "mcp__orchestra__CheckAgent" in opts.allowed_tools
-    # the base allowlist is intact alongside the two orchestra tools
+    assert "mcp__orchestra__NavigateBrowser" in opts.allowed_tools
+    # the base allowlist is intact alongside the orchestra tools
     assert set(lite_server.ATELIER_ALLOWED_TOOLS) <= set(opts.allowed_tools)
 
 

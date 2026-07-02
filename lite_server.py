@@ -25,6 +25,7 @@ Run:
 
 import asyncio
 import contextlib
+import dataclasses
 import datetime
 import itertools
 import json
@@ -55,6 +56,7 @@ from shared_tools import (
     CaptureBrief,
     ReadBrief,
 )
+from shared_tools import sdk_tools
 from shared_tools.sdk_tools import build_atelier_server
 
 # Pure stdlib vault path helpers: the /versions* routes validate note paths
@@ -203,10 +205,10 @@ def build_options(
     token deltas. Harmless for the non-streaming drain (it ignores StreamEvent).
 
     ``spawner_session_id``: when set, this run belongs to a depth-0 agent-card
-    session and gains a per-call "orchestra" MCP server (SpawnAgent/CheckAgent
-    bound to that session id). The chat client, the compat route, and depth-1
-    sub-agent sessions all pass None, so sub-agents structurally cannot spawn
-    their own sub-agents.
+    session and gains a per-call "orchestra" MCP server (SpawnAgent/CheckAgent/
+    NavigateBrowser bound to that session id). The chat client, the compat
+    route, and depth-1 sub-agent sessions all pass None, so sub-agents
+    structurally cannot spawn their own sub-agents.
 
     Isolation (unconditional for the app agent): a private CLAUDE_CONFIG_DIR
     (respect an existing override, else ~/.atelier/claude-home, created if
@@ -249,6 +251,7 @@ def build_options(
         allowed_tools += [
             "mcp__orchestra__SpawnAgent",
             "mcp__orchestra__CheckAgent",
+            "mcp__orchestra__NavigateBrowser",
         ]
 
     return ClaudeAgentOptions(
@@ -1080,6 +1083,96 @@ async def get_response_compat(req: AgencyResponseRequest):
         }
 
 
+# --- Mini-app generator (POST /miniapp) -----------------------------------------
+#
+# One-shot generation of a self-contained HTML mini-app for the desktop app's
+# Mini-app card. Every request runs on a FRESH ClaudeSDKClient (never the
+# long-lived chat client, so a build cannot pollute the user's chat context)
+# with a purpose-built options variant: the MINIAPP system prompt, no tools at
+# all, and a tight turn cap — the generator only ever writes one document.
+
+MINIAPP_INSTRUCTIONS = """You build tiny self-contained web apps.
+
+Produce exactly ONE complete self-contained HTML document implementing the small app the user describes.
+
+Rules:
+- Inline CSS and JS only. No external resources of any kind: no http(s) fetches, no script/link/img src pointing at the network, no CDN imports.
+- No forms that post anywhere.
+- Default aesthetic unless the user asks otherwise: warm cream background #faf7f1, ink text #3c3022, terracotta accent #c05c37.
+- Reply with ONLY the HTML document, nothing before or after it."""
+
+
+def _miniapp_options() -> ClaudeAgentOptions:
+    """build_options() variant for the mini-app generator.
+
+    Same model + provider + isolation env as every other run, but the MINIAPP
+    system prompt, no tools (allowed_tools=[] / mcp_servers={}), and
+    max_turns=4. dataclasses.replace on the FRESH instance build_options()
+    returns per call, so the shared builder's behavior for every other caller
+    is untouched.
+    """
+    return dataclasses.replace(
+        build_options(),
+        system_prompt=MINIAPP_INSTRUCTIONS,
+        max_turns=4,
+        allowed_tools=[],
+        mcp_servers={},
+    )
+
+
+# The first fenced html code block in a reply. DOTALL so the document's
+# newlines stay inside the one match; IGNORECASE for a "```HTML" fence.
+_MINIAPP_FENCE_RE = re.compile(r"```html[ \t]*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+# Ceiling on the extracted document, matching the desktop card's contract; a
+# document past this is rejected rather than truncated (a truncated app would
+# render broken and look like a model bug).
+_MINIAPP_MAX_CHARS = 300_000
+
+
+def _extract_miniapp_html(text: str) -> str | None:
+    """The reply's HTML document, or None when there is nothing usable.
+
+    Extraction order per the contract: the first fenced html code block, else
+    the raw reply when it starts (after whitespace) with <!doctype or <html.
+    """
+    match = _MINIAPP_FENCE_RE.search(text)
+    if match:
+        return match.group(1).strip() or None
+    stripped = text.strip()
+    if stripped.lower().startswith(("<!doctype", "<html")):
+        return stripped
+    return None
+
+
+class MiniappRequest(BaseModel):
+    # min 3 rejects junk pokes; max 2000 bounds the prompt the model sees.
+    description: str = Field(min_length=3, max_length=2000)
+
+
+@app.post("/miniapp")
+async def miniapp(req: MiniappRequest):
+    """Generate one self-contained mini-app HTML document. Token-gated (POST).
+
+    {"html": str} on success, {"error": str} on every failure mode — a failed
+    or unusable run never 500s the card.
+    """
+    try:
+        async with ClaudeSDKClient(options=_miniapp_options()) as client:
+            await client.query(req.description)
+            result = await _collect_response(client)
+    except Exception as exc:  # noqa: BLE001 - never 500 the card
+        return {"error": f"mini-app generation failed: {exc}"}
+    if result.get("error"):
+        return {"error": result["response"]}
+    html = _extract_miniapp_html(result["response"])
+    if html is None:
+        return {"error": "the model did not return a usable HTML document"}
+    if len(html) > _MINIAPP_MAX_CHARS:
+        return {"error": "generated app too large"}
+    return {"html": html}
+
+
 # --- Multi-card agent sessions ------------------------------------------------
 #
 # Each Agent card in the desktop app owns ONE of these sessions: a fresh
@@ -1090,7 +1183,8 @@ async def get_response_compat(req: AgencyResponseRequest):
 # Shape (fixed contract with app/sessions.js + tests):
 #   POST   /sessions                {"name"?}    -> {"id","name"}
 #   GET    /sessions                             -> {"sessions":[{id,name,status,messages_len,parent_id,depth}]}
-#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}],parent_id,depth}
+#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}],parent_id,depth,browser_nav}
+#   (browser_nav rides ONLY on the detail route the card polls, never the list)
 #   POST   /sessions/{id}/message   {"message"}  -> 202 {"status":"running"} (fire-and-poll)
 #   DELETE /sessions/{id}                        -> {"ok":true}
 #   unknown id -> 404 {"error":"unknown session"}; a turn error sets
@@ -1105,6 +1199,10 @@ class _AgentSession:
     ``parent_id``/``depth`` mark sub-agent sessions: a card session is depth 0
     with no parent; a session spawned by SpawnAgent is depth 1 with parent_id
     pointing at its spawner. Depth never exceeds 1 (see _run_session_turn).
+
+    ``browser_nav`` is the latest NavigateBrowser request against this session
+    ({"url", "seq"}, seq strictly increasing) or None; the desktop card polls
+    it off GET /sessions/{id} and acts when seq advances past what it has seen.
     """
 
     def __init__(
@@ -1122,6 +1220,7 @@ class _AgentSession:
         self.lock = asyncio.Lock()
         self.status = "idle"  # "idle" | "running" | "error"
         self.messages: list[dict] = []  # {"role","text","ts"} append-only
+        self.browser_nav: dict | None = None  # latest NavigateBrowser request
         self.last_used = next(_session_touch)
 
 
@@ -1315,6 +1414,7 @@ async def get_session(session_id: str):
         "messages": list(sess.messages),
         "parent_id": sess.parent_id,
         "depth": sess.depth,
+        "browser_nav": sess.browser_nav,
     }
 
 
@@ -1349,14 +1449,25 @@ async def delete_session(session_id: str):
 # --- Sub-agent orchestration (the "orchestra" MCP server) -----------------------
 #
 # Each depth-0 session's client gets its OWN in-process orchestra server whose
-# two tools close over that session's id (see build_options). A spawned child
+# tools close over that session's id (see build_options). A spawned child
 # is just another _AgentSession — same isolation, same /sessions surface, so
 # the desktop app can reveal it as a card — with parent_id/depth marking the
 # relationship. Tool results are plain text: the model reads them, and the
 # text convention mirrors shared_tools/sdk_tools.py's wrap_tool.
+#
+# NavigateBrowser is the third tool: the agent requests navigation of the
+# browser card the USER linked to its card (no CDP, no autonomous browsing —
+# the request is just a {"url","seq"} field the card polls and acts on, so
+# every navigation is user-visible and user-sanctioned via the link).
 
 _subagent_seq = itertools.count(1)  # 'Sub-agent N' default names
 _MAX_CHILDREN = 4  # live children per parent; keeps one card from eating the cap
+
+# Module-wide monotonic counter for browser_nav requests: the poller compares
+# seq against the last one it acted on, so repeats of the SAME url still fire.
+_browser_nav_seq = itertools.count(1)
+
+_HTTP_URL_RE = re.compile(r"^https?://")
 
 
 def _tool_text(text: str) -> dict:
@@ -1364,10 +1475,12 @@ def _tool_text(text: str) -> dict:
 
 
 def _orchestra_tools(parent_id: str) -> list:
-    """The SpawnAgent/CheckAgent SdkMcpTools, closed over the spawner's id.
+    """The SpawnAgent/CheckAgent/NavigateBrowser SdkMcpTools, closed over the
+    spawner's id.
 
     Factored from _build_orchestra_server so tests can invoke the handlers
-    directly (the SDK server config does not expose them back).
+    directly (the SDK server config does not expose them back) and so
+    GET /tools can introspect the declared names/descriptions/schemas.
     """
 
     @tool(
@@ -1470,7 +1583,42 @@ def _orchestra_tools(parent_id: str) -> list:
             f'Sub-agent "{child.name}" {finished}. Last reply: {last_reply}'
         )
 
-    return [_spawn_agent, _check_agent]
+    @tool(
+        "NavigateBrowser",
+        "Open an http(s) URL in the browser card the user has linked to this"
+        " conversation. This only works when the user has linked a browser"
+        " card (by shift-dragging a selection box around a browser card and"
+        " this agent card); if none is linked, nothing opens and you should"
+        " ask the user to link one.",
+        {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The http(s) URL to open in the linked"
+                    " browser card.",
+                },
+            },
+            "required": ["url"],
+        },
+    )
+    async def _navigate_browser(args):
+        url = str(args.get("url") or "")
+        if not _HTTP_URL_RE.match(url):
+            return _tool_text("Only http(s) URLs can be opened.")
+        parent = _sessions.get(parent_id)
+        if parent is None:
+            # The spawner was deleted/evicted mid-turn; there is no session
+            # for the card to poll, so the request has nowhere to land.
+            return _tool_text("Your session is gone; cannot navigate.")
+        parent.browser_nav = {"url": url, "seq": next(_browser_nav_seq)}
+        return _tool_text(
+            f"Navigation requested — {url} will load in the browser card the"
+            " user linked to this conversation (if none is linked, ask the"
+            " user to shift-drag a box around a browser card and this card)."
+        )
+
+    return [_spawn_agent, _check_agent, _navigate_browser]
 
 
 def _build_orchestra_server(parent_id: str):
@@ -1478,6 +1626,47 @@ def _build_orchestra_server(parent_id: str):
     return create_sdk_mcp_server(
         name="orchestra", version="1.0.0", tools=_orchestra_tools(parent_id)
     )
+
+
+# --- Tool inspector endpoint (GET /tools) ----------------------------------------
+#
+# Read-only registry of every tool the backend can hand a model, for the
+# desktop app's tool-inspector card. The atelier entries are introspected from
+# the LIGHT_TOOLS classes with the SAME schema builder sdk_tools uses to
+# register them, so what the inspector shows can never drift from what the
+# model sees; the orchestra entries come off the SdkMcpTool objects the @tool
+# decorators declare. Same conventions as the dashboard endpoints: fixed
+# shape, never 500, no token (read-only GET).
+
+
+@app.get("/tools")
+async def tools_registry():
+    try:
+        entries = [
+            {
+                "name": cls.__name__,
+                "description": (cls.__doc__ or cls.__name__).strip(),
+                "input_schema": sdk_tools._build_input_schema(cls),
+                "server": "atelier",
+                "availability": "all sessions",
+            }
+            for cls in LIGHT_TOOLS
+        ]
+        # Bound to a probe id: only the declared metadata is read here; the
+        # handler closures are never invoked.
+        entries += [
+            {
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+                "server": "orchestra",
+                "availability": "agent cards (depth 0)",
+            }
+            for t in _orchestra_tools("__tools_probe__")
+        ]
+        return {"tools": entries}
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        return {"tools": []}
 
 
 if __name__ == "__main__":
