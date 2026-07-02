@@ -879,6 +879,20 @@
   inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
   sendEl.addEventListener('click', send);
 
+  // Mount the shared model picker (chatcontrols.js) on the main chat composer.
+  // chatcontrols.js is a deferred script that loads AFTER core.js, so
+  // window.Atelier.chatcontrols does not exist yet at this point; deferred
+  // scripts all run before DOMContentLoaded, so mounting on that event runs
+  // after chatcontrols.js has published its API. Guarded: a missing module
+  // (404) leaves the composer exactly as it was.
+  window.addEventListener('DOMContentLoaded', () => {
+    const cc = window.Atelier && window.Atelier.chatcontrols;
+    const composer = inputEl && inputEl.parentElement; // the .composer div
+    if (cc && typeof cc.mount === 'function' && composer) {
+      cc.mount(composer, { scope: 'main' });
+    }
+  });
+
   // ── backend status polling ────────────────────────────────────────────────
   function setStatus(ok) {
     dotEl.classList.remove('ok', 'bad');
