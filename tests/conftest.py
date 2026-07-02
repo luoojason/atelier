@@ -21,13 +21,14 @@ import os
 
 import pytest
 
-_ISOLATED_KEYS = ("ATELIER_VERSIONS_DIR", "OBSIDIAN_VAULT")
+_ISOLATED_KEYS = ("ATELIER_VERSIONS_DIR", "OBSIDIAN_VAULT", "ATELIER_SETTINGS_PATH")
 
 
 @pytest.fixture(autouse=True)
 def _isolate_versions_env(tmp_path):
     saved = {key: os.environ.get(key) for key in _ISOLATED_KEYS}
     os.environ["ATELIER_VERSIONS_DIR"] = str(tmp_path / "atelier-versions")
+    os.environ["ATELIER_SETTINGS_PATH"] = str(tmp_path / "atelier-settings.json")
     try:
         yield
     finally:
