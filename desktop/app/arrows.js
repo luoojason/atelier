@@ -33,6 +33,9 @@
      link(fromEl, toEl) -> unlink()   register + draw; returns its remover
      refresh()                        redraw every live link now
      count()                          number of live links
+     unlinkTouching(el)               unlink every live link with from===el
+                                       or to===el (e.g. a sweep-drawn arrow
+                                       govern.js has no handle for)
 
    Boundaries (per the module contract)
    ------------------------------------
@@ -216,6 +219,18 @@
 
   function count() { return links.size; }
 
+  // Unlink every live link touching el, regardless of who drew it — the
+  // escape hatch for callers (govern.js) that need to clear an arrow they
+  // hold no unlink() handle for (e.g. sessions.js's sweep auto-reveal draws
+  // straight into this module's own registry). Snapshot first: unlink()
+  // mutates `links` mid-iteration otherwise.
+  function unlinkTouching(el) {
+    if (!el) return;
+    Array.from(links).forEach((entry) => {
+      if (entry.from === el || entry.to === el) entry.unlink();
+    });
+  }
+
   // ── bus wiring ────────────────────────────────────────────────────────────
   A.bus.on('card:removed', ({ el }) => {
     links.forEach((l) => { if (l.from === el || l.to === el) l.unlink(); });
@@ -237,14 +252,15 @@
   });
 
   // ── publish + self-check ──────────────────────────────────────────────────
-  A.arrows = { link, refresh, count };
+  A.arrows = { link, refresh, count, unlinkTouching };
 
   (function selfCheck() {
     const api = window.Atelier.arrows;
     const ok = api &&
       typeof api.link === 'function' &&
       typeof api.refresh === 'function' &&
-      typeof api.count === 'function';
+      typeof api.count === 'function' &&
+      typeof api.unlinkTouching === 'function';
     console.assert(ok, '[arrows] API surface incomplete:', api);
     if (ok) console.log('[arrows] ready');
   })();

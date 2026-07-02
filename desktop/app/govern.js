@@ -32,18 +32,16 @@
      server-side, so a govern DELETE would 404 a gone session.
    • No CSS: the arrow (arrows.js) and the toast (core.js) are the whole visual
      surface owned here; the button/chip/highlight chrome lives in chatcontrols.
-   • Known gap: sessions.js's own GET /sessions sweep (auto-reveal of children
-     by parent_id) draws its own arrow directly via A.arrows.link and never
+   • sessions.js's own GET /sessions sweep (auto-reveal of children by
+     parent_id) draws its own arrow directly via A.arrows.link and never
      hands this module the unlink() it gets back — that arrow lives ONLY in
      arrows.js's internal registry, invisible to childrenOf/detachChild here.
-     In practice this never collides: the sweep only ever draws for a session
-     that has NO card yet (a fresh SpawnAgent child), while govern() only ever
-     targets cards ALREADY on canvas (stamped by chatcontrols) — the two
-     mechanisms operate on disjoint arrows. The one theoretical seam (re-
-     governing a still-sweep-owned child to a new parent, leaving its original
-     sweep-drawn arrow stale) has no fix within arrows.js's current link/
-     refresh/count surface (no query-or-remove-by-element API) and is out of
-     scope for this module.
+     This used to leave a stale duplicate arrow when a still-sweep-owned
+     child got (re-)governed to a parent. Fixed via arrows.js's
+     unlinkTouching(el) (unlink-by-element, no handle required): detachChild
+     and unlink() both call it (guarded) so any arrow into childEl this
+     registry never tracked — sweep-drawn or otherwise — is cleared whenever
+     the child's governance changes.
 
    API (published as window.Atelier.govern)
    ----------------------------------------
@@ -148,6 +146,11 @@
     let old = null;
     govs.forEach((m, parentEl) => { if (m.has(childEl)) old = parentEl; });
     if (old) { dropOne(old, childEl); A.bus.emit('govern:changed', { parentEl: old }); }
+    // Unconditional (not gated on `old`): a still-sweep-owned child has NO
+    // entry in `govs` yet may already have a sweep-drawn arrow into it —
+    // clear any arrow this registry never tracked so a fresh govern() below
+    // never draws a stale duplicate.
+    if (A.arrows && typeof A.arrows.unlinkTouching === 'function') A.arrows.unlinkTouching(childEl);
     return old;
   }
 
@@ -164,7 +167,10 @@
       A.ui.toast('Could not govern: ' + msg);
       return false;
     }
-    detachChild(childEl); // move: drop the old parent's arrow first
+    // move: drop the old parent's arrow first — detachChild also clears any
+    // arrow into childEl this registry never tracked (e.g. a still-sweep-
+    // owned child), so the arrows.link() below never draws a duplicate.
+    detachChild(childEl);
     const arrows = A.arrows;
     const unlink = (arrows && typeof arrows.link === 'function')
       ? arrows.link(parentEl, childEl)   // orchestrator -> subagent
@@ -180,6 +186,13 @@
   function unlink(parentEl, childEl) {
     const pid = sidOf(parentEl), cid = sidOf(childEl);
     const removed = dropOne(parentEl, childEl);
+    if (removed) {
+      // guard against an orphan arrow into childEl this registry never
+      // tracked (e.g. a sweep-drawn arrow) so ungoverning leaves no stale
+      // line behind. Gated on `removed` so an unlink() called for a pair
+      // that isn't actually governed can't wipe a DIFFERENT parent's arrow.
+      if (A.arrows && typeof A.arrows.unlinkTouching === 'function') A.arrows.unlinkTouching(childEl);
+    }
     if (removed && pid && cid) {
       apiJson('/sessions/' + pid + '/govern/' + cid, { method: 'DELETE' }).catch(() => {});
       A.bus.emit('govern:changed', { parentEl });
