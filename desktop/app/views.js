@@ -112,6 +112,18 @@
       tour's anchors) and the spotlight tour starts over the live canvas.
       With tour.js absent (window.Atelier.tour undefined) the click is a
       guarded no-op: the view stays open, no error thrown.
+   12. Knowledge base card (right below Model provider): open Settings → a
+      "Knowledge base" card shows a Notion token row and an Obsidian vault
+      row. Paste a token and Save → the input clears and a "Connected ·
+      …abcd" hint row appears with a Remove button (the full token is never
+      rendered). Validate → "✓ token accepted — <workspace>" or "✗ token
+      rejected by Notion" inline. Remove → the hint row disappears. Set the
+      vault path to a real directory and Save → "saved" and the input keeps
+      the path on the next /config load; a bad path → "not a directory"
+      inline (HTTP 400). Same single-in-flight discipline as the provider
+      card: every button disables while its request is in flight, controls
+      are disabled until the first /config lands, and stop lite_server →
+      "unavailable".
    =========================================================================== */
 
 (function () {
@@ -714,6 +726,181 @@
       }
     }));
 
+    // ── Knowledge base card (Notion token + Obsidian vault) ────────────────
+    // Interactive, so built bespoke — same idiom as the Model provider card
+    // above (btn/noteLine/setNote, a single-in-flight kbAction guard). Fed by
+    // the SAME GET /config response (notion_connected / notion_token_hint /
+    // obsidian_vault) via loadConfig below. The token VALUE never enters the
+    // DOM — only the server's …last4 hint.
+    const kbCard = document.createElement('div');
+    kbCard.className = 'vw-card';
+    const kbTitle = document.createElement('div');
+    kbTitle.className = 'vw-card-title';
+    kbTitle.textContent = 'Knowledge base';
+
+    const notionRow = document.createElement('div');
+    notionRow.className = 'vw-kv vw-ctl';
+    const notionLabel = document.createElement('span');
+    notionLabel.className = 'k';
+    notionLabel.textContent = 'Notion token';
+    const notionCtl = document.createElement('span');
+    notionCtl.className = 'vw-key-ctl';
+    const notionInput = document.createElement('input');
+    notionInput.type = 'password';
+    notionInput.className = 'vw-key-input';
+    notionInput.placeholder = 'secret_… / ntn_…';
+    notionInput.autocomplete = 'off';
+    const notionSaveBtn = btn('Save', 'vw-btn');
+    const notionValidateBtn = btn('Validate', 'vw-btn');
+    notionCtl.append(notionInput, notionSaveBtn, notionValidateBtn);
+    notionRow.append(notionLabel, notionCtl);
+
+    const notionHintRow = document.createElement('div');
+    notionHintRow.className = 'vw-kv vw-ctl';
+    notionHintRow.style.display = 'none';        // shown only while a token is stored
+    const notionHintText = document.createElement('span');
+    notionHintText.className = 'k';
+    const notionRemoveBtn = btn('Remove', 'vw-btn');
+    notionHintRow.append(notionHintText, notionRemoveBtn);
+    const notionNote = noteLine();
+
+    const vaultRow = document.createElement('div');
+    vaultRow.className = 'vw-kv vw-ctl';
+    const vaultLabel = document.createElement('span');
+    vaultLabel.className = 'k';
+    vaultLabel.textContent = 'Obsidian vault';
+    const vaultCtl = document.createElement('span');
+    vaultCtl.className = 'vw-key-ctl';
+    const vaultInput = document.createElement('input');
+    vaultInput.type = 'text';
+    vaultInput.className = 'vw-key-input';
+    vaultInput.placeholder = '/path/to/vault';
+    const vaultSaveBtn = btn('Save', 'vw-btn');
+    vaultCtl.append(vaultInput, vaultSaveBtn);
+    vaultRow.append(vaultLabel, vaultCtl);
+    const vaultNote = noteLine();
+
+    kbCard.append(kbTitle, notionRow, notionHintRow, notionNote, vaultRow, vaultNote);
+
+    const kbControls = [notionInput, notionSaveBtn, notionValidateBtn, notionRemoveBtn,
+      vaultInput, vaultSaveBtn];
+    function setKbEnabled(on) {
+      kbControls.forEach((el) => { el.disabled = !on; });
+    }
+    setKbEnabled(false);                         // until the first /config lands
+
+    let kbReachable = false;                      // last GET /config outcome
+    let kbBusy = false;                           // a KB POST/DELETE in flight
+    function applyKbCfg(cfg) {
+      kbReachable = true;
+      const connected = !!cfg.notion_connected;
+      notionHintText.textContent = connected
+        ? 'Connected · ' + String(cfg.notion_token_hint || '') : '';
+      notionHintRow.style.display = connected ? '' : 'none';
+      if (typeof cfg.obsidian_vault === 'string') vaultInput.value = cfg.obsidian_vault;
+      // clear only the degrade text — action errors stay visible until acted on
+      if (notionNote.textContent === 'unavailable') setNote(notionNote, '');
+      if (vaultNote.textContent === 'unavailable') setNote(vaultNote, '');
+      // the header ↻ can land a /config response while a KB request is in
+      // flight — re-enabling under it would allow a concurrent second POST
+      if (!kbBusy) setKbEnabled(true);
+    }
+    function degradeKbCard() {
+      kbReachable = false;
+      setKbEnabled(false);
+      notionHintRow.style.display = 'none';
+      setNote(notionNote, 'unavailable');
+      setNote(vaultNote, 'unavailable');
+    }
+
+    // One in-flight KB request at a time — same discipline as provAction: the
+    // whole cluster disables, then re-enables from the last-known
+    // reachability when it settles (a loadConfig kicked off inside
+    // re-affirms right after). kbBusy keeps applyKbCfg from re-enabling
+    // mid-flight (see above).
+    async function kbAction(fn) {
+      kbBusy = true;
+      setKbEnabled(false);
+      try { await fn(); }
+      finally {
+        kbBusy = false;
+        if (!disposed) setKbEnabled(kbReachable);
+      }
+    }
+
+    notionSaveBtn.addEventListener('click', () => kbAction(async () => {
+      setNote(notionNote, '');
+      const v = notionInput.value.trim();
+      if (!v) { setNote(notionNote, 'enter a token first', 'err'); return; }
+      try {
+        const r = await api('/config/notion-token', {
+          method: 'POST', body: JSON.stringify({ token: v }),
+        });
+        if (disposed) return;
+        if (r.ok) {
+          notionInput.value = '';
+          setNote(notionNote, 'token saved', 'ok');
+          loadConfig();                          // refresh the Connected hint row
+        } else {
+          setNote(notionNote, (r.data && r.data.error) ||
+            ('save failed (HTTP ' + r.status + ')'), 'err');
+        }
+      } catch {
+        if (!disposed) setNote(notionNote, 'backend unreachable', 'err');
+      }
+    }));
+
+    notionRemoveBtn.addEventListener('click', () => kbAction(async () => {
+      setNote(notionNote, '');
+      try {
+        const r = await api('/config/notion-token', { method: 'DELETE' });
+        if (disposed) return;
+        if (r.ok) { setNote(notionNote, 'token removed', 'ok'); loadConfig(); }
+        else setNote(notionNote, (r.data && r.data.error) ||
+          ('remove failed (HTTP ' + r.status + ')'), 'err');
+      } catch {
+        if (!disposed) setNote(notionNote, 'backend unreachable', 'err');
+      }
+    }));
+
+    notionValidateBtn.addEventListener('click', () => kbAction(async () => {
+      setNote(notionNote, 'validating…');
+      const v = notionInput.value.trim();
+      try {
+        // empty JSON body means "validate the stored token" server-side
+        const r = await api('/config/notion-token/validate', {
+          method: 'POST', body: JSON.stringify(v ? { token: v } : {}),
+        });
+        if (disposed) return;
+        const d = r.data || {};
+        if (d.valid === true) {
+          const ws = d.workspace ? (' — ' + String(d.workspace)) : '';
+          setNote(notionNote, '✓ ' + String(d.detail || 'token accepted') + ws, 'ok');
+        } else {
+          setNote(notionNote, '✗ ' + String(d.detail || 'validation failed'), 'err');
+        }
+      } catch {
+        if (!disposed) setNote(notionNote, 'backend unreachable', 'err');
+      }
+    }));
+
+    vaultSaveBtn.addEventListener('click', () => kbAction(async () => {
+      setNote(vaultNote, '');
+      const v = vaultInput.value.trim();
+      if (!v) { setNote(vaultNote, 'enter a path first', 'err'); return; }
+      try {
+        const r = await api('/config/vault', {
+          method: 'POST', body: JSON.stringify({ path: v }),
+        });
+        if (disposed) return;
+        if (r.ok) { setNote(vaultNote, 'saved', 'ok'); loadConfig(); }
+        else setNote(vaultNote, (r.data && r.data.error) ||
+          ('save failed (HTTP ' + r.status + ')'), 'err');
+      } catch {
+        if (!disposed) setNote(vaultNote, 'backend unreachable', 'err');
+      }
+    }));
+
     // ── Model picker (Backend configuration card) ──────────────────────────
     // r15: the read-only Model row becomes a segmented control, mirroring
     // the provider-segment idiom above exactly (same .vw-seg styles, same
@@ -852,6 +1039,7 @@
 
     wrap.append(
       provCard,
+      kbCard,
       backendCard,
       appearCard,
       card('Connection', [
@@ -937,6 +1125,7 @@
             : 'not enforced (dev)';
           applyProviderCfg(cfg);
           applyModelCfg(cfg);
+          applyKbCfg(cfg);
         })
         .catch(() => {
           if (disposed) return;
@@ -944,6 +1133,7 @@
             .forEach((k) => { val[k].textContent = 'unavailable'; });
           degradeProviderCard();
           degradeModelCtl();
+          degradeKbCard();
         });
     }
     loadConfig();
