@@ -406,3 +406,30 @@ def test_sessions_never_touch_the_chat_client(monkeypatch, client):
     assert client.delete(f"/sessions/{sid}").json() == {"ok": True}
     # the poisoned chat client is still exactly what we installed — untouched
     assert isinstance(lite_server._chat_client, _PoisonChatClient)
+
+
+def test_session_model_reaches_the_sdk_client(monkeypatch, client):
+    monkeypatch.setattr(lite_server, "_resolved_model", lambda: "sonnet")
+    built = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory(built=built)
+    )
+    _inline_turns(monkeypatch)
+
+    sid = _create(client)["id"]
+    lite_server._sessions[sid].model = "haiku"  # per-session override
+    client.post(f"/sessions/{sid}/message", json={"message": "hi"})
+    assert built[0].options.model == "haiku"
+
+
+def test_session_without_model_uses_global(monkeypatch, client):
+    monkeypatch.setattr(lite_server, "_resolved_model", lambda: "sonnet")
+    built = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory(built=built)
+    )
+    _inline_turns(monkeypatch)
+
+    sid = _create(client)["id"]
+    client.post(f"/sessions/{sid}/message", json={"message": "hi"})
+    assert built[0].options.model == "sonnet"

@@ -193,7 +193,9 @@ def _resolved_model() -> str:
 
 
 def build_options(
-    stream: bool = False, spawner_session_id: str | None = None
+    stream: bool = False,
+    spawner_session_id: str | None = None,
+    model: str | None = None,
 ) -> ClaudeAgentOptions:
     """The single builder for BOTH the /chat client and every compat request.
 
@@ -255,7 +257,7 @@ def build_options(
         ]
 
     return ClaudeAgentOptions(
-        model=_resolved_model(),
+        model=model or _resolved_model(),
         system_prompt=ATELIER_INSTRUCTIONS,
         mcp_servers=mcp_servers,
         allowed_tools=allowed_tools,
@@ -1543,6 +1545,7 @@ class _AgentSession:
         self.name = name
         self.parent_id = parent_id
         self.depth = depth
+        self.model: str | None = None  # per-session model override; None -> _resolved_model()
         self.client: ClaudeSDKClient | None = None  # lazy: built on first message
         self.lock = asyncio.Lock()
         self.status = "idle"  # "idle" | "running" | "error"
@@ -1663,7 +1666,8 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
                 # rather than an instruction the model could talk itself past.
                 client = ClaudeSDKClient(
                     options=build_options(
-                        spawner_session_id=sess.id if sess.depth == 0 else None
+                        spawner_session_id=sess.id if sess.depth == 0 else None,
+                        model=sess.model,
                     )
                 )
                 await client.connect()

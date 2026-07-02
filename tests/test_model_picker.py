@@ -194,3 +194,11 @@ def test_config_and_health_reflect_model(client):
 def test_build_options_runs_on_resolved_model(client):
     client.post("/config/model", json={"model": "haiku"})
     assert lite_server.build_options().model == "haiku"
+
+
+def test_build_options_honors_explicit_session_model(client):
+    # an explicit per-session model beats the global resolution order
+    assert lite_server.build_options(model="haiku").model == "haiku"
+    client.post("/config/model", json={"model": "opus"})
+    assert lite_server.build_options(model="haiku").model == "haiku"
+    assert lite_server.build_options(model=None).model == "opus"  # None -> global
