@@ -11,6 +11,14 @@ runs ledger has no "ok" record for it inside the window, it fires once
 (staggered — first ~20s after start, then +45s apart) on top of its normal
 schedule.
 
+The daemon also hot-reloads the jobs file: every ``SWARM_JOBS_RELOAD_SECS``
+(default 30s) it checks the file's mtime and, when it changed, reloads
+leniently and rediffs against the live APScheduler jobs — vanished jobs are
+removed, new jobs added, changed jobs rescheduled — with no restart. A file
+that fails to load keeps the OLD jobs running (one logged line, never a
+crash). Catch-up one-shots stay a daemon-start-only affair: a job added by a
+live reload gets its normal schedule but no catch-up fire.
+
 Run it standalone (venv has apscheduler + httpx + pyyaml):
 
     /Users/jasonluo08/Desktop/openswarm/.venv-ext/bin/python scheduler/scheduler.py
@@ -24,6 +32,7 @@ Configuration (all via environment):
     SWARM_APP_TOKEN   bearer token for the server  (falls back to APP_TOKEN;
                                                     omit if the server has no token)
     SWARM_RUNS_LOG    append-only run log path     (default: scheduler/runs.log)
+    SWARM_JOBS_RELOAD_SECS  jobs-file watch interval, seconds (default: 30)
     SWARM_RUNS_JSONL  structured JSONL ledger path  (default: ~/.openswarm/runs.jsonl)
     SWARM_RUNS_JSONL_MAX_BYTES  ledger rotation size (default: 5242880 = 5 MiB)
     SWARM_MAX_RETRIES retries for pre-response fails (default: 2)
@@ -85,6 +94,14 @@ DEFAULT_RUNS_JSONL_MAX_BYTES = 5 * 1024 * 1024  # 5 MiB before rotation
 # Failure-notification tuning (all overridable via env).
 DEFAULT_NOTIFY_MIN_INTERVAL = 3600  # suppress the same failure for 1h by default
 NOTIFY_RECENT_LIMIT = 200  # how many prior notifications to scan for dedup
+
+# Jobs-file hot-reload tuning (overridable via SWARM_JOBS_RELOAD_SECS).
+DEFAULT_JOBS_RELOAD_SECS = 30
+# The watcher's own APScheduler job id. It shares the id namespace with user
+# job names, so it is defended on both sides: apply_jobs_diff refuses to
+# touch this id (a jobs-file entry with this name is ignored) and
+# lite_server's POST /jobs rejects it as reserved.
+RELOAD_JOB_ID = "__jobs-file-reload__"
 
 
 # --------------------------------------------------------------------------- #
@@ -152,6 +169,17 @@ def resolve_retry_base_delay() -> float:
 
 def resolve_runs_jsonl_max_bytes() -> int:
     return _resolve_int("SWARM_RUNS_JSONL_MAX_BYTES", DEFAULT_RUNS_JSONL_MAX_BYTES)
+
+
+def resolve_jobs_reload_secs() -> int:
+    """Jobs-file watch interval in seconds (SWARM_JOBS_RELOAD_SECS, default 30).
+
+    Garbage, negative, and zero all fall back to the default: the watcher is
+    registered as a real IntervalTrigger job, which rejects seconds <= 0, and
+    a broken env var must never keep the daemon from booting.
+    """
+    value = _resolve_int("SWARM_JOBS_RELOAD_SECS", DEFAULT_JOBS_RELOAD_SECS)
+    return value if value > 0 else DEFAULT_JOBS_RELOAD_SECS
 
 
 def resolve_aieos_url():
@@ -389,23 +417,31 @@ def make_job_runner(job, base_url, agency, app_token, runs_log):
 # --------------------------------------------------------------------------- #
 
 
+def _build_aps_trigger(job):
+    """Build the live APScheduler trigger for one validated job (lazy import).
+
+    Shared by initial registration (build_scheduler) and hot reload
+    (apply_jobs_diff) so both paths construct triggers identically.
+    """
+    from apscheduler.triggers.cron import CronTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    trigger_spec = build_trigger(job)
+    if trigger_spec["type"] == "interval":
+        return IntervalTrigger(seconds=trigger_spec["seconds"])
+    return CronTrigger(**trigger_spec["fields"])
+
+
 def build_scheduler(jobs, base_url, agency, app_token, runs_log):
     """Create a BlockingScheduler with every job registered. Lazy APScheduler import."""
     from apscheduler.schedulers.blocking import BlockingScheduler
-    from apscheduler.triggers.cron import CronTrigger
-    from apscheduler.triggers.interval import IntervalTrigger
 
     scheduler = BlockingScheduler()
 
     for job in jobs:
-        trigger_spec = build_trigger(job)
-        if trigger_spec["type"] == "interval":
-            trigger = IntervalTrigger(seconds=trigger_spec["seconds"])
-        else:
-            trigger = CronTrigger(**trigger_spec["fields"])
         scheduler.add_job(
             make_job_runner(job, base_url, agency, app_token, runs_log),
-            trigger=trigger,
+            trigger=_build_aps_trigger(job),
             id=job["name"],
             name=job["name"],
             replace_existing=True,
@@ -452,6 +488,217 @@ def schedule_catch_ups(scheduler, jobs, base_url, agency, app_token, runs_log,
             job["catch_up"],
         )
     return plans
+
+
+# --------------------------------------------------------------------------- #
+# Jobs-file hot reload (pure rediff + a watcher the scheduler fires itself)
+# --------------------------------------------------------------------------- #
+
+
+def diff_jobs(old_jobs, new_jobs) -> dict:
+    """Pure rediff of two validated job lists, keyed by job name.
+
+    Returns ``{"added": [job, ...], "removed": [name, ...], "changed":
+    [job, ...]}`` — ``added`` and ``changed`` carry the NEW job dicts (they are
+    what gets registered), ``removed`` carries the vanished names. Lists keep
+    file order (``removed`` keeps old-file order).
+
+    A job counts as changed when its normalized dict differs at all. The
+    contract cases are schedule and prompt, but every other field (agent,
+    endpoint, builtin, catch_up) also feeds either the trigger or the runner
+    closure, so replace-on-any-change is always the correct move. Pure and
+    stdlib-only on purpose: the tests drive this directly, not the daemon loop.
+    """
+    old_by_name = {job["name"]: job for job in old_jobs or []}
+    new_by_name = {job["name"]: job for job in new_jobs or []}
+    return {
+        "added": [job for job in new_jobs or [] if job["name"] not in old_by_name],
+        "removed": [name for name in old_by_name if name not in new_by_name],
+        "changed": [
+            job
+            for job in new_jobs or []
+            if job["name"] in old_by_name and old_by_name[job["name"]] != job
+        ],
+    }
+
+
+def apply_jobs_diff(scheduler, diff, base_url, agency, app_token, runs_log):
+    """Apply a :func:`diff_jobs` result to the live scheduler.
+
+    Removals first, then adds, then reschedules (a changed job is simply
+    re-added with ``replace_existing=True`` — APScheduler swaps the trigger and
+    the runner closure in one step). Every applied change logs exactly one
+    line; the lines are also returned so tests and callers can see what
+    happened. Each change is guarded individually: one surprising APScheduler
+    failure must not stop the rest of the diff or crash the daemon.
+
+    Deliberately NO catch-up planning here: catch_up one-shots run at daemon
+    start only (:func:`schedule_catch_ups`). A job added or changed by a live
+    reload gets its normal schedule and nothing else. But a PENDING boot
+    catch-up one-shot ("catch-up:<name>") holds the OLD runner closure, so a
+    removed or changed job takes its one-shot down with it — otherwise a job
+    deleted or reworded inside the boot window would still fire once with the
+    stale prompt.
+
+    :data:`RELOAD_JOB_ID` is never touched, in either direction: a jobs-file
+    entry carrying the watcher's reserved name must not replace (or remove)
+    the watcher itself. lite_server's POST /jobs rejects the name too; this
+    guard covers hand-edited files.
+    """
+    applied = []
+
+    def _log(line: str) -> None:
+        applied.append(line)
+        logger.info("reload: %s", line)
+
+    def _drop_catch_up(name: str) -> None:
+        # Pending boot one-shot for this job (schedule_catch_ups id scheme).
+        # Missing is the overwhelmingly common case: catch-ups only exist for
+        # the first minutes after daemon start — a lookup miss stays silent.
+        try:
+            scheduler.remove_job(f"catch-up:{name}")
+        except Exception:
+            return
+        _log(f"dropped pending catch-up for {name}")
+
+    for name in diff["removed"]:
+        if name == RELOAD_JOB_ID:
+            logger.warning("reload: ignoring reserved job name %s", name)
+            continue
+        try:
+            scheduler.remove_job(name)
+        except Exception:  # a lookup miss must not stop the rest of the diff
+            logger.exception("reload: failed to remove job %s", name)
+        else:
+            _log(f"removed job {name}")
+        _drop_catch_up(name)
+
+    for verb, jobs in (("added", diff["added"]), ("rescheduled", diff["changed"])):
+        for job in jobs:
+            if job["name"] == RELOAD_JOB_ID:
+                logger.warning("reload: ignoring reserved job name %s", job["name"])
+                continue
+            try:
+                scheduler.add_job(
+                    make_job_runner(job, base_url, agency, app_token, runs_log),
+                    trigger=_build_aps_trigger(job),
+                    id=job["name"],
+                    name=job["name"],
+                    replace_existing=True,
+                )
+            except Exception:  # one bad registration must not stop the rest
+                logger.exception("reload: failed to register job %s", job["name"])
+            else:
+                _log(f"{verb} job {job['name']} ({job['schedule']})")
+                if verb == "rescheduled":
+                    # the old closure's catch-up must not fire the old config
+                    _drop_catch_up(job["name"])
+
+    return applied
+
+
+def make_reload_checker(scheduler, jobs_file, jobs, base_url, agency, app_token,
+                        runs_log):
+    """Return the zero-arg callable the reload watcher job fires.
+
+    The closure holds the watcher state: the last seen mtime and the last
+    good jobs list. Each call stats *jobs_file*; when the mtime is unchanged it
+    returns immediately (the cheap common case). When it changed, the file is
+    reloaded leniently and rediffed against the last good jobs via
+    :func:`diff_jobs`, and the diff is applied to the live scheduler.
+
+    Failure policy (the old jobs must keep running, and the daemon must never
+    crash):
+      * unreadable/vanished file -> keep everything, warn once until it is
+        back;
+      * file-level load failure (unparseable YAML, wrong top-level shape) ->
+        keep everything, log one line. The failing mtime is consumed, so the
+        line logs once per bad edit instead of every poll; fixing the file
+        bumps the mtime again and reloads;
+      * every job entry invalid (valid file shape, zero salvageable jobs, at
+        least one error) -> treated like a failed load rather than "remove
+        every job": a fat-fingered edit must not silently empty a live
+        scheduler. A genuinely emptied file (zero jobs, zero errors) DOES
+        remove everything — that is what the file says.
+    """
+    try:
+        initial_mtime = os.path.getmtime(jobs_file)
+    except OSError:
+        initial_mtime = None
+    state = {"mtime": initial_mtime, "jobs": list(jobs), "stat_warned": False}
+
+    def check() -> None:
+        try:
+            mtime = os.path.getmtime(jobs_file)
+        except OSError as exc:
+            if not state["stat_warned"]:
+                logger.warning(
+                    "reload: cannot stat jobs file %s (%s); keeping the current "
+                    "%d job(s)",
+                    jobs_file, exc, len(state["jobs"]),
+                )
+                state["stat_warned"] = True  # warn once, not every poll
+            return
+        state["stat_warned"] = False
+        if mtime == state["mtime"]:
+            return
+        state["mtime"] = mtime  # consumed even on failure: log once per edit
+
+        try:
+            new_jobs, errors = load_jobs_lenient(jobs_file)
+        except Exception as exc:
+            logger.error(
+                "reload: jobs file %s failed to load (%s); keeping the old "
+                "%d job(s)",
+                jobs_file, exc, len(state["jobs"]),
+            )
+            return
+        for problem in errors:
+            logger.error("reload: skipping invalid job in %s: %s", jobs_file, problem)
+        if not new_jobs and errors:
+            logger.error(
+                "reload: no valid jobs left in %s; keeping the old %d job(s)",
+                jobs_file, len(state["jobs"]),
+            )
+            return
+
+        applied = apply_jobs_diff(
+            scheduler, diff_jobs(state["jobs"], new_jobs),
+            base_url, agency, app_token, runs_log,
+        )
+        state["jobs"] = new_jobs
+        if applied:
+            logger.info(
+                "reload: applied %d change(s) from %s; %d job(s) now scheduled",
+                len(applied), jobs_file, len(new_jobs),
+            )
+
+    return check
+
+
+def schedule_jobs_reload(scheduler, jobs_file, jobs, base_url, agency, app_token,
+                         runs_log):
+    """Register the interval job that hot-reloads *jobs_file* into *scheduler*.
+
+    The watcher rides the same APScheduler instance as the jobs themselves (no
+    extra thread to manage or shut down). Returns the checker callable so
+    callers and tests can drive a poll directly.
+    """
+    from apscheduler.triggers.interval import IntervalTrigger
+
+    seconds = resolve_jobs_reload_secs()
+    checker = make_reload_checker(
+        scheduler, jobs_file, jobs, base_url, agency, app_token, runs_log
+    )
+    scheduler.add_job(
+        checker,
+        trigger=IntervalTrigger(seconds=seconds),
+        id=RELOAD_JOB_ID,
+        name=RELOAD_JOB_ID,
+        replace_existing=True,
+    )
+    logger.info("watching %s for changes every %ds", jobs_file, seconds)
+    return checker
 
 
 def main() -> int:
@@ -510,6 +757,8 @@ def main() -> int:
 
     scheduler = build_scheduler(jobs, base_url, agency, app_token, runs_log)
     schedule_catch_ups(scheduler, jobs, base_url, agency, app_token, runs_log)
+    schedule_jobs_reload(scheduler, jobs_file, jobs, base_url, agency, app_token,
+                         runs_log)
 
     def _stop(signum, _frame):
         logger.info("received signal %s; shutting down", signum)

@@ -797,6 +797,16 @@
   }
   restoreFromStore();
 
+  // Externally registered widget types (the Phase B modules) load AFTER this
+  // file, so the restore pass above skips their persisted records — and any
+  // later persist() rebuilds the store from live instances only, silently
+  // erasing the skipped records. core.js emits 'widget:registered' on every
+  // registerWidget call; re-running the idempotent restore per registration
+  // re-mounts those records no matter which module loads last (previously
+  // only widget-heartbeat's trailing rescue call happened to cover this, a
+  // single point of failure on the orchestrator's script order).
+  A.bus.on('widget:registered', () => restoreFromStore());
+
   // ── in-place board switch (round 14) ───────────────────────────────────────
   // Nothing to flush here: unlike apps.js / customization.js, every persist()
   // in this module is synchronous (spawn, drag mouseup, cards:rearranged,

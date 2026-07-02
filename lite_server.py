@@ -543,6 +543,71 @@ async def runs(limit: int = 20):
     return {"runs": [r for r in records if isinstance(r, dict)]}
 
 
+def _interval_anchor(last_run_ts, now):
+    """The job's newest ledger fire as an aware datetime <= now, or None.
+
+    The ledger writes naive local ISO timestamps (run_store.build_record gets
+    datetime.now().isoformat()); a naive parse is localized. Unparsable or
+    future (clock skew) timestamps are ignored — the caller falls back to the
+    unanchored trigger.
+    """
+    if not last_run_ts:
+        return None
+    try:
+        anchor = datetime.datetime.fromisoformat(str(last_run_ts))
+    except ValueError:
+        return None
+    if anchor.tzinfo is None:
+        anchor = anchor.astimezone()
+    return anchor if anchor <= now else None
+
+
+def _fire_times(job: dict, last_run_ts=None) -> tuple:
+    """``(next_fire, fire_after)`` for one job dict, or ``(None, None)``.
+
+    Builds the SAME trigger the scheduler daemon builds (jobs_core.build_trigger
+    -> CronTrigger / IntervalTrigger, see scheduler.build_scheduler), asks it
+    for the next fire after now, then feeds that fire back in as the previous
+    one to get the fire after that. Values are ISO local-time strings at
+    seconds precision (with the UTC offset the triggers' aware datetimes
+    carry). Wrapped per job: a bad or never-firing schedule yields nulls and
+    can never 500 the route or disturb the other jobs' entries.
+
+    For an interval job the daemon anchors the cadence at its own start time,
+    which this process cannot know. The closest in-process proxy is the job's
+    newest runs-ledger fire (``last_run_ts``): anchoring the trigger's
+    start_date there makes next_fire the real fire + N*interval — exact once
+    the job has fired under the running daemon, and STABLE across requests
+    (a fresh unanchored IntervalTrigger re-anchors at construction, so every
+    request would report now + interval and a countdown that never advances).
+    A job with no ledger history falls back to now + interval; fire_after is
+    one interval later either way, so the spacing is always real.
+    """
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.triggers.interval import IntervalTrigger
+
+        spec = jobs_core.build_trigger(job)
+        now = datetime.datetime.now().astimezone()
+        if spec["type"] == "interval":
+            trigger = IntervalTrigger(
+                seconds=spec["seconds"],
+                start_date=_interval_anchor(last_run_ts, now),
+            )
+        else:
+            trigger = CronTrigger(**spec["fields"])
+        next_fire = trigger.get_next_fire_time(None, now)
+        if next_fire is None:
+            return None, None
+        fire_after = trigger.get_next_fire_time(next_fire, next_fire)
+    except Exception:  # noqa: BLE001 - a bad schedule yields nulls, never a 500
+        return None, None
+    return (
+        next_fire.isoformat(timespec="seconds"),
+        fire_after.isoformat(timespec="seconds") if fire_after else None,
+    )
+
+
 @app.get("/jobs")
 async def jobs():
     path = _jobs_file()
@@ -550,13 +615,275 @@ async def jobs():
         loaded = jobs_core.load_jobs(path)
     except Exception as exc:  # noqa: BLE001 - missing/malformed file, never 500
         return {"jobs": [], "file": path, "error": str(exc)}
-    return {"jobs": loaded, "file": path}
+    # Newest ledger fire per job name — the interval-cadence anchor for
+    # _fire_times (records come back oldest-first, so the last write wins).
+    # _run_records degrades to [] on any read failure, keeping never-500.
+    last_runs: dict = {}
+    for record in _run_records():
+        if isinstance(record, dict) and record.get("name") and record.get("ts"):
+            last_runs[str(record["name"])] = str(record["ts"])
+    out = []
+    for job in loaded:
+        entry = dict(job)
+        entry["next_fire"], entry["fire_after"] = _fire_times(
+            job, last_runs.get(str(job.get("name")))
+        )
+        out.append(entry)
+    return {"jobs": out, "file": path}
 
 
 @app.get("/notifications")
 async def notifications(limit: int = 20):
     records = _notification_records(limit=_clamp_limit(limit))
     return {"notifications": [n for n in records if isinstance(n, dict)]}
+
+
+@app.get("/campaigns")
+async def campaigns(limit: int = 20):
+    """The stored campaign entries, newest first. Read-only, never 500s.
+
+    Filters the SAME _memory_entries() source /metrics counts by, down to
+    kind == "campaign". Stored entry shape (written by campaign_core.
+    save_campaign, the store CampaignStatus reads back): {"ts", "kind":
+    "campaign", "text": <the goal>, "project", "id", "campaign": {"id",
+    "goal", "project", "brief", "stage", "created_ts", "deliverables":
+    [{"type", "spec", "status", "path", "verdict"}]}}. Entries pass through
+    verbatim — they are locally produced by the campaign tools — and the
+    store is append-only, so the last entry is the newest.
+    """
+    entries = [
+        e
+        for e in _memory_entries()
+        if isinstance(e, dict) and e.get("kind") == "campaign"
+    ]
+    entries.reverse()  # append-only store: newest last -> newest first
+    return {"campaigns": entries[: _clamp_limit(limit)]}
+
+
+# --- Jobs editing endpoints (POST /jobs + DELETE /jobs/{name}) -------------------
+#
+# Token-gated writes (POST/DELETE -> the middleware) against the USER jobs
+# file only: with SWARM_JOBS_FILE unset, _jobs_file() falls back to files
+# inside the repo checkout, and editing those would silently mutate the
+# install — both routes refuse with 409 instead. The write path round-trips
+# the loaded YAML structure and only ever touches the one edited/deleted
+# entry, so unknown keys — and even invalid sibling jobs the daemon's lenient
+# loader skips — survive an edit untouched (yaml comments are the one
+# accepted loss). The edited entry is validated with the SAME
+# jobs_core.validate_job the scheduler daemon applies at load time, so
+# nothing this route accepts can later fail to schedule.
+
+# The two job shapes the editor can write; "builtin:digest" maps to the job
+# dict {"builtin": "digest"} (see jobs_core.BUILTIN_JOBS).
+_JOB_TYPES = ("prompt", "builtin:digest")
+
+# The scheduler daemon's internal APScheduler ids live in the same id
+# namespace as user job names (add_job(id=job["name"])), so these are
+# rejected as job names. Mirrors scheduler.scheduler.RELOAD_JOB_ID and the
+# schedule_catch_ups "catch-up:<name>" one-shot ids; hardcoded here rather
+# than imported so the web process never pulls in the daemon module.
+_RELOAD_JOB_ID = "__jobs-file-reload__"
+_CATCH_UP_PREFIX = "catch-up:"
+
+
+class JobUpsertRequest(BaseModel):
+    # Defaults keep shape problems inside the handler's own 400 path (with
+    # human-readable reasons) instead of FastAPI's 422 for absent fields.
+    name: str = ""
+    schedule: str = ""
+    prompt: str = ""
+    type: str = "prompt"
+
+
+def _user_jobs_file() -> str | None:
+    """The user-configured jobs file, or None on the (read-only) repo fallback."""
+    return os.getenv("SWARM_JOBS_FILE") or None
+
+
+def _load_jobs_doc(path: str) -> tuple:
+    """The raw parsed YAML jobs document, round-trip friendly.
+
+    Returns ``(doc, raw_jobs)`` where raw_jobs is the mutable list INSIDE doc,
+    so in-place edits write back through doc without re-serializing any other
+    entry. A missing or empty file starts the seed template's shape
+    ({"jobs": []}); a file that will not parse, or whose top level is neither
+    a list nor a mapping with a "jobs:" list, raises ValueError. Any OSError
+    other than "file not found" propagates: a momentarily unreadable file
+    (permissions, EIO) still HOLDS the user's jobs, and starting an empty doc
+    here would let the caller's atomic write (which only needs directory
+    write permission) replace the whole file with just the edited entry.
+    """
+    import yaml
+
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        doc: dict = {"jobs": []}
+        return doc, doc["jobs"]
+    try:
+        data = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"jobs file could not be parsed: {exc}") from exc
+    if data is None:
+        doc = {"jobs": []}
+        return doc, doc["jobs"]
+    if isinstance(data, list):
+        return data, data
+    if isinstance(data, dict) and "jobs" in data:
+        if data["jobs"] is None:  # a bare "jobs:" line
+            data["jobs"] = []
+        if isinstance(data["jobs"], list):
+            return data, data["jobs"]
+    raise ValueError(
+        "jobs file must be a YAML list of jobs (or a mapping with a 'jobs:' list)"
+    )
+
+
+def _write_jobs_doc(path: str, doc) -> None:
+    """Atomic write (tmp + os.replace), the same pattern as save_settings."""
+    import yaml
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(
+        yaml.safe_dump(doc, sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
+    os.replace(tmp, target)
+
+
+def _raw_name_matches(item, name: str) -> bool:
+    """True when a raw yaml entry's name matches ``name`` as load_jobs sees it
+    (validate_job strips string fields, so match on the stripped form)."""
+    return isinstance(item, dict) and str(item.get("name") or "").strip() == name
+
+
+@app.post("/jobs")
+async def upsert_job(req: JobUpsertRequest):
+    """Create or update one job by name. Token-gated (POST).
+
+    400 {"error": reason} on anything invalid; 409 when no user jobs file is
+    configured (the repo fallback must never be written).
+    """
+    path = _user_jobs_file()
+    if path is None:
+        return JSONResponse(
+            {"error": "no user jobs file configured"}, status_code=409
+        )
+
+    name = req.name.strip()
+    if not name:
+        return JSONResponse({"error": "name must not be empty"}, status_code=400)
+    if len(name) > 100:
+        return JSONResponse(
+            {"error": "name too long (max 100 characters)"}, status_code=400
+        )
+    if "\n" in name or "\r" in name:
+        return JSONResponse(
+            {"error": "name must not contain newlines"}, status_code=400
+        )
+    if "/" in name:
+        # DELETE /jobs/{name} is a single path segment (and starlette decodes
+        # %2F before routing), so a name with a slash could never be deleted
+        # through the API again.
+        return JSONResponse(
+            {"error": "name must not contain '/'"}, status_code=400
+        )
+    if name == _RELOAD_JOB_ID or name.startswith(_CATCH_UP_PREFIX):
+        # The daemon's internal APScheduler ids share the user-job namespace:
+        # a job named after the hot-reload watcher would REPLACE it on the
+        # next reload (killing hot reload until daemon restart), and the
+        # "catch-up:" prefix collides with the boot catch-up one-shots. See
+        # scheduler/scheduler.py (RELOAD_JOB_ID, schedule_catch_ups).
+        return JSONResponse(
+            {"error": "name is reserved for scheduler-internal jobs"},
+            status_code=400,
+        )
+    if req.type not in _JOB_TYPES:
+        return JSONResponse(
+            {"error": 'type must be "prompt" or "builtin:digest"'}, status_code=400
+        )
+    if req.type == "prompt" and not req.prompt.strip():
+        return JSONResponse(
+            {"error": 'prompt is required for a "prompt" job'}, status_code=400
+        )
+
+    try:
+        doc, raw_jobs = _load_jobs_doc(path)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except OSError as exc:
+        # Unreadable (NOT missing) file: refuse rather than rebuild from empty.
+        return JSONResponse(
+            {"error": f"could not read jobs file: {exc}"}, status_code=500
+        )
+
+    # Merge into a copy of the entry being replaced (first match wins, same as
+    # the daemon's lenient loader) so fields the form does not carry —
+    # catch_up, agent, endpoint — ride through the edit instead of being
+    # silently dropped. Switching type swaps the payload field (a job carries
+    # exactly one of prompt|builtin).
+    index = next(
+        (i for i, item in enumerate(raw_jobs) if _raw_name_matches(item, name)),
+        None,
+    )
+    merged = dict(raw_jobs[index]) if index is not None else {}
+    merged["name"] = name
+    merged["schedule"] = req.schedule
+    if req.type == "prompt":
+        merged["prompt"] = req.prompt
+        merged.pop("builtin", None)
+    else:
+        merged["builtin"] = "digest"
+        merged.pop("prompt", None)
+
+    try:
+        job = jobs_core.validate_job(merged)
+    except (TypeError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    if index is None:
+        raw_jobs.append(job)
+    else:
+        raw_jobs[index] = job
+    try:
+        _write_jobs_doc(path, doc)
+    except OSError as exc:
+        return JSONResponse(
+            {"error": f"could not write jobs file: {exc}"}, status_code=500
+        )
+    return {"ok": True, "job": job}
+
+
+@app.delete("/jobs/{name}")
+async def delete_job(name: str):
+    """Remove every job entry matching ``name`` exactly. Token-gated (DELETE).
+
+    {"ok": true} when something was removed; {"ok": false} for an unknown
+    name, a missing file, or an unparseable one (nothing was removed in any
+    of those cases); 409 with no user jobs file configured, same as POST.
+    """
+    path = _user_jobs_file()
+    if path is None:
+        return JSONResponse(
+            {"error": "no user jobs file configured"}, status_code=409
+        )
+    try:
+        doc, raw_jobs = _load_jobs_doc(path)
+    except (ValueError, OSError):
+        # Unparseable or unreadable-but-present file: nothing was removed, and
+        # rebuilding from an empty doc would wipe the user's other jobs.
+        return {"ok": False}
+    kept = [item for item in raw_jobs if not _raw_name_matches(item, name)]
+    if len(kept) == len(raw_jobs):
+        return {"ok": False}
+    raw_jobs[:] = kept  # in place, so the write goes back through doc
+    try:
+        _write_jobs_doc(path, doc)
+    except OSError:
+        return {"ok": False}
+    return {"ok": True}
 
 
 # --- Run-log endpoint (read-only tail of the desktop backend log) ---------------

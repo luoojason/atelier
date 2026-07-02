@@ -378,6 +378,13 @@ ipcMain.handle('atelier:capture-page', async (event, rect) => {
   }
 });
 
+// atelier:scheduler-status — is the scheduler daemon sidecar alive? Read from
+// the same schedulerProc handle start/kill maintain; pid null when down.
+ipcMain.handle('atelier:scheduler-status', () => ({
+  running: !!schedulerProc,
+  pid: schedulerProc ? schedulerProc.pid : null,
+}));
+
 // ── boot ────────────────────────────────────────────────────────────────────
 
 // Single-instance lock: a second launch must not spawn a second backend that

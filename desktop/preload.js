@@ -40,6 +40,10 @@ contextBridge.exposeInMainWorld('atelier', {
   // devicePixelRatio) -> 480px-wide JPEG(70) data URL, or null on ANY failure.
   capturePage: (rect) =>
     ipcRenderer.invoke('atelier:capture-page', rect).catch(() => null),
+  // Scheduler daemon liveness -> { running, pid } from main's schedulerProc
+  // handle; null on ANY failure (same never-reject idiom as capturePage).
+  schedulerStatus: () =>
+    ipcRenderer.invoke('atelier:scheduler-status').catch(() => null),
   // main.js denies tab-disposition popups from browser-card webviews and sends
   // them here as { url }; apps.js opens each as a tab in a browser card.
   onWebviewNewWindow: (cb) =>

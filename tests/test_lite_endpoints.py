@@ -217,10 +217,175 @@ def test_jobs_seeded(env, client):
     body = client.get("/jobs").json()
     assert body["file"] == str(env / "jobs.yaml")
     assert "error" not in body
-    assert body["jobs"] == [
-        {"name": "daily-brief", "schedule": "0 9 * * *",
-         "prompt": "Summarize the day"},
-    ]
+    assert len(body["jobs"]) == 1
+    job = body["jobs"][0]
+    # The computed fire times ride on each item; the rest passes through.
+    next_fire = job.pop("next_fire")
+    fire_after = job.pop("fire_after")
+    assert job == {
+        "name": "daily-brief", "schedule": "0 9 * * *",
+        "prompt": "Summarize the day",
+    }
+    assert isinstance(next_fire, str) and isinstance(fire_after, str)
+
+
+# --------------------------------------------------------------------------- #
+# /jobs next_fire + fire_after
+# --------------------------------------------------------------------------- #
+
+
+def test_jobs_next_fire_cron(env, client):
+    (env / "jobs.yaml").write_text(
+        "- name: daily\n"
+        '  schedule: "0 9 * * *"\n'
+        "  prompt: p\n",
+        encoding="utf-8",
+    )
+    job = client.get("/jobs").json()["jobs"][0]
+    next_fire = datetime.datetime.fromisoformat(job["next_fire"])
+    fire_after = datetime.datetime.fromisoformat(job["fire_after"])
+    now = datetime.datetime.now().astimezone()
+    assert now < next_fire < fire_after
+    # Daily cron: consecutive fires are one day apart (23-25h tolerates DST).
+    gap = (fire_after - next_fire).total_seconds()
+    assert 23 * 3600 <= gap <= 25 * 3600
+    assert next_fire.hour == 9 and next_fire.minute == 0
+
+
+def test_jobs_next_fire_interval(env, client):
+    (env / "jobs.yaml").write_text(
+        "- name: often\n"
+        '  schedule: "30m"\n'
+        "  prompt: p\n",
+        encoding="utf-8",
+    )
+    job = client.get("/jobs").json()["jobs"][0]
+    next_fire = datetime.datetime.fromisoformat(job["next_fire"])
+    fire_after = datetime.datetime.fromisoformat(job["fire_after"])
+    # The interval cadence is exact: fires are one interval apart.
+    assert (fire_after - next_fire).total_seconds() == 30 * 60
+
+
+def test_jobs_interval_next_fire_anchors_to_last_ledger_run(env, client):
+    # The daemon anchors an interval cadence at ITS start time; the closest
+    # in-process proxy is the job's newest ledger fire. Anchored next_fire is
+    # the anchor plus a whole number of intervals — and STABLE across
+    # requests (a per-request re-anchor would read now + interval forever and
+    # the schedring countdown would never advance).
+    (env / "jobs.yaml").write_text(
+        "- name: often\n"
+        '  schedule: "30m"\n'
+        "  prompt: p\n",
+        encoding="utf-8",
+    )
+    last_run = (
+        datetime.datetime.now() - datetime.timedelta(minutes=45)
+    ).replace(microsecond=0)
+    _write_jsonl(
+        env / "runs.jsonl",
+        [_run_record("often", last_run.isoformat()),
+         _run_record("other-job", TODAY_TS)],
+    )
+    job = client.get("/jobs").json()["jobs"][0]
+    next_fire = datetime.datetime.fromisoformat(job["next_fire"])
+    # 45 minutes past the anchor: the cadence's next fire is anchor + 60m.
+    assert next_fire == (last_run + datetime.timedelta(minutes=60)).astimezone()
+    fire_after = datetime.datetime.fromisoformat(job["fire_after"])
+    assert (fire_after - next_fire) == datetime.timedelta(minutes=30)
+    # A second request reports the SAME instant.
+    again = client.get("/jobs").json()["jobs"][0]
+    assert again["next_fire"] == job["next_fire"]
+
+
+def test_jobs_bad_schedule_yields_nulls_others_unaffected(env, client, monkeypatch):
+    # load_jobs validates schedules at the file level, so a per-job failure
+    # can only come from trigger construction itself — simulate one by
+    # feeding the route a job list directly.
+    monkeypatch.setattr(
+        lite_server.jobs_core,
+        "load_jobs",
+        lambda path: [
+            {"name": "bad", "schedule": "not a schedule", "prompt": "p"},
+            {"name": "good", "schedule": "30m", "prompt": "p"},
+        ],
+    )
+    resp = client.get("/jobs")
+    assert resp.status_code == 200
+    jobs = {j["name"]: j for j in resp.json()["jobs"]}
+    assert jobs["bad"]["next_fire"] is None
+    assert jobs["bad"]["fire_after"] is None
+    assert jobs["good"]["next_fire"] is not None
+    assert jobs["good"]["fire_after"] is not None
+
+
+# --------------------------------------------------------------------------- #
+# /campaigns
+# --------------------------------------------------------------------------- #
+
+
+def _campaign_entry(cid, goal, ts):
+    """A stored campaign entry, shaped like campaign_core.save_campaign's."""
+    return {
+        "ts": ts,
+        "kind": "campaign",
+        "text": goal,
+        "project": None,
+        "id": cid,
+        "campaign": {
+            "id": cid,
+            "goal": goal,
+            "project": None,
+            "brief": None,
+            "deliverables": [
+                {"type": "post", "spec": "s", "status": "planned",
+                 "path": None, "verdict": None},
+            ],
+            "stage": "planned",
+            "created_ts": ts,
+        },
+    }
+
+
+def test_campaigns_empty_shape(env, client):
+    resp = client.get("/campaigns")
+    assert resp.status_code == 200
+    assert resp.json() == {"campaigns": []}
+
+
+def test_campaigns_corrupt_memory_never_500(env, client):
+    (env / "swarm_memory.json").write_text("{not json", encoding="utf-8")
+    resp = client.get("/campaigns")
+    assert resp.status_code == 200
+    assert resp.json() == {"campaigns": []}
+
+
+def test_campaigns_filters_newest_first_verbatim(env, client):
+    older = _campaign_entry("c1", "first goal", OLD_TS)
+    newer = _campaign_entry("c2", "second goal", TODAY_TS)
+    (env / "swarm_memory.json").write_text(
+        json.dumps(
+            [
+                {"ts": OLD_TS, "kind": "note", "text": "a fact"},
+                older,
+                {"ts": TODAY_TS, "kind": "brief", "text": "a brief"},
+                newer,
+            ]
+        ),
+        encoding="utf-8",
+    )
+    body = client.get("/campaigns").json()
+    # Only kind == "campaign", newest (appended last) first, verbatim.
+    assert body["campaigns"] == [newer, older]
+
+
+def test_campaigns_limit(env, client):
+    entries = [_campaign_entry(f"c{i}", f"goal {i}", TODAY_TS) for i in range(25)]
+    (env / "swarm_memory.json").write_text(json.dumps(entries), encoding="utf-8")
+    body = client.get("/campaigns").json()
+    assert len(body["campaigns"]) == 20  # default limit
+    assert body["campaigns"][0]["id"] == "c24"  # newest first
+    body = client.get("/campaigns?limit=2").json()
+    assert [c["id"] for c in body["campaigns"]] == ["c24", "c23"]
 
 
 def test_notifications_seeded(env, client):

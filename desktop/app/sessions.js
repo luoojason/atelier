@@ -63,6 +63,25 @@
    r15 note-clobbering rule stays (the link-status note yields to any note
    text, including these).
 
+   Sessions accessor (round 17): window.AtelierSessions = { reveal(id, name) }
+   is the small cross-module surface other modules (the agent-orbs widget's
+   orb click) use to jump to a session's card. A card already on canvas is
+   raised through core's own bringToFront path — a synthetic NON-BUBBLING
+   mousedown dispatched on the card element, which core listens on directly;
+   the bar's drag handler (a child) never sees a target-dispatched event, and
+   the canvas pan/marquee handlers are out of the propagation path — then
+   flashed with a 1s accent outline (injected class, restartable via a reflow
+   between back-to-back reveals). An unknown id spawns an ATTACHED card at
+   canvas center: createAgentCard(null, {id, name, parentEl: null}). Verified:
+   the attach path never reads attach.parentEl (only the discovery sweep uses
+   parentEl, for positioning + arrows), and a null worldPos already falls back
+   to canvas center — parentEl: null needs no fix. The revealed card is the
+   standard attach-mode live view onto the EXISTING backend session: no
+   POST /sessions, no recreate on 404, same close semantics as any agent
+   card. An explicit reveal also clears the id from dismissedSessions — that
+   set only exists to stop the background sweep from resurrecting
+   user-closed children, and a user click is fresh intent.
+
    Dock note: core.js's dock handler would spawn any registered type by
    lowercased button title, but apps.js CLONE-REPLACES every .dock-btn at load
    (stripping core's listeners) and its replacement handler only knows its own
@@ -152,7 +171,16 @@
       ask again → the browser stays put and the note explains no browser is
       linked (shift-drag a box around a browser card and this card). Without
       app/link.js or app/apps.js loaded, sends and polls behave as before.
-  14. Console shows "[sessions] self-check passed" and no assert failures.
+  15. Accessor (round 17): with an Agent card open, run in the console
+      AtelierSessions.reveal(<that card's session id>) → the card jumps to
+      the front (core's bringToFront) and flashes a 1s accent outline; no
+      drag starts and the canvas does not pan. Now curl-create a session the
+      canvas does not know (curl -X POST 127.0.0.1:8765/sessions) and reveal
+      ITS id → an attached card (hollow dot) spawns at canvas center,
+      flashes, and streams the session's transcript via the normal poll;
+      closing it DELETEs the backend session like any agent card. Reveal the
+      same open card twice in a row → the outline flash restarts both times.
+  16. Console shows "[sessions] self-check passed" and no assert failures.
    =========================================================================== */
 
 (function () {
@@ -215,6 +243,11 @@
       .atl-agent-send:disabled { opacity: 0.5; }
       .atl-agent-subdot { background: #fff; border: 2px solid var(--accent);
         box-sizing: border-box; }
+      .atl-agent-reveal { animation: atl-agent-reveal-flash 1s ease-out; }
+      @keyframes atl-agent-reveal-flash {
+        0%, 55% { outline: 3px solid var(--accent); outline-offset: 3px; }
+        100% { outline: 3px solid rgba(192, 92, 55, 0); outline-offset: 3px; }
+      }
     `;
     const style = document.createElement('style');
     style.id = 'atl-sessions-styles';
@@ -331,7 +364,11 @@
   // ── one agent card ─────────────────────────────────────────────────────────
   // attach = null (fresh card: creates its own backend session) or
   // {id, name, parentEl} (sub-agent reveal: a view onto an EXISTING session —
-  // no POST /sessions, transcript arrives via the first poll).
+  // no POST /sessions, transcript arrives via the first poll). parentEl is
+  // caller-side metadata only — the sweep uses it to compute the child's
+  // position and draw the arrow BEFORE/AFTER this call; nothing in here reads
+  // it, so AtelierSessions.reveal passes parentEl: null and a null worldPos
+  // lands on the canvas-center fallback below (verified — no fix needed).
   function createAgentCard(worldPos, attach) {
     const attached = !!(attach && attach.id);
     let name;
@@ -723,6 +760,56 @@
     create(worldPos) { return createAgentCard(worldPos); },
   });
 
+  // ── public accessor: window.AtelierSessions (round 17) ────────────────────
+  // reveal(sessionId, name) — jump to a session's card. Known id: raise +
+  // flash the live card. Unknown id: spawn an attached view at canvas center.
+  // Consumers (widget-orbs' orb click) must guard on window.AtelierSessions —
+  // this module may be absent from a stripped-down page.
+  function flashReveal(el) {
+    // restart the outline animation even when the class is still on from a
+    // reveal moments ago: drop it, force one reflow, re-add
+    el.classList.remove('atl-agent-reveal');
+    void el.offsetWidth;
+    el.classList.add('atl-agent-reveal');
+    const onEnd = (e) => {
+      if (e.animationName !== 'atl-agent-reveal-flash') return; // child anims bubble
+      el.classList.remove('atl-agent-reveal');
+      el.removeEventListener('animationend', onEnd);
+    };
+    el.addEventListener('animationend', onEnd);
+  }
+
+  window.AtelierSessions = {
+    reveal(sessionId, name) {
+      const id = String(sessionId == null ? '' : sessionId);
+      if (!id) return null;
+      const existing = cardBySession.get(id);
+      if (existing) {
+        // raise through core's own path: core listens for mousedown on the
+        // card element itself (bringToFront). Non-bubbling on purpose — the
+        // bar's drag handler sits on a CHILD (never sees a target dispatch)
+        // and the canvas pan/marquee handlers stay out of the picture.
+        existing.dispatchEvent(new MouseEvent('mousedown'));
+        flashReveal(existing);
+        return existing;
+      }
+      // an explicit reveal is fresh user intent: lift the sweep-suppression
+      // flag a past close may have left (see dismissedSessions), or the
+      // discovery sweep would fight this card's re-tracking
+      dismissedSessions.delete(id);
+      // attach path: live view onto the existing backend session — no
+      // POST /sessions, 404 renders the expired note instead of recreating.
+      // null worldPos -> canvas-center fallback; parentEl is never read.
+      const el = createAgentCard(null, {
+        id,
+        name: String(name || 'Agent'),
+        parentEl: null,
+      });
+      if (el) flashReveal(el);
+      return el;
+    },
+  };
+
   // ── dock wiring (see header: apps.js stripped core's dock handler) ────────
   (function wireDock() {
     const btn = Array.from(document.querySelectorAll('.dock-btn'))
@@ -762,9 +849,18 @@
        typeof A.links.browserElFor === 'function');
     console.assert(linksOk,
       '[sessions] Atelier.links present but missing browserFor()/browserElFor()');
-    if (registered && btn && sweepIdle && linksOk) {
+    // r17 accessor: the surface widget-orbs guards on must exist with the
+    // exact shape the contract names, and the flash class must be injected
+    const accessorOk = !!window.AtelierSessions
+      && typeof window.AtelierSessions.reveal === 'function';
+    console.assert(accessorOk, '[sessions] AtelierSessions.reveal missing');
+    const flashCssOk = /atl-agent-reveal-flash/
+      .test((document.getElementById('atl-sessions-styles') || {}).textContent || '');
+    console.assert(flashCssOk, '[sessions] reveal flash keyframes not injected');
+    if (registered && btn && sweepIdle && linksOk && accessorOk && flashCssOk) {
       console.log('[sessions] self-check passed — agent app registered, '
-        + 'dock wired, child sweep idle, links access guarded.');
+        + 'dock wired, child sweep idle, links access guarded, '
+        + 'AtelierSessions.reveal published.');
     }
   })();
 })();
