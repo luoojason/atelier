@@ -433,3 +433,21 @@ def test_session_without_model_uses_global(monkeypatch, client):
     sid = _create(client)["id"]
     client.post(f"/sessions/{sid}/message", json={"message": "hi"})
     assert built[0].options.model == "sonnet"
+
+
+def test_create_accepts_allowlisted_model(client):
+    r = client.post("/sessions", json={"name": "R", "model": "opus"})
+    assert r.status_code == 200
+    assert lite_server._sessions[r.json()["id"]].model == "opus"
+
+
+def test_create_rejects_unknown_model(client):
+    r = client.post("/sessions", json={"model": "gpt-4o"})
+    assert r.status_code == 400
+    assert r.json() == {"error": "unknown model"}
+    assert lite_server._sessions == {}  # nothing created on a rejected model
+
+
+def test_create_without_model_defaults_to_none(client):
+    sid = _create(client)["id"]
+    assert lite_server._sessions[sid].model is None

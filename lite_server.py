@@ -1696,6 +1696,7 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
 
 class SessionCreateRequest(BaseModel):
     name: str | None = None
+    model: str | None = None
 
 
 class SessionMessageRequest(BaseModel):
@@ -1706,12 +1707,18 @@ class SessionMessageRequest(BaseModel):
 
 @app.post("/sessions")
 async def create_session(req: SessionCreateRequest | None = None):
+    # Gate the optional per-session model BEFORE _make_room so a junk value
+    # never evicts an idle card just to be rejected.
+    model = req.model if req else None
+    if model is not None and model not in _ALLOWED_MODELS:
+        return JSONResponse({"error": "unknown model"}, status_code=400)
     # Cap with LRU eviction (see _make_room). All running -> 409.
     if not await _make_room():
         return JSONResponse({"error": "session limit"}, status_code=409)
 
     name = ((req.name if req else None) or "").strip() or f"Agent {next(_session_seq)}"
     sess = _AgentSession(uuid.uuid4().hex, name)
+    sess.model = model
     _sessions[sess.id] = sess
     return {"id": sess.id, "name": sess.name}
 
