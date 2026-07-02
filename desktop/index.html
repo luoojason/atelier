@@ -166,6 +166,11 @@
          printToPDF via the preload bridge) or HTML. Guards window.Atelier so a
          404 stays harmless under defer. -->
     <script defer src="app/document.js"></script>
+    <!-- research.js after document.js: reuses document.js's shared card CSS.
+         The ported deep_research deliverable — a Research card that runs a
+         keyless multi-source research loop and produces a cited HTML report,
+         exportable to PDF/HTML. Guards window.Atelier so a 404 stays harmless. -->
+    <script defer src="app/research.js"></script>
     <script defer src="app/toolinspector.js"></script>
     <script defer src="app/tour.js"></script>
     <!-- Phase B living widgets (each registers one type; widgets.js machinery

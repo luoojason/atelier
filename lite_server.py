@@ -1781,6 +1781,71 @@ def _document_title(html: str) -> str:
     return "document"
 
 
+# --- Deep research deliverable (POST /research) ----------------------------------
+#
+# The OpenSwarm deep_research capability in Atelier's zero-key idiom: a research
+# persona that loops over the KEYLESS WebSearch/WebFetch tools Atelier already
+# ships (no OpenAI-hosted WebSearchTool, no SEARCH_API_KEY ScholarSearch) and
+# emits ONE print-ready, cited HTML report. Unlike /document and /miniapp, this
+# run KEEPS the atelier MCP server but allow-lists ONLY the two web tools (so a
+# research run can read the web but not touch campaigns, the vault, or Notion),
+# and gets a high turn cap for the search→read→synthesize loop.
+
+RESEARCH_INSTRUCTIONS = """You are a rigorous research analyst. Investigate the user's question thoroughly using the WebSearch and WebFetch tools, then write ONE complete, print-ready HTML research report.
+
+Method:
+- Search for multiple independent, credible sources. WebFetch the promising ones and read them before citing. Do not rely on a single source, and never invent facts, quotes, statistics, or URLs — every claim must trace to something you actually fetched.
+- If the tools return nothing usable, say so plainly in the report rather than fabricating.
+
+The report (reply with ONLY the HTML document, nothing before or after it):
+- One complete, self-contained HTML document. Inline CSS only; no scripts, no external resource references, no network image src.
+- Design it as a printed report: white page, readable serif or system body text, clear hierarchy (title + date, an executive summary, sections with headings, bullet/numbered lists, tables where useful), generous margins, `@page` margins and `page-break-inside: avoid` on headings/tables.
+- Cite inline (e.g. bracketed source numbers) and end with a "Sources" section listing each source's title and URL you actually fetched.
+- Write genuinely useful, well-organized findings — this is a real deliverable."""
+
+
+def _research_options() -> ClaudeAgentOptions:
+    """build_options() variant for the research generator: keep the atelier MCP
+    server but allow ONLY the keyless web tools, a research prompt, a high turn
+    cap for the tool loop. build_options() itself stays untouched."""
+    return dataclasses.replace(
+        build_options(),
+        system_prompt=RESEARCH_INSTRUCTIONS,
+        max_turns=30,
+        allowed_tools=["mcp__atelier__WebSearch", "mcp__atelier__WebFetch"],
+        mcp_servers={"atelier": ATELIER_SERVER},
+    )
+
+
+class ResearchRequest(BaseModel):
+    description: str = Field(min_length=3, max_length=4000)
+    title: str | None = Field(default=None, max_length=200)
+
+
+@app.post("/research")
+async def research(req: ResearchRequest):
+    """Run a keyless deep-research turn and return a cited HTML report.
+    Token-gated (POST). {"html","title"} on success, {"error"} on any failure —
+    a failed run never 500s the card."""
+    prompt = req.description
+    if req.title:
+        prompt = f'Report title: "{req.title}"\n\n{req.description}'
+    try:
+        async with ClaudeSDKClient(options=_research_options()) as client:
+            await client.query(prompt)
+            result = await _collect_response(client)
+    except Exception as exc:  # noqa: BLE001 - never 500 the card
+        return {"error": f"research failed: {exc}"}
+    if result.get("error"):
+        return {"error": result["response"]}
+    html = _extract_miniapp_html(result["response"])
+    if html is None:
+        return {"error": "the model did not return a usable HTML report"}
+    if len(html) > _MINIAPP_MAX_CHARS:
+        return {"error": "generated report too large"}
+    return {"html": html, "title": (req.title or _document_title(html))}
+
+
 # --- Multi-card agent sessions ------------------------------------------------
 #
 # Each Agent card in the desktop app owns ONE of these sessions: a fresh
