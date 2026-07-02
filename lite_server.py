@@ -62,6 +62,9 @@ from campaign_agent.tools.CampaignStatus import CampaignStatus
 from scheduler import jobs_core, run_store
 from scheduler import notify as swarm_notify
 
+# Pure stdlib Claude Code transcript readers backing /config + /cc/*.
+import cc_usage
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -243,6 +246,16 @@ app = FastAPI(title="Atelier Lite", lifespan=_lifespan)
 # ATELIER_TOKEN fresh per launch and threads it to the renderer via preload
 # and to both sidecars via spawn env. Token unset (dev uvicorn, plain-browser
 # testing, TestClient) -> the token gate is off and origin gating is the wall.
+#
+# ACCEPTED RISK (security review 2026-07): because "null" is CORS-allowed and
+# read-only GETs are deliberately not token-gated (frozen contract), a hostile
+# page in a browser without strict Private Network Access enforcement
+# (Firefox/Safari today; Chrome blocks via PNA preflight) can READ /config and
+# /cc/* cross-origin via a sandboxed iframe: monthly spend, per-session cost,
+# session ids, and munged project directory names. If that ever becomes
+# unacceptable, token-gate /cc/*+/config when ATELIER_TOKEN is set (the
+# renderer already has the token via preload), or stop returning project
+# directory names from /cc/usage.
 _ORIGIN_RE = r"^(null|file://|https?://(localhost|127\.0\.0\.1)(:\d+)?)$"
 _origin_ok = re.compile(_ORIGIN_RE).match
 _MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
@@ -419,6 +432,96 @@ async def jobs():
 async def notifications(limit: int = 20):
     records = _notification_records(limit=_clamp_limit(limit))
     return {"notifications": [n for n in records if isinstance(n, dict)]}
+
+
+# --- /config + Claude Code usage endpoints (/cc/*) -----------------------------
+#
+# Read-only views over ~/.claude/projects transcripts via cc_usage (ported from
+# cc-dashboard-app aimd/cc). Same conventions as the dashboard endpoints above:
+# fixed shapes, degrade to empty shapes, never 500. Unlike the tiny ledgers,
+# a cold transcript sweep can chew through hundreds of MB of JSONL, so every
+# /cc reader runs in a worker thread (asyncio.to_thread) instead of blocking
+# the event loop under /chat/stream; cc_usage's (path, mtime, size) cache
+# makes warm hits stat-only.
+
+# Session ids are uuid/hex-ish transcript filenames. Anything outside this
+# alphabet (dots, slashes, %-escapes already decoded by the router) is rejected
+# before it can touch the filesystem, so {id} can never traverse.
+# fullmatch + \Z (not $): $ would also match before a trailing newline, letting
+# '/cc/usage/abc%0A' through validation with session_id='abc\n'.
+_CC_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]+\Z")
+
+
+@app.get("/config")
+async def config():
+    """Effective backend configuration for the Settings view.
+
+    NEVER the token value — only whether one is set.
+    """
+    token_present = bool(os.getenv("ATELIER_TOKEN", ""))
+    try:
+        max_turns = int(os.getenv("ATELIER_MAX_TURNS", "40"))
+    except ValueError:
+        max_turns = 40
+    return {
+        "model": _resolved_model(),
+        "max_turns": max_turns,
+        # lite_server neither spawns nor monitors the scheduler sidecar
+        # (main.js does), so it cannot honestly know whether it is running:
+        # null = "unknown" and the UI renders it as such.
+        "scheduler": {"running": None},
+        "jobs_file": os.getenv("SWARM_JOBS_FILE") or "",
+        "auth_mode": "token" if token_present else "origin-gate",
+        "token_present": token_present,
+    }
+
+
+@app.get("/cc/status")
+async def cc_status():
+    try:
+        return await asyncio.to_thread(cc_usage.status_summary)
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        return cc_usage.empty_status()
+
+
+@app.get("/cc/usage")
+async def cc_usage_list(limit: int = 20):
+    try:
+        return await asyncio.to_thread(cc_usage.recent_sessions, _clamp_limit(limit))
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        return []
+
+
+@app.get("/cc/usage/{session_id}")
+async def cc_usage_detail(session_id: str):
+    if not _CC_SESSION_ID_RE.fullmatch(session_id):
+        # Invalid id: the empty shape, with the hostile string NOT echoed back.
+        return cc_usage.empty_session_detail("")
+    try:
+        data = await asyncio.to_thread(cc_usage.session_detail, session_id)
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        data = cc_usage.empty_session_detail(session_id)
+    if data is None:  # valid id, no such transcript
+        return JSONResponse(
+            cc_usage.empty_session_detail(session_id), status_code=404
+        )
+    return data
+
+
+@app.get("/cc/aggregate")
+async def cc_aggregate():
+    try:
+        return await asyncio.to_thread(cc_usage.aggregate_summary)
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        return cc_usage.empty_aggregate()
+
+
+@app.get("/cc/heatmap")
+async def cc_heatmap():
+    try:
+        return await asyncio.to_thread(cc_usage.heatmap_summary)
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        return cc_usage.empty_heatmap()
 
 
 @app.post("/chat")

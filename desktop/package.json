@@ -22,7 +22,8 @@
       "preload.js",
       "index.html",
       "app/**/*",
-      "styles.css"
+      "styles.css",
+      "vendor/**/*"
     ],
     "extraResources": [
       {
@@ -35,6 +36,7 @@
         "to": "backend",
         "filter": [
           "lite_server.py",
+          "cc_usage.py",
           "config.py",
           "claude_subscription_model.py",
           "helpers.py",

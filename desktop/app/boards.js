@@ -177,6 +177,16 @@
     Object.keys(collectLiveScoped()).forEach((k) => localStorage.removeItem(k));
   }
 
+  // A view can be OPEN while we snapshot outside a real switch (duplicate,
+  // export) — a real switch always nulls 'view.current' first (views.js
+  // closes on 'boards:will-switch'), so a snapshot that carries an open view
+  // would auto-reopen it when the copy is later restored. Normalize to the
+  // JSON null the store convention uses.
+  function scrubViewKey(snap) {
+    if ('atelier:view.current' in snap) snap['atelier:view.current'] = 'null';
+    return snap;
+  }
+
   function restoreSnapshot(boardId) {
     let snap = null;
     try { snap = JSON.parse(localStorage.getItem(stateKey(boardId)) || 'null'); }
@@ -326,7 +336,7 @@
     try {
       if (id === activeId()) {
         try { await captureThumb(); } catch {}       // freshen the thumb we're about to copy
-        localStorage.setItem(stateKey(nid), JSON.stringify(collectLiveScoped()));
+        localStorage.setItem(stateKey(nid), JSON.stringify(scrubViewKey(collectLiveScoped())));
       } else {
         const raw = localStorage.getItem(stateKey(id));
         if (raw != null) localStorage.setItem(stateKey(nid), raw);
@@ -382,7 +392,9 @@
       // debounced saves first, exactly like switch-away does (they listen on
       // 'boards:will-switch' and persist+disarm; the payload is ignored).
       try { A.bus.emit('boards:will-switch', { to: b.id, reason: 'export' }); } catch {}
-      state = collectLiveScoped();
+      // views.js deliberately ignores reason:'export' (the view stays open),
+      // so the live 'view.current' may be set — scrub it like duplicate does.
+      state = scrubViewKey(collectLiveScoped());
     } else {
       try {
         const snap = JSON.parse(localStorage.getItem(stateKey(b.id)) || 'null');

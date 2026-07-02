@@ -138,5 +138,11 @@
          missing file 404s harmlessly under defer and must not break boot. -->
     <script defer src="app/boards.js"></script>
     <script defer src="app/sessions.js"></script>
+    <!-- Analytics stack: vendored Chart.js, then the views overlay system,
+         then the analytics views. Any of these missing at boot 404s
+         harmlessly under defer and must not break the app. -->
+    <script defer src="vendor/chart.umd.min.js"></script>
+    <script defer src="app/views.js"></script>
+    <script defer src="app/analytics.js"></script>
   </body>
 </html>
