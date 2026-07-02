@@ -42,6 +42,11 @@
          (round 16) the raw element straight from the link Map — no tab
          resolution. sessions.js hands it to AtelierApps.browserNavigate
          when the agent requests navigation of the user-linked browser.
+     link(agentEl, browserEl) -> true if linked
+         (round 22) the marquee toggle-ON path WITHOUT the gesture: draws the
+         browser->agent arrow and registers the pair in the same Map. Used by
+         sessions.js after the OpenBrowser tool spawns a browser card so the
+         auto-created browser behaves exactly like a user-linked one.
      unlink(agentEl)  -> true if a link was removed
      count()          -> number of live links
 
@@ -118,6 +123,26 @@
     return true;
   }
 
+  // ── link registration (shared by the marquee gesture + the public API) ─────
+  // Registers browserEl as agentEl's linked browser: replaces any prior link
+  // for that agent (an agent holds at most one — relink drops the old arrow
+  // first), draws the browser->agent arrow, and stores the unlink handle.
+  // Returns true once the pair is linked; a same-pair call is a no-op that
+  // still returns true (already linked). NO toast / selection side effects —
+  // the marquee handler and sessions.js each own their own user feedback.
+  function setLink(agentEl, browserEl) {
+    if (!agentEl || !browserEl || agentEl === browserEl) return false;
+    const existing = links.get(agentEl);
+    if (existing && existing.browserEl === browserEl) return true; // already linked
+    if (existing) dropLink(agentEl);
+    const arrows = A.arrows;
+    const unlink = (arrows && typeof arrows.link === 'function')
+      ? arrows.link(browserEl, agentEl)
+      : function () {}; // arrows.js absent (plain-browser test) — link still works
+    links.set(agentEl, { browserEl, unlink });
+    return true;
+  }
+
   // ── the gesture: marquee finalize -> toggle ────────────────────────────────
   A.bus.on('selection:changed', () => {
     const sel = A.selection.get();
@@ -142,12 +167,7 @@
     }
 
     // toggle ON (an agent holds at most one browser: replace, old arrow first)
-    if (existing) dropLink(agentEl);
-    const arrows = A.arrows;
-    const unlink = (arrows && typeof arrows.link === 'function')
-      ? arrows.link(browserEl, agentEl)
-      : function () {}; // arrows.js absent (plain-browser test) — link still works
-    links.set(agentEl, { browserEl, unlink });
+    setLink(agentEl, browserEl);
     A.ui.toast('Browser linked to ' + titleOf(agentEl) +
       ' — its current page now rides along with every message');
     A.selection.clear(); // re-emits selection:changed with 0 selected — a no-op here
@@ -181,6 +201,14 @@
       const entry = links.get(agentEl);
       return entry ? entry.browserEl : null;
     },
+    // round 22: programmatic link — the marquee gesture's toggle-ON path
+    // without the gesture. sessions.js calls it after the OpenBrowser tool
+    // spawns a browser card, so the auto-created browser registers in the
+    // SAME Map that browserElFor/browserFor read — subsequent NavigateBrowser
+    // then drives it exactly as a user-linked one. Draws the arrow, replaces
+    // any prior link for the agent, returns true once linked (false only on
+    // bad args). No toast (the caller sets its own note).
+    link(agentEl, browserEl) { return setLink(agentEl, browserEl); },
     unlink(agentEl) { return dropLink(agentEl); },
     count() { return links.size; },
   };
@@ -191,6 +219,7 @@
     const ok = api &&
       typeof api.browserFor === 'function' &&
       typeof api.browserElFor === 'function' &&
+      typeof api.link === 'function' &&
       typeof api.unlink === 'function' &&
       typeof api.count === 'function' &&
       api.count() === 0 &&

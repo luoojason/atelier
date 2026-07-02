@@ -27,6 +27,7 @@ import asyncio
 import contextlib
 import dataclasses
 import datetime
+import ipaddress
 import itertools
 import json
 import os
@@ -34,6 +35,7 @@ import re
 import secrets
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -99,7 +101,7 @@ Be concise. When you take an action with a tool, say plainly what you did and ci
 
 If a task needs a tool or capability you do not have, or a tool returns an error or no results, say so plainly. NEVER present training-knowledge as if it were searched, fetched, or retrieved — do not fabricate sources, URLs, or live data.
 
-When SpawnAgent/CheckAgent are available you can delegate a subtask to a parallel sub-agent and collect its result later; sub-agents run as their own isolated sessions. When DelegateToSubagent is available you govern one or more existing sub-agent cards; call it with a governed card's id or name to hand it a subtask and get its reply back inline."""
+When SpawnAgent/CheckAgent are available you can delegate a subtask to a parallel sub-agent and collect its result later; sub-agents run as their own isolated sessions. When DelegateToSubagent is available you govern one or more existing sub-agent cards; call it with a governed card's id or name to hand it a subtask and get its reply back inline. When OpenBrowser is available and you need to open a web page for the user, call OpenBrowser(url) — it spawns a browser card on the dashboard connected to you by an arrow and loads the page, so prefer it over just describing a URL; NavigateBrowser instead drives a browser the user has already linked to you."""
 
 LIGHT_TOOLS = [
     VaultSearch,
@@ -313,6 +315,7 @@ def build_options(
                 "mcp__orchestra__SpawnAgent",
                 "mcp__orchestra__CheckAgent",
                 "mcp__orchestra__NavigateBrowser",
+                "mcp__orchestra__OpenBrowser",
             ]
         if children:
             allowed_tools.append("mcp__orchestra__DelegateToSubagent")
@@ -2065,8 +2068,8 @@ async def deck_pptx(req: DeckPptxRequest):
 # Shape (fixed contract with app/sessions.js + tests):
 #   POST   /sessions                {"name"?}    -> {"id","name"}
 #   GET    /sessions                             -> {"sessions":[{id,name,status,messages_len,parent_id,depth}]}
-#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}],parent_id,depth,browser_nav}
-#   (browser_nav rides ONLY on the detail route the card polls, never the list)
+#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}],parent_id,depth,browser_nav,canvas_op}
+#   (browser_nav + canvas_op ride ONLY on the detail route the card polls, never the list)
 #   POST   /sessions/{id}/message   {"message"}  -> 202 {"status":"running"} (fire-and-poll)
 #   DELETE /sessions/{id}                        -> {"ok":true}
 #   unknown id -> 404 {"error":"unknown session"}; a turn error sets
@@ -2085,6 +2088,9 @@ class _AgentSession:
     ``browser_nav`` is the latest NavigateBrowser request against this session
     ({"url", "seq"}, seq strictly increasing) or None; the desktop card polls
     it off GET /sessions/{id} and acts when seq advances past what it has seen.
+    ``canvas_op`` is the latest OpenBrowser request ({"kind", "url", "seq"},
+    seq strictly increasing) or None — the agent-driven "spawn a card, arrow-
+    link it to me, then drive it" op the card acts on the same seq-gated way.
     """
 
     def __init__(
@@ -2109,6 +2115,12 @@ class _AgentSession:
         self.status = "idle"  # "idle" | "running" | "error"
         self.messages: list[dict] = []  # {"role","text","ts"} append-only
         self.browser_nav: dict | None = None  # latest NavigateBrowser request
+        # latest OpenBrowser request: an agent-driven "spawn a card on the
+        # canvas, arrow-link it to me, then drive it" op ({"kind","url","seq"},
+        # seq strictly increasing) or None. Unlike browser_nav (which drives a
+        # browser the USER linked), canvas_op tells the card to CREATE the
+        # browser card itself and register the link — no manual gesture.
+        self.canvas_op: dict | None = None
         self.last_used = next(_session_touch)
 
 
@@ -2323,6 +2335,7 @@ async def get_session(session_id: str):
         "depth": sess.depth,
         "model": sess.model,
         "browser_nav": sess.browser_nav,
+        "canvas_op": sess.canvas_op,
     }
 
 
@@ -2491,7 +2504,53 @@ def _governs_cycle(parent_id: str, child_id: str) -> bool:
 # seq against the last one it acted on, so repeats of the SAME url still fire.
 _browser_nav_seq = itertools.count(1)
 
+# Module-wide monotonic counter for canvas_op (OpenBrowser) requests. Same
+# seq-gated poll contract as browser_nav, on its own field so the two never
+# collide: a card can hold both a "spawn a browser" op and a "drive the linked
+# browser" op independently.
+_canvas_op_seq = itertools.count(1)
+
 _HTTP_URL_RE = re.compile(r"^https?://")
+
+
+def _agent_open_host_blocked(url: str) -> bool:
+    """True if an AGENT-opened browser (OpenBrowser) must refuse this URL's host.
+
+    OpenBrowser spawns a browser and drives it with NO user gesture, so it is a
+    fully autonomous outbound-GET primitive — a prompt-injected agent could
+    otherwise reach the user's LAN, loopback services (including this backend on
+    127.0.0.1:8765), cloud metadata (169.254.169.254), or router admin pages.
+    It is therefore restricted to the PUBLIC web: loopback / private / link-
+    local / reserved / unspecified / multicast IP literals and 'localhost' are
+    refused. NavigateBrowser keeps full reach because the USER deliberately
+    linked that browser card (a real dev may want localhost there).
+
+    Hostnames are NOT DNS-resolved (a name that resolves to a private IP is a
+    documented residual — full SSRF hardening would resolve + re-check, at the
+    cost of latency and a rebinding window); IP literals + 'localhost' cover the
+    concrete reach vectors. A URL whose host cannot be parsed is refused.
+    """
+    try:
+        host = (urlparse(url).hostname or "").strip()
+    except ValueError:
+        return True  # unparseable -> refuse
+    if not host:
+        return True
+    low = host.lower()
+    if low == "localhost" or low.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # an ordinary hostname -> allowed (public web)
+    return (
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_unspecified
+        or ip.is_multicast
+    )
 
 
 def _tool_text(text: str) -> dict:
@@ -2671,6 +2730,54 @@ def _orchestra_tools(parent_id: str) -> list:
         )
 
     @tool(
+        "OpenBrowser",
+        "Open an http(s) URL in a browser on the dashboard. This spawns a NEW"
+        " browser card next to your card, draws an arrow connecting you to it,"
+        " and loads the URL — all automatically, with no manual linking. Use"
+        " this to browse the web when no browser card is linked to you yet; if"
+        " one is already linked, it navigates that one instead of spawning a"
+        " second. The user watches the card appear and load live on the canvas.",
+        {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The http(s) URL to open in a browser card"
+                    " on the dashboard.",
+                },
+            },
+            "required": ["url"],
+        },
+    )
+    async def _open_browser(args):
+        url = str(args.get("url") or "")
+        if not _HTTP_URL_RE.match(url):
+            return _tool_text("Only http(s) URLs can be opened.")
+        # Agent-initiated + no user gesture -> public web only (see the helper).
+        if _agent_open_host_blocked(url):
+            return _tool_text(
+                "That address is a private, loopback, or link-local host, which"
+                " an agent-opened browser will not load. If you need to open a"
+                " local or internal address, ask the user to open a browser card"
+                " and link it to you, then use NavigateBrowser."
+            )
+        parent = _sessions.get(parent_id)
+        if parent is None:
+            # The spawner was deleted/evicted mid-turn; there is no session for
+            # the card to poll, so the request has nowhere to land.
+            return _tool_text("Your session is gone; cannot open a browser.")
+        parent.canvas_op = {
+            "kind": "browser",
+            "url": url,
+            "seq": next(_canvas_op_seq),
+        }
+        return _tool_text(
+            f"Opening {url} in a browser card on your dashboard — a new card"
+            " will appear beside yours, connected by an arrow, and load the"
+            " page (or an already-linked browser will navigate to it)."
+        )
+
+    @tool(
         "DelegateToSubagent",
         "Delegate a subtask to one of the sub-agent cards you already govern"
         " (an existing card on the canvas), identified by its session id or"
@@ -2767,7 +2874,15 @@ def _orchestra_tools(parent_id: str) -> list:
             f'Sub-agent "{child.name}" replied: {last_reply}'
         )
 
-    return [_spawn_agent, _check_agent, _navigate_browser, _delegate_agent]
+    # NOTE: _delegate_agent stays at index 3 (tests unpack it by index); new
+    # tools append to the END.
+    return [
+        _spawn_agent,
+        _check_agent,
+        _navigate_browser,
+        _delegate_agent,
+        _open_browser,
+    ]
 
 
 def _build_orchestra_server(parent_id: str):

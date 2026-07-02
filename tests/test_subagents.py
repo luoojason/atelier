@@ -436,6 +436,137 @@ def test_navigate_tool_description_mentions_the_link_requirement():
     assert "linked" in nav_tool.description
 
 
+# ── OpenBrowser (agent-driven card spawn, round 22) ───────────────────────────
+
+def _open_browser_handler(parent_id):
+    """The OpenBrowser handler coroutine (the 5th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[4].handler
+
+
+def test_open_browser_sets_canvas_op_and_seq_increments(captured):
+    parent = _register_parent()
+    ob = _open_browser_handler(parent.id)
+    assert parent.canvas_op is None
+
+    reply = _text(_call(ob, {"url": "https://example.com/a"}))
+    assert "example.com/a" in reply
+    first = parent.canvas_op
+    assert set(first) == {"kind", "url", "seq"}
+    assert first["kind"] == "browser"
+    assert first["url"] == "https://example.com/a"
+    assert isinstance(first["seq"], int)
+
+    # a second request strictly advances seq so the poller distinguishes it
+    _call(ob, {"url": "http://example.org/b"})
+    second = parent.canvas_op
+    assert second["url"] == "http://example.org/b"
+    assert second["seq"] == first["seq"] + 1
+
+
+def test_open_browser_and_navigate_use_independent_seq_counters(captured):
+    # canvas_op (OpenBrowser) and browser_nav (NavigateBrowser) are separate
+    # fields with separate monotonic counters — one must never clobber the other
+    parent = _register_parent()
+    _, _, nav = _handlers(parent.id)
+    ob = _open_browser_handler(parent.id)
+
+    _call(ob, {"url": "https://a.example/1"})
+    _call(nav, {"url": "https://b.example/2"})
+    assert parent.canvas_op["url"] == "https://a.example/1"
+    assert parent.browser_nav["url"] == "https://b.example/2"
+    # both are set and independent — the nav call did not touch canvas_op
+    _call(ob, {"url": "https://a.example/3"})
+    assert parent.canvas_op["url"] == "https://a.example/3"
+    assert parent.browser_nav["url"] == "https://b.example/2"  # unchanged
+
+
+def test_open_browser_rejects_non_http_urls(captured):
+    parent = _register_parent()
+    ob = _open_browser_handler(parent.id)
+    for args in (
+        {"url": "ftp://example.com"},
+        {"url": "javascript:alert(1)"},
+        {"url": "file:///etc/passwd"},
+        {"url": "example.com"},
+        {"url": ""},
+        {},
+    ):
+        assert _text(_call(ob, args)) == "Only http(s) URLs can be opened."
+    assert parent.canvas_op is None  # nothing was ever recorded
+
+
+def test_open_browser_rejects_private_and_loopback_hosts(captured):
+    # OpenBrowser is agent-initiated with no user gesture, so it is restricted
+    # to the public web — loopback/LAN/link-local/metadata hosts are refused so
+    # a prompt-injected agent cannot reach the backend, the router, or metadata.
+    parent = _register_parent()
+    ob = _open_browser_handler(parent.id)
+    for url in (
+        "http://127.0.0.1:8765/exfil",
+        "http://localhost/admin",
+        "https://LOCALHOST/x",
+        "http://app.localhost/x",
+        "http://10.0.0.5/",
+        "http://192.168.1.1/",
+        "http://172.16.0.1/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/",
+        "http://0.0.0.0/",
+    ):
+        reply = _text(_call(ob, {"url": url}))
+        assert "private, loopback, or link-local" in reply, url
+    assert parent.canvas_op is None  # nothing recorded for any blocked host
+
+    # a public host still passes and records the op
+    _call(ob, {"url": "https://example.com/ok"})
+    assert parent.canvas_op["url"] == "https://example.com/ok"
+
+
+def test_agent_open_host_blocked_helper_edges():
+    b = lite_server._agent_open_host_blocked
+    assert b("https://example.com") is False
+    assert b("https://sub.example.co.uk/path?q=1") is False
+    assert b("http://8.8.8.8/") is False           # public IP literal is fine
+    assert b("http://127.0.0.1/") is True
+    assert b("http://localhost") is True
+    assert b("http://[fe80::1]/") is True           # link-local v6
+    assert b("http://[fc00::1]/") is True           # unique-local v6 (private)
+    assert b("not a url") is True                    # unparseable/no host -> refuse
+    assert b("https://") is True                     # empty host -> refuse
+
+
+def test_open_browser_with_parent_gone(captured):
+    ob = _open_browser_handler("deadbeef00000000deadbeef00000000")
+    assert _text(_call(ob, {"url": "https://example.com"})) == (
+        "Your session is gone; cannot open a browser."
+    )
+
+
+def test_detail_carries_canvas_op_and_list_does_not(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["canvas_op"] is None
+
+    ob = _open_browser_handler(sid)
+    _call(ob, {"url": "https://example.com/page"})
+
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["canvas_op"]["kind"] == "browser"
+    assert detail["canvas_op"]["url"] == "https://example.com/page"
+    assert detail["canvas_op"]["seq"] >= 1
+
+    # the list route deliberately does NOT carry canvas_op
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "canvas_op" not in s
+
+
+def test_open_browser_tool_description_mentions_spawning_and_arrow():
+    ob_tool = lite_server._orchestra_tools("p")[4]
+    assert ob_tool.name == "OpenBrowser"
+    assert ob_tool.input_schema["required"] == ["url"]
+    # the description must distinguish it from NavigateBrowser: it SPAWNS a card
+    assert "arrow" in ob_tool.description
+
+
 # ── the structural depth cap ─────────────────────────────────────────────────
 
 def test_build_options_without_spawner_has_no_orchestra():
@@ -453,6 +584,7 @@ def test_build_options_with_spawner_gains_orchestra():
     assert "mcp__orchestra__SpawnAgent" in opts.allowed_tools
     assert "mcp__orchestra__CheckAgent" in opts.allowed_tools
     assert "mcp__orchestra__NavigateBrowser" in opts.allowed_tools
+    assert "mcp__orchestra__OpenBrowser" in opts.allowed_tools
     # the base allowlist is intact alongside the orchestra tools (Notion tools
     # are gated on a stored token — excluded here since none is set)
     assert (

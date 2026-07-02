@@ -189,6 +189,7 @@ def test_create_list_get_shapes(client):
     assert detail == {
         "id": made["id"], "name": "Research", "status": "idle", "messages": [],
         "parent_id": None, "depth": 0, "model": None, "browser_nav": None,
+        "canvas_op": None,
     }
 
 

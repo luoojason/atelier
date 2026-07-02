@@ -15,7 +15,7 @@
      GET    /sessions                            -> {"sessions":[{id,name,status,
                                                     messages_len,parent_id,depth}]}
      GET    /sessions/{id}                       -> {id,name,status,parent_id,
-                                                    depth,browser_nav,
+                                                    depth,browser_nav,canvas_op,
                                                     messages:[{role,text,ts}]}
      POST   /sessions/{id}/message   {"message"} -> 202 {"status":"running"}
                                        (409 {"error":"turn in progress"} mid-turn)
@@ -63,6 +63,18 @@
    was linked. Both modules are optional and guarded at every access — the
    r15 note-clobbering rule stays (the link-status note yields to any note
    text, including these).
+
+   Agent-driven browser spawn (round 22): the backend's OpenBrowser orchestra
+   tool lets an agent SPAWN a browser card connected to its own card — no
+   user gesture. The session detail carries canvas_op = {kind, url, seq} | null.
+   Each card gates on a monotonic lastCanvasOpSeq (start 0) exactly like the
+   r16 nav gate. For kind "browser", handleCanvasOp -> openLinkedBrowser
+   reuses an already-linked browser (Atelier.links.browserElFor) if present,
+   otherwise A.spawnApp('browser') beside this card + Atelier.links.link (the
+   r22 programmatic link — draws the arrow AND registers the pair so later
+   NavigateBrowser drives it) + AtelierApps.browserNavigate. core's spawnApp,
+   link.js, and apps.js are all guarded — without them the op is consumed and
+   the note explains. Unknown kinds are a forward-compat no-op.
 
    Sessions accessor (round 17): window.AtelierSessions = { reveal(id, name) }
    is the small cross-module surface other modules (the agent-orbs widget's
@@ -436,6 +448,8 @@
     let pollTimer = null;
     let thinkingRow = null;
     let lastNavSeq = 0;     // r16: highest agent-requested browser_nav.seq handled
+    let lastCanvasOpSeq = 0; // r22: highest agent-requested canvas_op.seq handled
+    let attachBaselined = false; // r22: attached cards adopt existing seqs once
 
     if (attached) trackSession(sessionId, card); // fresh cards register in ensureSession
 
@@ -491,6 +505,77 @@
         setNote('Agent asked to open ' + url + ' but no browser card is '
           + 'linked — shift-drag a box around a browser card and this card '
           + 'to link one.');
+      }
+    }
+
+    // Agent-driven card spawning (round 22). The backend's OpenBrowser tool
+    // sets canvas_op = {kind, url, seq} on the session; the detail poll
+    // re-delivers it every cycle, so the monotonic lastCanvasOpSeq gate fires
+    // each request exactly once. Unlike browser_nav (which drives a browser
+    // the USER linked), canvas_op tells this card to CREATE the browser card
+    // itself, arrow-link it, and drive it — no manual gesture. Both spawnApp
+    // (core), Atelier.links (link.js), and AtelierApps (apps.js) are guarded:
+    // without them the op is consumed (seq advances) and the note explains.
+    function handleCanvasOp(op) {
+      if (closed || !op || typeof op.seq !== 'number') return;
+      if (op.seq <= lastCanvasOpSeq) return; // already handled (polls repeat it)
+      lastCanvasOpSeq = op.seq;
+      if (op.kind === 'browser') openLinkedBrowser(String(op.url || ''));
+      // unknown kinds are consumed silently — a forward-compat no-op so an
+      // older card never chokes on a newer backend op it does not understand.
+    }
+
+    // Spawn (or reuse) a browser card linked to THIS agent card and navigate
+    // it. Reuse: if link.js already holds a browser for this card, drive that
+    // one instead of stacking a second (OpenBrowser called twice, or after a
+    // manual marquee-link). Spawn: A.spawnApp('browser') beside this card,
+    // then Atelier.links.link registers the pair (drawing the arrow) so the
+    // auto-created browser behaves exactly like a user-linked one and later
+    // NavigateBrowser drives it. The browser card queues the load until its
+    // webview attaches (apps.js loadInTab), so navigating right after spawn is
+    // safe. The url is server-derived and only ever lands via setNote/textContent.
+    function openLinkedBrowser(url) {
+      const links = window.Atelier && window.Atelier.links;
+      const api = window.AtelierApps;
+      let browserEl = (links && typeof links.browserElFor === 'function')
+        ? links.browserElFor(card)
+        : null;
+      let spawned = false;
+      let linked = false;
+      if (!browserEl) {
+        if (typeof A.spawnApp !== 'function') {
+          setNote('Agent wanted to open ' + url + ' but browser cards are '
+            + 'unavailable here.');
+          return;
+        }
+        // Place the browser BELOW this card, not to its right: the right lane
+        // (card.left + offsetWidth + CHILD_DX, stepping down by CHILD_DY) is
+        // where auto-revealed sub-agent children stack, and a browser dropped
+        // there would land exactly on the k=0 child slot. Below the card is a
+        // free lane. left/top are world coords (core.js/arrows.js convention);
+        // positioning by our own offsetHeight needs no browser-card dimensions.
+        const pos = {
+          x: (parseFloat(card.style.left) || 0),
+          y: (parseFloat(card.style.top) || 0) + card.offsetHeight + 40,
+        };
+        browserEl = A.spawnApp('browser', pos);
+        spawned = true;
+        if (browserEl && links && typeof links.link === 'function') {
+          linked = links.link(card, browserEl) === true; // registers pair + arrow
+        }
+      }
+      let done = false;
+      if (browserEl && api && typeof api.browserNavigate === 'function') {
+        try { done = api.browserNavigate(browserEl, url); } catch { done = false; }
+      }
+      if (done) {
+        // note honesty: only claim "linked" when the arrow/registry actually
+        // registered (link.js present); an already-linked browser is reused.
+        setNote('Agent opened ' + url + (spawned
+          ? (linked ? ' in a new linked browser card' : ' in a new browser card')
+          : ' in the linked browser'));
+      } else {
+        setNote('Agent tried to open ' + url + ' but the browser card refused it.');
       }
     }
 
@@ -569,6 +654,7 @@
       // handleBrowserNav silently drop every new request until the fresh
       // counter climbed past it.
       lastNavSeq = 0;
+      lastCanvasOpSeq = 0; // r22: same reset rationale for the canvas_op counter
       if (!closed) trackSession(sessionId, card); // card:removed cleans this up
       return sessionId;
     }
@@ -615,10 +701,28 @@
       setNote('');
       hideThinking(); // new messages must land ABOVE the thinking bubble
       renderNew(r.data.messages || []);
+      // r22: an ATTACHED card is a live VIEW onto a session another agent owns
+      // (AtelierSessions.reveal a still-live depth-0 session, or a sub-agent).
+      // Any browser_nav/canvas_op the session already holds at attach time was
+      // requested for the ORIGINAL card, not this view — adopt their seqs on the
+      // first poll WITHOUT acting, so revealing a depth-0 session can't replay a
+      // stale OpenBrowser into a spurious browser spawn. Only ops that arrive
+      // AFTER attach fire. (Sub-agents carry neither field, so this is a no-op
+      // for them.)
+      if (attached && !attachBaselined) {
+        attachBaselined = true;
+        const bn = r.data.browser_nav, co = r.data.canvas_op;
+        if (bn && typeof bn.seq === 'number') lastNavSeq = bn.seq;
+        if (co && typeof co.seq === 'number') lastCanvasOpSeq = co.seq;
+      }
       // r16: AFTER the routine setNote('') so a fresh nav request's note
       // wins this cycle (the next healthy poll clears it — transient by
       // design; a nav landing on the turn's final poll stays visible).
       handleBrowserNav(r.data.browser_nav);
+      // r22: agent-driven card spawn (OpenBrowser). Runs after handleBrowserNav
+      // so, in the rare case both land on the same poll, the spawn note wins
+      // (the newer, more visible action). Each is seq-gated independently.
+      handleCanvasOp(r.data.canvas_op);
       if (r.data.status === 'running') {
         showThinking();
         schedulePoll();

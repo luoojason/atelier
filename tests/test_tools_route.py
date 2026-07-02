@@ -1,8 +1,9 @@
 """Tests for lite_server's GET /tools (r16 Feature 2) — the read-only tool
 registry the tool-inspector card renders: the 16 atelier LIGHT_TOOLS
 introspected with the SAME schema builder sdk_tools uses to register them,
-plus the orchestra tools (SpawnAgent/CheckAgent/NavigateBrowser) with their
-declared schemas. Fixed shape, never 500, no token (read-only GET).
+plus the orchestra tools (SpawnAgent/CheckAgent/NavigateBrowser/OpenBrowser/
+DelegateToSubagent) with their declared schemas. Fixed shape, never 500, no
+token (read-only GET).
 
 Needs the extension venv:
 
@@ -32,6 +33,7 @@ ORCHESTRA_NAMES = {
     "CheckAgent",
     "NavigateBrowser",
     "DelegateToSubagent",
+    "OpenBrowser",
 }
 
 
@@ -93,6 +95,9 @@ def test_orchestra_entries_present(client):
     assert orchestra["CheckAgent"]["input_schema"]["required"] == ["agent_id"]
     assert orchestra["NavigateBrowser"]["input_schema"]["required"] == ["url"]
     assert "linked" in orchestra["NavigateBrowser"]["description"]
+    assert orchestra["OpenBrowser"]["input_schema"]["required"] == ["url"]
+    # OpenBrowser spawns a NEW card (vs NavigateBrowser driving a linked one)
+    assert "arrow" in orchestra["OpenBrowser"]["description"]
     assert orchestra["DelegateToSubagent"]["input_schema"]["required"] == [
         "subagent",
         "task",
