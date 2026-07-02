@@ -11,6 +11,7 @@ Anything under `Sources/` is immutable and must never be written to.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from datetime import date
@@ -22,9 +23,35 @@ DEFAULT_VAULT = "/Users/jasonluo08/Desktop/AI Brain"
 _SKIP_DIRS = {"Sources", ".obsidian", ".git", ".trash"}
 
 
+def _settings_obsidian_vault():
+    """The ``obsidian_vault`` path from the Atelier settings file, or None.
+
+    Read directly (NOT via lite_server.load_settings) to avoid an import cycle
+    and keep this module stdlib-only. Any failure — missing file, bad JSON,
+    wrong type, empty — yields None so vault_root() falls through to env/default.
+    """
+    path = os.getenv("ATELIER_SETTINGS_PATH") or "~/.atelier/settings.json"
+    try:
+        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("obsidian_vault")
+    return value if isinstance(value, str) and value else None
+
+
 def vault_root() -> Path:
-    """Return the vault root directory from env OBSIDIAN_VAULT (with default)."""
-    return Path(os.getenv("OBSIDIAN_VAULT", DEFAULT_VAULT)).expanduser()
+    """Vault root: settings ``obsidian_vault`` → env OBSIDIAN_VAULT → DEFAULT_VAULT.
+
+    A settings- or env-supplied path is honored ONLY when it is an existing
+    directory; otherwise resolution falls through to the next source (finally
+    the default, returned even if absent so callers behave exactly as before).
+    """
+    for candidate in (_settings_obsidian_vault(), os.getenv("OBSIDIAN_VAULT")):
+        if candidate and Path(candidate).expanduser().is_dir():
+            return Path(candidate).expanduser()
+    return Path(DEFAULT_VAULT).expanduser()
 
 
 def _is_skipped(rel_parts) -> bool:
