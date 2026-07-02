@@ -46,7 +46,7 @@
       popover shows "1 / 10" (fewer if optional modules are absent) with
       Next / Skip (no Back on step 1).
    2. Click Next through the steps — dock, ⌘K search, Dashboards group, the
-      "+ widget" button, zoombar, Agent dock button, Analytics group, the
+      "+ widget" button, zoombar, Chat dock button, Analytics group, the
       Settings footer row; the cutout glides between anchors and the popover
       stays inside the viewport. Back walks the same path in reverse.
    3. While the tour is up, click a dock button or the canvas — nothing
@@ -87,7 +87,7 @@
     { sel: '.sidebar .sb-group:not(.vw-nav)', title: 'Boards', body: 'Boards — separate studios, switched in place' },
     { sel: '.wgt-add-btn', title: 'Widgets', body: 'Live widgets — metrics, charts, and (soon) living dials' },
     { sel: '.zoombar', title: 'Zoombar', body: 'Fit ⤢, tidy ✦, minimap ▣' },
-    { sel: '[title="Agent"]', title: 'Agents', body: 'Agent cards — each its own conversation; agents can spawn sub-agents that appear beside them' },
+    { sel: '[title="Chat"]', title: 'Agents', body: 'Chat — each press spawns a new agent conversation card; agents can spawn sub-agents that appear beside them' },
     { sel: '.vw-nav', title: 'Analytics', body: 'Claude Code usage and cost' },
     { sel: '.sb-foot .sb-row', title: 'Settings', body: 'Provider (subscription or API key), model, credentials' },
     { sel: null, title: 'Ready', body: 'That is the studio — build something.' },
