@@ -1,41 +1,43 @@
 """Lite subscription backend for Atelier.
 
 A single-file FastAPI app that serves ONE "Atelier" agent on the user's Claude
-Max subscription (via config.get_default_model() with DEFAULT_MODEL=claude-cli),
-carrying only the LIGHT tools that import cleanly without the heavy media deps
-(weasyprint / playwright / moviepy / jupyter / google-genai). It deliberately
-does NOT import swarm.create_agency or any of the heavy specialist agents.
+Max subscription via the official claude-agent-sdk (native tool_use — the CLI
+runs on the Max OAuth login with zero API keys). It carries only the LIGHT
+tools that import cleanly without the heavy media deps (weasyprint / playwright
+/ moviepy / jupyter / google-genai) and deliberately does NOT import
+swarm.create_agency or any of the heavy specialist agents.
+
+The earlier fenced-JSON bridge (claude_subscription_model, ~60% reliable — the
+model would intermittently emit a NATIVE tool call the bridge rejected) is gone
+from this path; the SDK speaks native tool_use directly. claude_subscription_model
+and agency_swarm stay intact for the heavy swarm in server.py.
+
+Isolation is UNCONDITIONAL for the app agent now: options.env pins a private
+CLAUDE_CONFIG_DIR + empty CLAUDE_SECURESTORAGE_CONFIG_DIR (keeps Max OAuth on
+the default Keychain item) and strips inherited API keys, and setting_sources=[]
+is the safe-mode equivalent (no CLAUDE.md / hooks / plugins / skills / auto-
+memory). No DEFAULT_MODEL / claude_subscription_model wiring is needed.
 
 Run:
-    DEFAULT_MODEL=claude-cli PORT=8765 \
+    PORT=8765 \
         /Users/jasonluo08/Desktop/openswarm/.venv-ext/bin/python lite_server.py
 """
 
+import asyncio
+import contextlib
 import datetime
 import json
 import os
 import re
 from pathlib import Path
 
-# Must be set before importing config so the subscription backend is selected.
-os.environ.setdefault("DEFAULT_MODEL", "claude-cli")
-# The app backend defaults to isolated `claude -p` runs (safe-mode + private
-# config dir; see claude_subscription_model.run_cli). The raw fork stays opt-in.
-os.environ.setdefault("CLAUDE_ISOLATED", "1")
-
-import config
-
-# Disable OpenAI tracing when there is no OpenAI key, so building/running the
-# agent on the subscription never trips over a missing tracing export key.
-try:  # pragma: no cover - defensive; tracing is optional
-    from agents import set_tracing_disabled
-
-    if not os.getenv("OPENAI_API_KEY"):
-        set_tracing_disabled(True)
-except Exception:  # noqa: BLE001
-    pass
-
-import agency_swarm
+from claude_agent_sdk import (
+    AssistantMessage,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ResultMessage,
+    TextBlock,
+)
 
 # --- LIGHT tools (all verified to import under .venv-ext) ---
 from shared_tools import (
@@ -47,6 +49,7 @@ from shared_tools import (
     CaptureBrief,
     ReadBrief,
 )
+from shared_tools.sdk_tools import build_atelier_server
 from campaign_agent.tools.StartCampaign import StartCampaign
 from campaign_agent.tools.RecordDeliverable import RecordDeliverable
 from campaign_agent.tools.CampaignStatus import CampaignStatus
@@ -56,7 +59,6 @@ from scheduler import jobs_core, run_store
 from scheduler import notify as swarm_notify
 
 from fastapi import FastAPI, Request
-from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -86,30 +88,129 @@ LIGHT_TOOLS = [
     CampaignStatus,
 ]
 
-# --- Build ONE agent on the subscription and wrap it in a single Agency. ---
-def build_agency():
-    """Build a FRESH Atelier Agent + Agency (same instructions/tools/model).
+# One in-process MCP server ("atelier") wrapping all 10 BaseTool subclasses as
+# native SDK tools, plus the mcp__atelier__<ClassName> allowlist for the agent.
+ATELIER_SERVER, ATELIER_ALLOWED_TOOLS = build_atelier_server(LIGHT_TOOLS)
 
-    The single construction path for BOTH the module-level chat agency below
-    and the per-request agencies of the scheduler compat route, so the two can
-    never drift. A fresh Agency shares no conversation state with any other
-    instance.
+
+def _resolved_model() -> str:
+    """The SDK model string: CLAUDE_CLI_MODEL env else 'sonnet'."""
+    return os.getenv("CLAUDE_CLI_MODEL") or "sonnet"
+
+
+def build_options() -> ClaudeAgentOptions:
+    """The single builder for BOTH the /chat client and every compat request.
+
+    Resolves model + isolation env + the atelier MCP server + allowed_tools +
+    setting_sources in ONE place so the chat session and the scheduler's fresh
+    per-request sessions can never drift.
+
+    Isolation (unconditional for the app agent): a private CLAUDE_CONFIG_DIR
+    (respect an existing override, else ~/.atelier/claude-home, created if
+    missing), an empty CLAUDE_SECURESTORAGE_CONFIG_DIR (keeps Max OAuth on the
+    default Keychain item), stripped inherited API keys, and setting_sources=[]
+    (no CLAUDE.md / hooks / plugins / skills / auto-memory).
     """
-    agent = agency_swarm.Agent(
-        name="Atelier",
-        instructions=ATELIER_INSTRUCTIONS,
-        model=config.get_default_model(),
-        tools=LIGHT_TOOLS,
+    config_dir = os.environ.get(
+        "CLAUDE_CONFIG_DIR", os.path.expanduser("~/.atelier/claude-home")
     )
-    return agency_swarm.Agency(agent, name="Atelier")
+    os.makedirs(config_dir, exist_ok=True)
+
+    env = {k: v for k, v in os.environ.items()}
+    # Strip any inherited API/auth keys so the run stays on the Max OAuth login.
+    env.pop("ANTHROPIC_API_KEY", None)
+    env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    env["CLAUDE_CONFIG_DIR"] = config_dir
+    env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = ""
+
+    return ClaudeAgentOptions(
+        model=_resolved_model(),
+        system_prompt=ATELIER_INSTRUCTIONS,
+        mcp_servers={"atelier": ATELIER_SERVER},
+        allowed_tools=ATELIER_ALLOWED_TOOLS,
+        setting_sources=[],
+        env=env,
+        # ponytail: 12 is a generous ceiling for a multi-tool studio job
+        # (search -> read -> remember -> record) without runaway loops.
+        max_turns=12,
+    )
 
 
-# Module-level agency, reused across every /chat call so the conversation keeps
-# continuity (memory of prior turns) within the process.
-agency = build_agency()
+async def _collect_response(client: ClaudeSDKClient) -> dict:
+    """Drain one turn: concatenate assistant TextBlocks, honor a failed result.
+
+    Returns the {"response"} (+"error": true) HTTP shape. A failed/aborted
+    ResultMessage (is_error) surfaces as the error shape even if some text came
+    through, matching the "never claim success on failure" contract.
+    """
+    texts: list[str] = []
+    async for msg in client.receive_response():
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    texts.append(block.text)
+        elif isinstance(msg, ResultMessage):
+            if msg.is_error:
+                detail = msg.result or (
+                    "; ".join(msg.errors) if msg.errors else "run failed"
+                )
+                return {
+                    "response": (
+                        f"Atelier hit an error and could not finish that turn: {detail}"
+                    ),
+                    "error": True,
+                }
+    return {"response": "".join(texts).strip()}
 
 
-app = FastAPI(title="Atelier Lite")
+# One long-lived chat client, lazily connected on first /chat use and guarded by
+# a lock so concurrent /chat calls serialize onto the single conversation. The
+# scheduler compat route uses its OWN fresh client (never this one).
+_chat_client: ClaudeSDKClient | None = None
+_chat_lock = asyncio.Lock()
+
+
+async def _get_chat_client() -> ClaudeSDKClient:
+    global _chat_client
+    if _chat_client is None:
+        client = ClaudeSDKClient(options=build_options())
+        await client.connect()
+        _chat_client = client
+    return _chat_client
+
+
+async def _reset_chat_client() -> None:
+    """Drop the long-lived chat client so the next /chat reconnects a fresh one.
+
+    Called after a mid-turn SDK failure: the underlying claude CLI subprocess or
+    transport may be dead, and reusing the same client would re-raise on every
+    subsequent turn (wedging the session until the app restarts). Guarded by
+    _chat_lock so we never null the client out from under a concurrent caller.
+    """
+    global _chat_client
+    async with _chat_lock:
+        if _chat_client is not None:
+            try:
+                await _chat_client.disconnect()
+            except Exception:  # noqa: BLE001 - already broken; best-effort teardown
+                pass
+            finally:
+                _chat_client = None
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI):
+    # Nothing to warm up; the chat client connects lazily on first /chat.
+    yield
+    global _chat_client
+    if _chat_client is not None:
+        try:
+            await _chat_client.disconnect()
+        finally:
+            _chat_client = None
+
+
+app = FastAPI(title="Atelier Lite", lifespan=_lifespan)
 
 # Local-only server, but allow_origins=["*"] would let ANY web page — in the
 # user's regular browser, or loaded inside the app's own browser card — read
@@ -153,12 +254,10 @@ class AgencyResponseRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    backend = config.get_default_model()
-    model_name = type(backend).__name__
     return {
         "ok": True,
-        "model": model_name,
-        "subscription": not config.is_openai_provider(),
+        "model": _resolved_model(),
+        "subscription": True,
     }
 
 
@@ -296,15 +395,22 @@ async def notifications(limit: int = 20):
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
+    """Conversational turn on the ONE long-lived chat client (in-process memory).
+
+    The SDK is async-native, so we await it directly (no threadpool for the
+    agent call; the tool run() calls are threaded inside the wrapper). The lock
+    serializes concurrent /chat calls onto the single conversation.
+    """
     try:
-        # get_response_sync is blocking/sync; run it off the event loop so the
-        # server stays responsive. Reuse the single module-level agency.
-        result = await run_in_threadpool(agency.get_response_sync, req.message)
-        text = getattr(result, "final_output", None)
-        if text is None:
-            text = str(result)
-        return {"response": str(text)}
+        async with _chat_lock:
+            client = await _get_chat_client()
+            await client.query(req.message)
+            return await _collect_response(client)
     except Exception as exc:  # noqa: BLE001 - never 500 the UI
+        # The turn failed; the long-lived client may now be wedged (dead CLI
+        # subprocess / broken transport). Tear it down so the NEXT /chat call
+        # reconnects instead of re-raising forever.
+        await _reset_chat_client()
         return {
             "response": f"Atelier hit an error and could not finish that turn: {exc}",
             "error": True,
@@ -316,24 +422,15 @@ async def get_response_compat(req: AgencyResponseRequest):
     """Scheduler compat route: the agency server's POST /{agency}/get_response.
 
     scheduler/client.py fires each job here as {"message", "recipient_agent"?}.
-    Every call runs on a FRESH agency from build_agency() — never the
-    module-level chat agency — so a scheduled 7am brief cannot pollute the
-    user's chat context, and it is safe to run concurrently with /chat.
+    Every call runs on a FRESH ClaudeSDKClient — never the long-lived chat
+    client — so a scheduled 7am brief cannot pollute the user's chat context,
+    and it is safe to run concurrently with /chat. recipient_agent is accepted
+    for API parity but ignored (single agent).
     """
-
-    def _run():
-        fresh = build_agency()
-        kwargs = {}
-        if req.recipient_agent:
-            kwargs["recipient_agent"] = req.recipient_agent
-        return fresh.get_response_sync(req.message, **kwargs)
-
     try:
-        result = await run_in_threadpool(_run)
-        text = getattr(result, "final_output", None)
-        if text is None:
-            text = str(result)
-        return {"response": str(text)}
+        async with ClaudeSDKClient(options=build_options()) as client:
+            await client.query(req.message)
+            return await _collect_response(client)
     except Exception as exc:  # noqa: BLE001 - mirror /chat: never 500 the caller
         return {
             "response": f"Atelier hit an error and could not finish that turn: {exc}",

@@ -3,7 +3,8 @@
 file path pointed into tmp_path via env vars (SWARM_RUNS_JSONL,
 SWARM_NOTIFICATIONS, SWARM_MEMORY_PATH, SWARM_JOBS_FILE).
 
-Needs the extension venv (lite_server imports agency_swarm):
+Needs the extension venv (lite_server imports claude_agent_sdk + the
+agency_swarm-based tools):
 
     .venv-ext/bin/python -m pytest -q tests/test_lite_endpoints.py
 """
@@ -19,15 +20,9 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-pytest.importorskip("agency_swarm")
+pytest.importorskip("claude_agent_sdk")
 
-# Importing lite_server setdefaults DEFAULT_MODEL and CLAUDE_ISOLATED process-
-# wide; snapshot and restore so the rest of the pytest run is unaffected.
-_HAD_ISOLATED = "CLAUDE_ISOLATED" in os.environ
 import lite_server  # noqa: E402
-
-if not _HAD_ISOLATED:
-    os.environ.pop("CLAUDE_ISOLATED", None)
 
 from fastapi.testclient import TestClient  # noqa: E402
 
