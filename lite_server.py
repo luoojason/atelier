@@ -1362,8 +1362,20 @@ async def _stream_turn(message: str):
     The chat lock is held for the WHOLE stream — that is what serializes the
     single conversation, same as /chat. On failure the client is torn down so
     the next turn reconnects (mirrors chat()).
+
+    The reset lives in a ``finally`` keyed off ``completed_cleanly`` rather
+    than the old ``except Exception`` + ``failed`` flag: a client that
+    disconnects MID-turn makes the SDK stream raise asyncio.CancelledError
+    or GeneratorExit, both BaseException — neither is caught by
+    ``except Exception``, so ``failed`` never flipped and the reset never
+    ran. Left unreset, the long-lived client keeps that turn's unconsumed
+    ResultMessage buffered and the NEXT turn reads it instead of its own
+    reply, so every reply ends up permanently one turn behind. The finally
+    below resets on ANY exit that is not the normal completion, including
+    those BaseExceptions, and never swallows them — they propagate right
+    after the reset runs.
     """
-    failed = False
+    completed_cleanly = False
     try:
         async with _chat_lock:
             client = await _get_chat_client()
@@ -1399,8 +1411,8 @@ async def _stream_turn(message: str):
                         )
                         return
             yield _sse({"done": True, "response": "".join(texts).strip()})
+            completed_cleanly = True
     except Exception as exc:  # noqa: BLE001 - surface as an SSE error event
-        failed = True
         yield _sse(
             {
                 "done": True,
@@ -1410,11 +1422,9 @@ async def _stream_turn(message: str):
                 ),
             }
         )
-    # ponytail: a client that disconnects MID-turn leaves the session mid-flight;
-    # the next turn's query() may find it wedged and trip this same reset via
-    # chat()'s error path. Proactive cancellation handling is the upgrade.
-    if failed:
-        await _reset_chat_client()
+    finally:
+        if not completed_cleanly:
+            await _reset_chat_client()
 
 
 @app.post("/chat/stream")

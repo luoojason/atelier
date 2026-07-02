@@ -18,6 +18,7 @@ Needs the extension venv:
     .venv-ext/bin/python -m pytest -q tests/test_lite_stream.py
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -172,6 +173,77 @@ def test_stream_exception_yields_error_event_and_resets_client(monkeypatch, clie
     assert final["error"] is True
     assert "transport died" in final["response"]
     assert resets == [True]
+
+
+def test_stream_cancelled_mid_turn_resets_client(monkeypatch):
+    """A mid-turn client disconnect throws CancelledError into the generator
+    (BaseException, not Exception) at the point it is suspended mid-stream.
+    That must still reset the shared chat client, or the next turn reads the
+    stale unconsumed ResultMessage left in the client's buffer."""
+    fake = _StreamingChatClient([_stream_event("text_delta", "Hel")])
+    _install(monkeypatch, fake)
+    resets = []
+
+    async def _reset():
+        resets.append(True)
+
+    monkeypatch.setattr(lite_server, "_reset_chat_client", _reset)
+
+    async def _drive():
+        gen = lite_server._stream_turn("hi")
+        # Advance past the first delta so the generator is suspended
+        # mid-stream (mirrors a client that disconnects after partial
+        # streaming but before the final "done" event).
+        first = await gen.__anext__()
+        with pytest.raises(asyncio.CancelledError):
+            await gen.athrow(asyncio.CancelledError())
+        return first
+
+    first = asyncio.run(_drive())
+    assert json.loads(first.strip()[len("data: ") :]) == {"delta": "Hel"}
+    assert resets == [True]
+
+
+def test_stream_closed_mid_turn_resets_client(monkeypatch):
+    """Same scenario via GeneratorExit (a consumer closing the generator
+    directly), the other BaseException the mid-stream disconnect can raise."""
+    fake = _StreamingChatClient([_stream_event("text_delta", "Hel")])
+    _install(monkeypatch, fake)
+    resets = []
+
+    async def _reset():
+        resets.append(True)
+
+    monkeypatch.setattr(lite_server, "_reset_chat_client", _reset)
+
+    async def _drive():
+        gen = lite_server._stream_turn("hi")
+        await gen.__anext__()
+        await gen.aclose()
+
+    asyncio.run(_drive())
+    assert resets == [True]
+
+
+def test_stream_clean_completion_does_not_reset_client(monkeypatch, client):
+    fake = _StreamingChatClient(
+        [
+            _stream_event("text_delta", "Hi"),
+            _assistant("Hi"),
+            _result(),
+        ]
+    )
+    _install(monkeypatch, fake)
+    resets = []
+
+    async def _reset():
+        resets.append(True)
+
+    monkeypatch.setattr(lite_server, "_reset_chat_client", _reset)
+
+    resp = client.post("/chat/stream", json={"message": "hi"})
+    assert resp.status_code == 200
+    assert resets == []
 
 
 def test_nonstream_chat_ignores_stream_events(monkeypatch, client):
