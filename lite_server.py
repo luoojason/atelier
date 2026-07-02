@@ -36,6 +36,7 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
+    StreamEvent,
     TextBlock,
 )
 
@@ -60,7 +61,7 @@ from scheduler import notify as swarm_notify
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 
@@ -98,12 +99,15 @@ def _resolved_model() -> str:
     return os.getenv("CLAUDE_CLI_MODEL") or "sonnet"
 
 
-def build_options() -> ClaudeAgentOptions:
+def build_options(stream: bool = False) -> ClaudeAgentOptions:
     """The single builder for BOTH the /chat client and every compat request.
 
     Resolves model + isolation env + the atelier MCP server + allowed_tools +
     setting_sources in ONE place so the chat session and the scheduler's fresh
     per-request sessions can never drift.
+
+    ``stream=True`` enables include_partial_messages so /chat/stream can emit
+    token deltas. Harmless for the non-streaming drain (it ignores StreamEvent).
 
     Isolation (unconditional for the app agent): a private CLAUDE_CONFIG_DIR
     (respect an existing override, else ~/.atelier/claude-home, created if
@@ -135,6 +139,7 @@ def build_options() -> ClaudeAgentOptions:
         # "Reached maximum number of turns". 40 fits the heaviest real job;
         # env knob for tuning without a rebuild.
         max_turns=int(os.getenv("ATELIER_MAX_TURNS", "40")),
+        include_partial_messages=stream,
     )
 
 
@@ -175,7 +180,9 @@ _chat_lock = asyncio.Lock()
 async def _get_chat_client() -> ClaudeSDKClient:
     global _chat_client
     if _chat_client is None:
-        client = ClaudeSDKClient(options=build_options())
+        # stream=True so /chat/stream gets token deltas; the non-streaming /chat
+        # drain ignores the extra StreamEvents, so one client serves both.
+        client = ClaudeSDKClient(options=build_options(stream=True))
         await client.connect()
         _chat_client = client
     return _chat_client
@@ -417,6 +424,86 @@ async def chat(req: ChatRequest):
             "response": f"Atelier hit an error and could not finish that turn: {exc}",
             "error": True,
         }
+
+
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+async def _stream_turn(message: str):
+    """SSE generator for one chat turn: token deltas, then a canonical final.
+
+    Events: {"delta": "<text>"} per text_delta, then exactly one
+    {"done": true, "response": "<full text>", "error"?: true}. The final
+    response is rebuilt from the complete AssistantMessage TextBlocks, so the
+    client can replace its accumulated deltas with the canonical text.
+
+    The chat lock is held for the WHOLE stream — that is what serializes the
+    single conversation, same as /chat. On failure the client is torn down so
+    the next turn reconnects (mirrors chat()).
+    """
+    failed = False
+    try:
+        async with _chat_lock:
+            client = await _get_chat_client()
+            await client.query(message)
+            texts: list[str] = []
+            async for msg in client.receive_response():
+                if isinstance(msg, StreamEvent):
+                    ev = msg.event or {}
+                    if ev.get("type") == "content_block_delta":
+                        delta = ev.get("delta") or {}
+                        # thinking_delta / signature_delta are internal; only
+                        # surface real text.
+                        if delta.get("type") == "text_delta" and delta.get("text"):
+                            yield _sse({"delta": delta["text"]})
+                elif isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            texts.append(block.text)
+                elif isinstance(msg, ResultMessage):
+                    if msg.is_error:
+                        detail = msg.result or (
+                            "; ".join(msg.errors) if msg.errors else "run failed"
+                        )
+                        yield _sse(
+                            {
+                                "done": True,
+                                "error": True,
+                                "response": (
+                                    "Atelier hit an error and could not finish "
+                                    f"that turn: {detail}"
+                                ),
+                            }
+                        )
+                        return
+            yield _sse({"done": True, "response": "".join(texts).strip()})
+    except Exception as exc:  # noqa: BLE001 - surface as an SSE error event
+        failed = True
+        yield _sse(
+            {
+                "done": True,
+                "error": True,
+                "response": (
+                    f"Atelier hit an error and could not finish that turn: {exc}"
+                ),
+            }
+        )
+    # ponytail: a client that disconnects MID-turn leaves the session mid-flight;
+    # the next turn's query() may find it wedged and trip this same reset via
+    # chat()'s error path. Proactive cancellation handling is the upgrade.
+    if failed:
+        await _reset_chat_client()
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """Streaming variant of /chat: SSE token deltas on the same conversation."""
+    return StreamingResponse(
+        _stream_turn(req.message),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/open-swarm/get_response")

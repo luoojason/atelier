@@ -477,6 +477,43 @@
     if (!d) return 'No response.';
     return d.message ?? d.detail ?? (typeof d.error === 'string' ? d.error : null) ?? 'Something went wrong.';
   }
+  // SSE token streaming for the chat card. Reads POST /chat/stream directly
+  // with fetch (the page has no CSP and widgets already fetch the backend
+  // directly); throws on any transport/shape problem so send() can fall back
+  // to the blocking POST /chat. onDelta(text) fires per token chunk.
+  // ponytail: direct fetch, no preload hop — the shared-secret-header upgrade
+  // moves this (and the widget fetches) behind the preload bridge together.
+  async function streamChat(message, onDelta) {
+    const res = await fetch('http://127.0.0.1:8765/chat/stream', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    if (!res.ok || !res.body) throw new Error('stream unavailable');
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    let final = null;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        const line = chunk.split('\n').find((l) => l.startsWith('data: '));
+        if (!line) continue;
+        let obj;
+        try { obj = JSON.parse(line.slice(6)); } catch { continue; }
+        if (obj.delta) { try { onDelta(obj.delta); } catch { /* UI callback */ } }
+        if (obj.done) final = obj;
+      }
+    }
+    if (!final) throw new Error('stream ended without a final event');
+    return final;
+  }
+
   async function send() {
     const text = inputEl.value.trim();
     if (!text || sending) return;
@@ -484,14 +521,36 @@
     addMessage('user', text);
     bus.emit('chat:sent', { text });
     const t = addThinking();
+    let streamedAny = false;
     try {
-      const data = await backend.chat(text);
+      const data = await streamChat(text, (delta) => {
+        if (!streamedAny) { streamedAny = true; t.classList.remove('thinking'); t.textContent = ''; }
+        t.textContent += delta;
+        scrollBottom();
+      });
       t.classList.remove('thinking');
+      // Replace accumulated deltas with the canonical final text.
       t.textContent = (data && data.error) ? extractError(data) : (extractReply(data) || '(empty response)');
       bus.emit('chat:reply', { data });
     } catch {
-      t.classList.remove('thinking');
-      t.textContent = 'Could not reach the Atelier backend. It may still be starting — try again in a moment.';
+      if (streamedAny) {
+        // Deltas already arrived, then the stream died. Do NOT re-send (the
+        // turn already ran server-side); keep what streamed and say so.
+        t.classList.remove('thinking');
+        t.textContent += '\n\n[connection to the stream was lost — reply may be incomplete]';
+      } else {
+        // Streaming endpoint missing/unreachable (older backend, cold start):
+        // fall back to the blocking chat exactly as before.
+        try {
+          const data = await backend.chat(text);
+          t.classList.remove('thinking');
+          t.textContent = (data && data.error) ? extractError(data) : (extractReply(data) || '(empty response)');
+          bus.emit('chat:reply', { data });
+        } catch {
+          t.classList.remove('thinking');
+          t.textContent = 'Could not reach the Atelier backend. It may still be starting — try again in a moment.';
+        }
+      }
     } finally {
       sending = false; sendEl.disabled = false; scrollBottom(); inputEl.focus();
     }
