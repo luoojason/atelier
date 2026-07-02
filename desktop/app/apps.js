@@ -117,6 +117,11 @@
         target board's own app cards mount in place, NO page reload; switch
         back → browser returns with both tab URLs + the active tab, the note
         returns rendered with its text.
+    10. Click ▦ Apps in the dock — the ⌘K command palette overlay opens (NOT
+        a new note card).
+    11. Click 💬 Chat — a fresh agent/session card appears on the canvas;
+        click it again — a second card appears (one per press). 🗒 Notes
+        still spawns a note card (unchanged).
    =========================================================================== */
 
 (function () {
@@ -1088,7 +1093,7 @@
 
   // ── own the dock (clone-replace strips core's listeners → no double-spawn) ─
   const DOCK_MAP = {
-    apps: 'note', browser: 'browser', campaign: 'workflow',
+    browser: 'browser', campaign: 'workflow',
     notes: 'note', history: 'history', calendar: 'calendar',
   };
   (function wireDock() {
@@ -1099,7 +1104,11 @@
         document.querySelectorAll('.dock-btn').forEach((x) => x.classList.remove('active'));
         fresh.classList.add('active');
         const t = (fresh.getAttribute('title') || '').toLowerCase();
-        if (t === 'chat') { const i = document.getElementById('input'); if (i) i.focus(); return; }
+        // 💬 Chat spawns a fresh agent/session card (the old ✳ Agent path).
+        if (t === 'chat') { if (typeof A.spawnApp === 'function') A.spawnApp('agent'); return; }
+        // ▦ Apps opens the ⌘K command palette. Read lazily + guarded: palette.js
+        // loads AFTER us, so A.palette is absent at parse but present at click.
+        if (t === 'apps') { if (A.palette && typeof A.palette.open === 'function') A.palette.open(); return; }
         const type = DOCK_MAP[t];
         if (type) makeApp(type, {});
       });
@@ -1161,6 +1170,7 @@
     console.assert(Array.isArray(stored), '[apps] store key atelier.apps is not an array');
     const dock = document.querySelectorAll('.dock-btn');
     console.assert(dock.length >= 6, '[apps] expected 6 dock buttons, got', dock.length);
+    console.assert(!('apps' in DOCK_MAP), '[apps] ▦ Apps must no longer map to a note type');
     console.assert(normalizeUrl('example.com') === 'https://example.com', '[apps] normalizeUrl token+dot failed');
     console.assert(normalizeUrl('localhost:8765') === 'http://localhost:8765', '[apps] normalizeUrl localhost failed');
     console.assert(normalizeUrl('hello world') === 'https://duckduckgo.com/?q=hello%20world', '[apps] normalizeUrl search failed');
