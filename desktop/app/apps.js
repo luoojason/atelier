@@ -44,9 +44,14 @@
      twice. This also fixes the "Notes" button, which core left inert.
 
    Persistence: open apps (type + config + rect) are stored under the Atelier
-     store key "atelier.apps" and restored on load. A note's text and the
-     browser's tab URLs + active index live in each app's config, so they
-     survive a reload (legacy configs with a single `url` still restore).
+     store key "atelier.apps" and restored by restoreFromStore() — at load AND
+     on 'boards:switched' (the in-place board switch: boards.js runs
+     canvas.removeAllCards, which fires card:removed per app card — emptying
+     openApps/browserCards and stopping every poll timer — swaps the live
+     store keys to the target board, then emits 'boards:switched'; no page
+     reload). A note's text and the browser's tab URLs + active index live in
+     each app's config, so they survive a reload and a board round-trip
+     (legacy configs with a single `url` still restore).
 
    Contract: builds ONLY against window.Atelier (+ the window.atelier preload
      bridge). Does not touch index.html, core.js, styles.css, or any other
@@ -106,6 +111,12 @@
         every 30s, so an edit to the jobs file shows up without respawning.
      8. Close a History, Campaign, or Calendar card (×) → its poll stops
         (watch the Network tab).
+     9. Boards: open a browser (2 tabs) + a note, switch boards in the
+        sidebar → both cards vanish with their polls/registries cleared (no
+        /runs or /jobs requests from the old cards in the Network tab), the
+        target board's own app cards mount in place, NO page reload; switch
+        back → browser returns with both tab URLs + the active tab, the note
+        returns rendered with its text.
    =========================================================================== */
 
 (function () {
@@ -281,6 +292,12 @@
       openApps.delete(appId);
       persist();
     });
+    // In-place board switch: by the time boards.js emits this, every app card
+    // is already gone (canvas.removeAllCards → card:removed above emptied
+    // openApps/browserCards and cleared the poll timers) and the live store
+    // keys hold the TARGET board's state — re-mount its apps. (Function
+    // declaration below hoists; the handler only fires long after load.)
+    A.bus.on('boards:switched', () => restoreFromStore());
   }
 
   // ── card shell (matches core's expected structure) ────────────────────────
@@ -1023,15 +1040,33 @@
     });
   });
 
-  // ── restore previously-open apps ──────────────────────────────────────────
-  (function restore() {
+  // ── restore open apps from the store (load + every board switch) ──────────
+  // Formerly a load-only IIFE; 'boards:switched' re-runs it after an in-place
+  // switch. Idempotent: records whose id is still mounted are skipped, and any
+  // registry entry whose card element left the DOM without card:removed (core
+  // routes removals through the handles, so this should never happen — belt
+  // and braces) is swept, cleanups and all, BEFORE mounting. That keeps every
+  // internal registry — openApps, browserCards, per-card poll timers, and the
+  // browser cards' tab/webview keep-alive state (card-scoped closures + DOM,
+  // freed with the card) — from outliving its card into the next board. No
+  // persist() in the sweep: mid-switch the store already holds the TARGET
+  // board's keys, and writing leftovers would clobber them.
+  function restoreFromStore() {
+    clearTimeout(persistTimer);   // a stale debounce must not race the mount
+    openApps.forEach((rec, appId) => {
+      if (rec.handle && rec.handle.el && rec.handle.el.isConnected) return;
+      (rec.cleanups || []).forEach((fn) => { try { fn(); } catch { /* best effort */ } });
+      openApps.delete(appId);
+    });
     const saved = A.store.get(STORE_KEY, []);
     if (!Array.isArray(saved)) return;
     saved.forEach((rec) => {
       if (!rec || !TYPES[rec.type]) return;
+      if (rec.id && openApps.has(rec.id)) return;   // already live — skip
       makeApp(rec.type, { id: rec.id, config: rec.config, rect: rec.rect || undefined });
     });
-  })();
+  }
+  restoreFromStore();
 
   // ── own the dock (clone-replace strips core's listeners → no double-spawn) ─
   const DOCK_MAP = {

@@ -49,7 +49,10 @@
       selection BEFORE panel-closing (mid-drag it cancels the marquee and
       restores the pre-drag selection). Dragging ANY selected card's bar
       moves the whole selection together. Delete/Backspace (not while
-      typing) removes every selected card — each fires card:removed.
+      typing) removes every selected card — each fires card:removed. The
+      builtin metrics/chat cards are permanent: no × in their bars and
+      Delete skips them (the in-place board switch dropped reload, so a
+      closed builtin would stay dead on every board until app restart).
   11. Zoombar ✦ (Auto-arrange) or Atelier.canvas.tidy() — cards sort by
       (y, x) and flow left→right into viewport-wide rows with 24px gutters,
       animating (CSS transition via .tidying) into place, then fitToView().
@@ -58,6 +61,11 @@
       stroked rect), redrawn throttled ~250ms on card add/remove/drag-end
       and pan/zoom. Click or drag on it pans so that world point centers.
       On/off persists in Atelier.store key 'minimap' (default ON).
+  13. In the console spawn a card (Atelier.spawnApp('note')), select it, then
+      run Atelier.canvas.removeAllCards() — the spawned card disappears with
+      a 'card:removed' bus event, the built-in metrics + chat cards (stamped
+      data-atl-builtin at boot) stay, and the selection is cleared. Boards
+      use this for in-place board switches.
    =========================================================================== */
 
 (function () {
@@ -338,9 +346,20 @@
 
     cardHandles.set(el, handle); // Delete-key removal routes through the handle
 
-    // close button routes through the handle so card:removed fires
+    // close button routes through the handle so card:removed fires. Builtin
+    // shell cards (index.html metrics/chat, stamped data-atl-builtin in the
+    // boot loop below) are PERMANENT: since the in-place board switch dropped
+    // location.reload(), nothing would ever recreate a closed builtin —
+    // removeAllCards skips-but-never-rebuilds them and every board's saved
+    // 'atelier.layout' expects them to exist — so their × is hidden and never
+    // wired (deleteSelected skips them too). ponytail: hide-on-close +
+    // reshow-on-switch is the upgrade if closable builtins are ever wanted.
     const x0 = el.querySelector('.card-x');
-    if (x0) x0.addEventListener('click', () => handle.remove());
+    if (el.dataset.atlBuiltin === '1') {
+      if (x0) x0.style.display = 'none';
+    } else if (x0) {
+      x0.addEventListener('click', () => handle.remove());
+    }
 
     bus.emit('card:added', { id, el });
     return handle;
@@ -417,11 +436,30 @@
   });
 
   function deleteSelected() {
-    // route through the handles so card:removed fires for every card
+    // route through the handles so card:removed fires for every card;
+    // builtin shell cards are permanent (no re-create path — see addCard)
     Array.from(selected).forEach((el) => {
+      if (el.dataset.atlBuiltin === '1') return;
       const h = cardHandles.get(el);
       if (h) h.remove();
     });
+  }
+
+  // removeAllCards(): board-switch teardown (boards.js calls this before
+  // restoring the target board's snapshot). Removes every non-builtin card
+  // THROUGH its addCard handle so 'card:removed' fires per card and modules
+  // can drop their per-card state; the static index.html cards (stamped
+  // data-atl-builtin in the boot loop) survive. Any selection left on the
+  // survivors is cleared afterwards.
+  function removeAllCards() {
+    Array.from(content.children).forEach((el) => {
+      if (!el.classList.contains('card')) return;
+      if (el.dataset.atlBuiltin === '1') return;
+      const h = cardHandles.get(el);
+      if (h) h.remove();
+      else el.remove(); // never addCard-adopted (should not happen) — drop quietly
+    });
+    clearSelection();
   }
 
   // ── tidy / auto-arrange (zoombar ✦) ───────────────────────────────────────
@@ -917,7 +955,7 @@
 
   // ── publish the API ───────────────────────────────────────────────────────
   window.Atelier = {
-    canvas: { addCard, onDoubleClick, viewport, screenToWorld, fitToView, setViewport, tidy },
+    canvas: { addCard, removeAllCards, onDoubleClick, viewport, screenToWorld, fitToView, setViewport, tidy },
     selection: {
       get: () => Array.from(selected),   // selected card elements
       clear: clearSelection,
@@ -942,6 +980,7 @@
   document.querySelectorAll('#content > .card').forEach((el) => {
     const x = parseFloat(el.style.left) || 0;
     const y = parseFloat(el.style.top) || 0;
+    el.dataset.atlBuiltin = '1'; // static shell cards; removeAllCards skips these
     addCard(el, { x, y }); // width/height stay from CSS; look unchanged
   });
 
@@ -957,6 +996,7 @@
     const A = window.Atelier;
     const checks = [
       ['canvas.addCard', A.canvas && typeof A.canvas.addCard === 'function'],
+      ['canvas.removeAllCards', A.canvas && typeof A.canvas.removeAllCards === 'function'],
       ['canvas.onDoubleClick', typeof A.canvas.onDoubleClick === 'function'],
       ['canvas.viewport', typeof A.canvas.viewport === 'function'],
       ['canvas.screenToWorld', typeof A.canvas.screenToWorld === 'function'],

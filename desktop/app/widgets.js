@@ -17,7 +17,18 @@
    • Every widget card has a ⚙ gear that opens a live config form built from the
      type's `fields`; editing title + settings re-renders the widget in place.
    • Positions, sizes and configs persist via Atelier.store under the key
-     "atelier.widgets" and are restored on load.
+     "atelier.widgets", restored by an idempotent restoreFromStore() at load
+     AND on bus 'boards:switched' (round 14: boards.js switches boards in
+     place — canvas.removeAllCards() fires 'card:removed' per widget card,
+     which stops timers/pollers + clears the instance map below, then the
+     target board's store keys land and 'boards:switched' re-mounts them).
+     Nothing to flush on 'boards:will-switch': every persist() call site here
+     (spawn, drag mouseup, cards:rearranged, card:removed, config save) writes
+     localStorage synchronously — no debounce timer exists in this module.
+     Will-switch DOES close any open widget config panel (real switches only;
+     reason:'export' is exempt): its Save closure targets a card the switch
+     destroys, and saving afterwards would re-mount a live poller on a
+     detached body (the old reload wiped panels for free).
    • LIVE DATA BINDINGS — metric / status / chart / list each gain a
      "Data source" select ('' Static, metrics, runs, jobs, notifications,
      health) + a "Field path" dot-path text field. A shared mount polls the
@@ -56,12 +67,20 @@
       runs → bars of latency_ms per run (Field path overrides the per-run
       key, e.g. tokens). Checklist → source = jobs → "name — schedule" rows;
       source = notifications → "name: error" rows.
+   9. BOARDS — create a second board in the sidebar and switch to it: the
+      widgets from steps 2–6 disappear IN PLACE (no reload) and the new board
+      is empty. Add a Clock there, switch back → the original widgets return
+      at their spots; the clock stays on board 2. Switch with a widget config
+      panel open → the panel closes with the switch. No orphan ticking: after
+      a switch, `AtelierWidgets.instances.size` matches the visible widget
+      cards and removed clocks/pollers stop (watch the Network/console).
 
    ── SELF-CHECK ─────────────────────────────────────────────────────────────
    On load, a console.assert verifies all 5 types registered (see bottom). A
    scriptable hook is exposed as window.AtelierWidgets for headless testing:
      AtelierWidgets.spawn('metric', { title:'X', value:'9' })  // returns handle
      AtelierWidgets.instances                                   // Map of live widgets
+     AtelierWidgets.restoreFromStore()                          // idempotent re-mount
      localStorage['atelier:atelier.widgets']                    // persisted state
    ========================================================================== */
 
@@ -584,6 +603,10 @@
   function applyConfig(inst, newCfg) {
     const def = A.widgets.get(inst.type);
     if (!def) return;
+    // The card can be removed while its config panel is open (board switch,
+    // Delete key, close ×). Its 'card:removed' already ran cleanup; saving now
+    // would re-mount a poller onto the detached body that nothing ever stops.
+    if (!instances.has(inst.id)) return;
     if (inst.cleanup) { try { inst.cleanup(); } catch (_) {} inst.cleanup = null; }
     inst.config = newCfg;
     inst.cleanup = renderBody(def, newCfg, inst.bodyEl);
@@ -651,22 +674,33 @@
     return form;
   }
 
+  // Open config panels, tracked module-level so a board switch can close them
+  // (core's panel.close() is panel.remove() — safe to call twice).
+  const cfgPanels = new Set();
+
   function openConfigForm(id) {
     const inst = instances.get(id);
     if (!inst) return;
     const def = A.widgets.get(inst.type);
     if (!def) return;
     let panel;
+    const dismiss = () => {
+      if (!panel) return;
+      try { panel.close(); } catch (_) {}
+      cfgPanels.delete(panel);
+      panel = null;
+    };
     const form = buildForm(
       def, inst.config,
       (values) => {
         applyConfig(inst, Object.assign({}, inst.config, values));
         A.ui.toast('Widget updated');
-        if (panel) panel.close();
+        dismiss();
       },
-      () => { if (panel) panel.close(); }
+      dismiss
     );
     panel = A.ui.openPanel('Configure · ' + (def.label || inst.type), form);
+    cfgPanels.add(panel);
   }
 
   // ── widget picker (compact floating menu) ──────────────────────────────────
@@ -739,25 +773,65 @@
     document.body.appendChild(btn);
   })();
 
-  // ── restore persisted widgets on load ──────────────────────────────────────
-  (function restore() {
+  // ── restore persisted widgets (load + in-place board switch) ───────────────
+  // Idempotent: a record whose instanceId is already live is skipped, so a
+  // stray double 'boards:switched' cannot duplicate cards. At load the map is
+  // empty and every record spawns; on a board switch, core's removeAllCards
+  // already fired 'card:removed' per widget card (clearing the map + stopping
+  // timers/pollers via the handler above), and boards.js has swapped in the
+  // TARGET board's store keys before emitting — so this re-mounts the target's
+  // records against a clean slate.
+  function restoreFromStore() {
     const saved = A.store.get(STORE_KEY, []);
     if (!Array.isArray(saved)) return;
     restoring = true;
     try {
       saved.forEach((rec) => {
         if (!rec || !rec.type || !A.widgets.has(rec.type)) return;
+        if (rec.instanceId && instances.has(rec.instanceId)) return; // already live
         spawnWidget(rec.type, { config: rec.config, rect: rec.rect, instanceId: rec.instanceId });
       });
     } finally {
       restoring = false;
     }
-  })();
+  }
+  restoreFromStore();
+
+  // ── in-place board switch (round 14) ───────────────────────────────────────
+  // Nothing to flush here: unlike apps.js / customization.js, every persist()
+  // in this module is synchronous (spawn, drag mouseup, cards:rearranged,
+  // card:removed, config save) — verified, no debounce timer exists. The only
+  // will-switch duty is closing open config panels: each Save closure targets
+  // a card removeAllCards is about to destroy (see the applyConfig guard).
+  // reason:'export' is boards' debounce-flush signal, not a real switch —
+  // exporting must not close panels (same check as views.js). Closing a
+  // panel is non-destructive, so it is safe here even when the quota gate
+  // later aborts the switch.
+  A.bus.on('boards:will-switch', (d) => {
+    if (d && d.reason === 'export') return;
+    cfgPanels.forEach((p) => { try { p.close(); } catch (_) {} });
+    cfgPanels.clear();
+  });
+
+  // Re-mount from the restored store. The teardown of the outgoing board's
+  // widgets already happened per card via 'card:removed'; the sweep below is
+  // a safety net for any instance whose card left the DOM without that event.
+  // It must NOT persist(): the store now holds the TARGET board's records —
+  // writing the (normally empty) map here would erase them.
+  A.bus.on('boards:switched', () => {
+    instances.forEach((inst, id) => {
+      if (inst.handle && inst.handle.el && inst.handle.el.isConnected) return;
+      if (inst.cleanup) { try { inst.cleanup(); } catch (_) {} }
+      instances.delete(id);
+    });
+    restoreFromStore();
+  });
 
   // ── scriptable hook for headless testing / the self-check ──────────────────
   window.AtelierWidgets = {
     spawn: (type, config, worldPos) => spawnWidget(type, worldPos ? { config, worldPos } : { config }),
     openPicker,
+    restoreFromStore,
     instances,
     STORE_KEY,
   };

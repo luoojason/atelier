@@ -15,13 +15,24 @@
        for "theme:set" and "canvas:toggleGrid" so other modules can drive it.
 
    (B) LAYOUT PERSISTENCE
-       Snapshots the whole board — every card's position/size (+ content for
-       runtime cards) AND the viewport (Atelier.canvas.viewport) — into
-       Atelier.store key "atelier.layout" on change (debounced), and restores
-       it on load so the studio reopens exactly as it was left. The viewport
-       is the explicitly-owned piece here: it is restored by driving the core's
-       own pan/zoom handlers with synthetic events, so the core's internal
-       pan/zoom stays in sync (no jump on the first interaction).
+       Snapshots the built-in cards' geometry AND the viewport
+       (Atelier.canvas.viewport) into Atelier.store key "atelier.layout" on
+       change (debounced), and restores it on load so the studio reopens
+       exactly as it was left. The viewport is the explicitly-owned piece
+       here: it is restored through Atelier.canvas.setViewport (which updates
+       the core's internal pan/zoom AND repaints, so there is no jump on the
+       first interaction); a synthetic-event fallback drives the core's own
+       pan/zoom handlers if setViewport is ever missing.
+
+   ROUND 14 — IN-PLACE BOARD SWITCH
+       boards.js no longer location.reload()s on a board switch. After it
+       swaps the live store keys it emits 'boards:switched', and this module
+       re-applies what it owns: the theme state ('atelier.theme' — currently a
+       GLOBAL key per boards.js, so usually a no-op re-render) and the
+       restored board's layout (built-in card geometry + viewport). Built-in
+       cards are never removed by the switch, so only their geometry moves.
+       A board with no saved layout (fresh board) is reset to the boot
+       defaults captured at load, mirroring what the old reload gave it.
 
    This module never edits index.html, core.js, styles.css, or another module.
    Its only CSS is injected below as a <style> string.
@@ -38,6 +49,12 @@
       canvas by dragging — it moves smoothly from the restored position (proof
       the core's pan state was restored in sync, not just the CSS transform).
    7. Console shows "[customization] ready …" with no console.assert failures.
+   8. (Round 14) Make two boards with different pan/zoom + metrics-card spots.
+      Switch between them via the sidebar — NO reload happens, yet the
+      metrics/chat cards jump to each board's saved geometry and the pan/zoom
+      lands exactly where that board left it (then drag-pan: no jump — the
+      core's internal pan state was restored too). Create a brand-new board →
+      built-ins return to their index.html spots, viewport resets to boot.
    ============================================================================ */
 
 (function () {
@@ -199,6 +216,22 @@
     state.grid = !!on;
     render(); persistTheme(); refreshPanel();
     if (!opts.silent) A.bus.emit('canvas:toggleGrid', state.grid);
+  }
+
+  // Re-read 'atelier.theme' from the store and apply it, silently: no
+  // persistTheme (the store already holds exactly what we just read), no bus
+  // echo, and NOT via the setters (setTheme clears any custom accent).
+  // Used on 'boards:switched' — boards.js keeps the theme key GLOBAL, so this
+  // is normally an idempotent re-render, but re-reading keeps us correct if a
+  // restored snapshot ever carries a theme of its own.
+  function applyThemeFromStore() {
+    const stored = Object.assign({}, DEFAULT_STATE, A.store.get('atelier.theme', {}));
+    if (!THEMES[stored.id]) stored.id = DEFAULT_STATE.id;
+    state.id = stored.id;         // mutate in place — setters + the debug
+    state.accent = stored.accent; // handle close over this object
+    state.grid = stored.grid;
+    render();
+    refreshPanel();
   }
 
   // restore theme on load
@@ -378,11 +411,23 @@
     saveTimer = setTimeout(saveLayout, 450);
   }
 
-  // Restore the viewport by driving the core's OWN pan/zoom handlers with
-  // synthetic events, so the core's internal pan/zoom stays consistent and the
-  // first real pan/zoom after load does not jump.
+  // Restore the viewport. Preferred path: Atelier.canvas.setViewport — core's
+  // sanctioned restore API (updates internal pan/zoom AND repaints). Fallback:
+  // drive the core's own pan/zoom handlers with synthetic events (the original
+  // technique from before setViewport existed). The fallback matters less than
+  // it looks, but stays because it is proven; setViewport is strictly safer on
+  // the round-14 in-place board switch, where synthetic window mouseup/move
+  // events would also tickle every OTHER live module's global listeners.
   function restoreViewport(vp) {
     if (!vp) return;
+    if (typeof A.canvas.setViewport === 'function') {
+      A.canvas.setViewport({
+        panX: typeof vp.panX === 'number' ? vp.panX : 0,
+        panY: typeof vp.panY === 'number' ? vp.panY : 0,
+        zoom: typeof vp.zoom === 'number' ? vp.zoom : 1,
+      });
+      return;
+    }
     const rect = canvasEl.getBoundingClientRect();
 
     // 1) Zoom, anchored at the current world-origin's screen point so pan is
@@ -441,6 +486,40 @@
     }
   }
 
+  // Boot defaults, captured BEFORE the load-time restore moves anything: the
+  // built-in cards' index.html inline styles + the core's boot viewport. A
+  // fresh board (no 'atelier.layout' snapshot) is reset to these on switch —
+  // the same state the old location.reload() used to hand it.
+  const BOOT = {
+    cards: (function () {
+      const m = {};
+      content.querySelectorAll(':scope > .card[data-card]').forEach((el) => {
+        m[el.getAttribute('data-card')] = el.getAttribute('style') || '';
+      });
+      return m;
+    })(),
+    viewport: A.canvas.viewport(),
+  };
+
+  // Reset built-in geometry + viewport to the captured boot defaults. Writing
+  // style.cssText (not left/top/w/h) also CLEARS any inline width/height a
+  // previous board's restore pinned on, so CSS sizing comes back exactly as at
+  // boot. Only used on the boards:switched path, never at load.
+  function resetLayoutToBoot() {
+    restoring = true;
+    try {
+      for (const key in BOOT.cards) {
+        const el = content.querySelector(`.card[data-card="${key}"]`);
+        if (el) el.style.cssText = BOOT.cards[key];
+      }
+      restoreViewport(BOOT.viewport);
+    } catch (err) {
+      console.warn('[customization] resetLayoutToBoot failed', err);
+    } finally {
+      restoring = false;
+    }
+  }
+
   // Restore, THEN start watching for changes (so restore never re-triggers a save).
   restoreLayout();
 
@@ -455,10 +534,31 @@
   // board's keys are swapped and write this board's layout into the next one.
   A.bus.on('boards:will-switch', () => { clearTimeout(saveTimer); saveLayout(); });
 
+  // Round 14: boards.js switches in place (no reload) and emits this after the
+  // live keys are swapped. Re-apply what this module owns: theme state, then
+  // the restored board's layout (built-in card geometry + viewport — built-ins
+  // are never removed by the switch, so only geometry moves). Double-restore
+  // guard, same quirk this file was already burned by (see restoreLayout's
+  // comment): only builtin-kind entries are touched — runtime cards re-mount
+  // themselves in widgets.js/apps.js from their own stores, and any legacy
+  // 'html' entries in old snapshots stay ignored. Also disarm the debounce
+  // timer first: the switch's removeAllCards fired card:removed per runtime
+  // card, arming a save that must not race the restore below.
+  // ponytail: unconditional full re-apply, no diffing — two built-in cards +
+  // one setViewport call is too cheap to be worth change detection.
+  A.bus.on('boards:switched', () => {
+    clearTimeout(saveTimer);
+    applyThemeFromStore();
+    let saved = null;
+    try { saved = A.store.get(LAYOUT_KEY, null); } catch { saved = null; }
+    if (saved) restoreLayout();
+    else resetLayoutToBoot(); // fresh board: reload used to mean boot defaults
+  });
+
   // debug / manual-test handle
   window.__atelierCustomization = {
     state, setTheme, setAccent, setGridOn, openPanel,
-    saveLayout, restoreLayout, THEMES,
+    saveLayout, restoreLayout, applyThemeFromStore, resetLayoutToBoot, THEMES,
   };
 
   /* ── self-check: non-destructive assertions ──────────────────────────────── */

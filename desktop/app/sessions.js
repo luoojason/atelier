@@ -47,10 +47,22 @@
    Contract: builds ONLY against window.Atelier + fetch. Injects its own CSS.
    Does not touch core.js, apps.js, boards.js, or styles.css.
 
+   Board switches (round 14, in-place): agent cards are per-page-load and not
+   board-scoped (nothing here touches localStorage, so board snapshots never
+   carry them). Under the old location.reload() switch they simply vanished;
+   the in-place switch closes them at boards' canvas.removeAllCards() step —
+   every agent card is an ordinary addCard card, so core removes it through
+   its handle, card:removed fires per card, arrows unlink, each backend
+   session gets its best-effort DELETE (sooner than the old reload-then-LRU
+   path), and the discovery sweep stops when the map empties. Deliberately NO
+   'boards:will-switch' close here: will-switch fires BEFORE boards' quota
+   gate, and a quota-aborted switch (toast, board unchanged) must leave live
+   agent conversations intact — removeAllCards only runs after the gate.
+
    ponytail: agent cards are NOT persisted (backend sessions are in-memory and
-   die with the server; a board switch reloads the page and drops the cards —
-   the backend's LRU cap reclaims the orphaned sessions). Disk persistence on
-   both sides is the upgrade.
+   die with the server; a board switch closes the cards in place — see above —
+   and the backend's LRU cap reclaims anything the best-effort DELETE missed).
+   Disk persistence on both sides is the upgrade.
 
    ── MANUAL TEST ────────────────────────────────────────────────────────────
    1. Start the backend (PORT=8765 .venv-ext/bin/python lite_server.py) and
@@ -84,7 +96,14 @@
   10. Restart the backend, then send in a revealed child card → the inline
       sub-agent-expired note appears and the card does NOT create a fresh
       session; the message stays in the composer.
-  11. Console shows "[sessions] self-check passed" and no assert failures.
+  11. Board switch: with two agent cards open (one with a revealed child),
+      switch boards in the sidebar → all agent cards close in place (no
+      reload), Network tab shows one DELETE /sessions/{id} per card, arrows
+      disappear, and the GET /sessions sweep stops. Exporting a board leaves
+      agent cards untouched, and so does a FAILED switch (fill localStorage
+      until the "storage is full" toast fires → the board stays put and the
+      agent conversations survive).
+  12. Console shows "[sessions] self-check passed" and no assert failures.
    =========================================================================== */
 
 (function () {
@@ -492,7 +511,8 @@
     }
     const handle = A.canvas.addCard(card, { x: pos.x, y: pos.y, w: CARD_W, h: CARD_H });
 
-    // card closed (×, or programmatically) → stop polling + free the backend
+    // card closed (×, board switch's removeAllCards, or programmatically) →
+    // stop polling + free the backend
     const off = A.bus.on('card:removed', ({ el }) => {
       if (el !== card) return;
       closed = true;
@@ -548,6 +568,17 @@
     if (!btn) { console.warn('[sessions] no Agent dock button found.'); return; }
     btn.addEventListener('click', () => { A.spawnApp('agent'); });
   })();
+
+  // ── board switch ───────────────────────────────────────────────────────────
+  // Nothing to do here on purpose. Agent cards are ordinary addCard cards, so
+  // boards' in-place switch closes them at its canvas.removeAllCards() step
+  // (AFTER the snapshot quota gate) and each card's card:removed handler above
+  // does the full teardown: stop poll, untrack, mark dismissed, best-effort
+  // DELETE, arrows unlink. An earlier 'boards:will-switch' close was removed —
+  // it fired BEFORE the quota gate, so a switch that aborted on the "storage
+  // is full" toast (board unchanged) had already destroyed every agent
+  // conversation on both sides. Nothing to flush either: this module never
+  // writes board-scoped store keys.
 
   // ── self-check ─────────────────────────────────────────────────────────────
   (function selfCheck() {

@@ -6,9 +6,15 @@
    Multiple named dashboards ("boards"). The ACTIVE board's state lives in the
    ordinary live 'atelier:*' localStorage keys that every feature module
    already reads/writes; INACTIVE boards exist only as snapshots. Switching
-   boards = snapshot the live board-scoped keys, swap in the target's
-   snapshot, reload — every module's own boot-restore then re-renders the new
-   board for free.
+   boards is IN-PLACE (no reload): flush ('boards:will-switch') -> thumb +
+   snapshot the live board-scoped keys -> canvas.removeAllCards() -> swap in
+   the target's snapshot -> 'boards:switched', on which every module
+   re-mounts its cards from the restored store.
+
+   KNOWN BEHAVIOR CHANGE (in-place switch): the built-in chat card's
+   transcript is page-scoped DOM, not board state, so it now PERSISTS across
+   board switches — which matches the single long-lived backend conversation
+   better than the old reload-wipe did.
 
    Data (raw localStorage keys):
      'atelier:boards'            -> [{id, name, createdAt, updatedAt,
@@ -33,10 +39,12 @@
       active (first run adopts your current canvas as that board).
    3. Add a widget or note, drag it somewhere memorable, release the mouse and
       wait ~2s — in Electron the row's thumbnail updates to a real screenshot.
-   4. Click "+" in the Dashboards header -> "Board 2" is created and the app
-      reloads onto an empty canvas (only the built-in metrics/chat cards).
-   5. Click the "Main studio" row -> reload -> your widget/note is back
-      exactly where you left it. In DevTools, localStorage now holds
+   4. Click "+" in the Dashboards header -> "Board 2" is created and the
+      canvas swaps IN PLACE (no reload) to an empty board — only the built-in
+      metrics/chat cards remain, and the chat transcript survives the switch.
+   5. Click the "Main studio" row -> in-place swap again -> your widget/note
+      is back exactly where you left it, and the sidebar active highlight has
+      moved without a reload. In DevTools, localStorage now holds
       'atelier:board.<id>.state' for whichever board is NOT active.
    6. Click "⌄" in the Dashboards header -> the "All boards" panel opens:
       cover thumbnails, names, updated dates, a search box that filters by
@@ -253,25 +261,52 @@
   window.addEventListener('mouseup', scheduleThumb);
 
   // ── board operations ───────────────────────────────────────────────────────
+  // Shared in-place mount — the ONLY path that swaps the live keys. Both real
+  // switches (switchTo) and delete-active landings (remove) come through here
+  // AFTER their own will-switch / snapshot steps:
+  //   canvas.removeAllCards()  -> 'card:removed' fires per non-builtin card,
+  //                               so modules drop their per-card state
+  //   removeLiveScoped() + restoreSnapshot(id) + LAST_KEY = id
+  //   'boards:switched'        -> modules re-mount from the restored store
+  //   syncUI()                 -> sidebar highlight / all-boards panel follow
+  function mountBoard(id) {
+    // The target can be deleted between switchTo's entry check and here: the
+    // await captureThumb() suspension leaves the All boards panel interactive,
+    // so a Delete can land mid-switch. Mounting a ghost id would strand
+    // LAST_KEY outside the index (the old reload path self-healed via boot()'s
+    // dangling-lastBoardId migration; in-place has no reload) — mirror boot
+    // and land on the first remaining board instead.
+    const idx = readIndex();
+    if (!idx.length) return;                         // boot + remove() keep >= 1 board
+    if (!idx.some((b) => b.id === id)) id = idx[0].id;
+    A.canvas.removeAllCards();
+    removeLiveScoped();
+    restoreSnapshot(id);
+    try { localStorage.setItem(LAST_KEY, id); } catch {}
+    A.bus.emit('boards:switched', { to: id });
+    syncUI();
+  }
+
   async function switchTo(id) {
     if (id === activeId()) return;
     if (!readIndex().some((b) => b.id === id)) return;
     // Flush the sibling modules' debounced saves BEFORE snapshotting, or a
     // drag/edit inside the debounce window is missing from the snapshot (and a
     // timer firing after removeLiveScoped would leak it into the next board).
-    // apps.js / widgets.js / customization.js listen and persist+disarm.
+    // apps.js / widgets.js / customization.js listen and persist+disarm;
+    // views.js closes the open view. Nothing DESTRUCTIVE may hang off this
+    // event: the quota gate below can still abort with the board unchanged
+    // (agent cards, for one, are only closed later by mountBoard's
+    // removeAllCards — after the gate).
     try { A.bus.emit('boards:will-switch', { to: id }); } catch {}
     try { await captureThumb(); } catch {}
     if (!snapshotLive(activeId())) {
       A.ui.toast('Board switch failed — storage is full');
-      return;
+      return;                                        // quota-abort: board unchanged
     }
-    removeLiveScoped();
-    restoreSnapshot(id);
-    try { localStorage.setItem(LAST_KEY, id); } catch {}
-    // ponytail: reload-based switch — every module's boot-restore does the
-    // re-render for free; in-place switching is the upgrade path.
-    location.reload();
+    // ponytail: the in-place switch rebuilds via remove-all + full re-restore
+    // — no card diffing; fine at board scale (tens of cards), diff if not.
+    mountBoard(id);
   }
 
   async function create(name) {
@@ -365,18 +400,24 @@
     localStorage.removeItem(stateKey(id));
     localStorage.removeItem(thumbKey(id));
     if (!wasActive) { writeIndex(rest); return; }
-    // Deleting the active board: its live keys go too, then land somewhere.
-    removeLiveScoped();
+    // Deleting the active board: its live keys go too, then land somewhere
+    // (the first remaining board, or a fresh "Main studio").
+    let landing;
     if (rest.length) {
       writeIndex(rest, { silent: true });
-      restoreSnapshot(rest[0].id);
-      try { localStorage.setItem(LAST_KEY, rest[0].id); } catch {}
+      landing = rest[0].id;
     } else {
       const nb = newEntry('Main studio');
       writeIndex([nb], { silent: true });
-      try { localStorage.setItem(LAST_KEY, nb.id); } catch {}
+      landing = nb.id;
     }
-    location.reload();
+    // Same flush/close as a real switch (disarm debounce timers, close views)
+    // or a late timer could resurrect deleted-board keys into the landing
+    // board; agent cards go in mountBoard's removeAllCards. No thumb/snapshot:
+    // this board's state is gone on purpose — mountBoard's removeLiveScoped
+    // drops the live keys.
+    try { A.bus.emit('boards:will-switch', { to: landing }); } catch {}
+    mountBoard(landing);
   }
 
   // ── export / import ────────────────────────────────────────────────────────
@@ -730,11 +771,14 @@
   A.bus.on('palette:ready', registerPaletteCommands); // covers palette.js loading after this module
 
   // ── keep every surface in sync ─────────────────────────────────────────────
-  A.bus.on('boards:changed', () => {
+  // Called on index changes AND after every in-place mount (a plain switch
+  // never touches the index, so the active highlight would otherwise stall).
+  function syncUI() {
     renderSidebar();
     registerPaletteCommands();                       // palette dedupes by id
     if (allPanel && document.body.contains(allPanel.el) && allPanelRender) allPanelRender();
-  });
+  }
+  A.bus.on('boards:changed', syncUI);
 
   // ── public API ─────────────────────────────────────────────────────────────
   window.Atelier.boards = {

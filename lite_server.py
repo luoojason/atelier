@@ -533,6 +533,58 @@ async def notifications(limit: int = 20):
     return {"notifications": [n for n in records if isinstance(n, dict)]}
 
 
+# --- Run-log endpoint (read-only tail of the desktop backend log) ---------------
+#
+# main.js appends the backend's stdio to ~/.atelier/logs/backend.log and rotates
+# it at 5MB, so the file is always small — but the read still seeks in from the
+# end and decodes at most ~1MB, never the whole file. Same conventions as the
+# dashboard endpoints above: fixed shape, resolve the path from env at CALL
+# time (ATELIER_BACKEND_LOG), degrade to the empty shape on any failure, never
+# 500. ponytail: sync <=1MB local read inside an async handler, same deliberate
+# trade as the ledger readers; asyncio.to_thread is the upgrade if it ever
+# points at slow storage.
+
+_LOG_TAIL_MAX_BYTES = 1024 * 1024  # never load more than ~1MB of the log
+
+
+def _log_path() -> Path:
+    return Path(
+        os.getenv("ATELIER_BACKEND_LOG") or "~/.atelier/logs/backend.log"
+    ).expanduser()
+
+
+def _tail_lines(path: Path, n: int) -> tuple[list[str], int]:
+    """The last ``n`` lines of ``path`` plus its total byte size.
+
+    Reads only the final _LOG_TAIL_MAX_BYTES window (seek from the end) and
+    decodes errors='replace', so binary garbage and a multibyte char torn by
+    the window boundary both degrade to replacement chars instead of raising.
+    When the window starts mid-file its first "line" can be a fragment of a
+    longer one; slicing the LAST n lines discards it except in the degenerate
+    case of >1KB average lines (1MB window / 1000-line max tail) — accepted.
+    """
+    with path.open("rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        start = max(0, size - _LOG_TAIL_MAX_BYTES)
+        fh.seek(start)
+        data = fh.read(size - start)
+    return data.decode("utf-8", errors="replace").splitlines()[-n:], size
+
+
+@app.get("/logs/backend")
+async def logs_backend(tail: int = 200):
+    # Its own clamp, NOT _clamp_limit: the run-log card asks for 300 lines and
+    # the contract ceiling is 1000, past the dashboard readers' 200.
+    n = max(1, min(1000, tail))
+    path = _log_path()
+    try:
+        lines, size = _tail_lines(path, n)
+    except OSError:  # missing file, unreadable, path-is-a-directory — never 500
+        return {"lines": [], "path": str(path), "size": 0}
+    return {"lines": lines, "path": str(path), "size": size}
+
+
 # --- /config + Claude Code usage endpoints (/cc/*) -----------------------------
 #
 # Read-only views over ~/.claude/projects transcripts via cc_usage (ported from
