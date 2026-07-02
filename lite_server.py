@@ -101,7 +101,7 @@ Be concise. When you take an action with a tool, say plainly what you did and ci
 
 If a task needs a tool or capability you do not have, or a tool returns an error or no results, say so plainly. NEVER present training-knowledge as if it were searched, fetched, or retrieved — do not fabricate sources, URLs, or live data.
 
-When SpawnAgent/CheckAgent are available you can delegate a subtask to a parallel sub-agent and collect its result later; sub-agents run as their own isolated sessions. When DelegateToSubagent is available you govern one or more existing sub-agent cards; call it with a governed card's id or name to hand it a subtask and get its reply back inline. When OpenBrowser is available and you need to open a web page for the user, call OpenBrowser(url) — it spawns a browser card on the dashboard connected to you by an arrow and loads the page, so prefer it over just describing a URL; NavigateBrowser instead drives a browser the user has already linked to you."""
+When SpawnAgent/CheckAgent are available you can delegate a subtask to a parallel sub-agent and collect its result later; sub-agents run as their own isolated sessions. When DelegateToSubagent is available you govern one or more existing sub-agent cards; call it with a governed card's id or name to hand it a subtask and get its reply back inline. When OpenBrowser is available and you need to open a web page for the user, call OpenBrowser(url) — it spawns a browser card on the dashboard connected to you by an arrow and loads the page, so prefer it over just describing a URL; NavigateBrowser instead drives a browser the user has already linked to you. When CreateCard is available and you produce a written deliverable — a note or a document — call CreateCard(kind, content) to place it on the dashboard as its own card connected to you by an arrow (kind='note' for short text, kind='document' for a complete self-contained HTML page), rather than only printing it in chat."""
 
 LIGHT_TOOLS = [
     VaultSearch,
@@ -316,6 +316,7 @@ def build_options(
                 "mcp__orchestra__CheckAgent",
                 "mcp__orchestra__NavigateBrowser",
                 "mcp__orchestra__OpenBrowser",
+                "mcp__orchestra__CreateCard",
             ]
         if children:
             allowed_tools.append("mcp__orchestra__DelegateToSubagent")
@@ -2068,8 +2069,8 @@ async def deck_pptx(req: DeckPptxRequest):
 # Shape (fixed contract with app/sessions.js + tests):
 #   POST   /sessions                {"name"?}    -> {"id","name"}
 #   GET    /sessions                             -> {"sessions":[{id,name,status,messages_len,parent_id,depth}]}
-#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}],parent_id,depth,browser_nav,canvas_op}
-#   (browser_nav + canvas_op ride ONLY on the detail route the card polls, never the list)
+#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}],parent_id,depth,browser_nav,canvas_ops}
+#   (browser_nav + canvas_ops ride ONLY on the detail route the card polls, never the list)
 #   POST   /sessions/{id}/message   {"message"}  -> 202 {"status":"running"} (fire-and-poll)
 #   DELETE /sessions/{id}                        -> {"ok":true}
 #   unknown id -> 404 {"error":"unknown session"}; a turn error sets
@@ -2088,9 +2089,11 @@ class _AgentSession:
     ``browser_nav`` is the latest NavigateBrowser request against this session
     ({"url", "seq"}, seq strictly increasing) or None; the desktop card polls
     it off GET /sessions/{id} and acts when seq advances past what it has seen.
-    ``canvas_op`` is the latest OpenBrowser request ({"kind", "url", "seq"},
-    seq strictly increasing) or None — the agent-driven "spawn a card, arrow-
-    link it to me, then drive it" op the card acts on the same seq-gated way.
+    ``canvas_ops`` is the QUEUE of agent-driven "spawn a card, arrow-link it to
+    me, then fill/drive it" ops (OpenBrowser + CreateCard), each {"kind", ...,
+    "seq"} with a strictly-increasing seq. The card drains every op past its
+    high-water mark, in seq order, each poll — a list so several ops emitted in
+    ONE turn all fire (a single field would keep only the last).
     """
 
     def __init__(
@@ -2115,12 +2118,16 @@ class _AgentSession:
         self.status = "idle"  # "idle" | "running" | "error"
         self.messages: list[dict] = []  # {"role","text","ts"} append-only
         self.browser_nav: dict | None = None  # latest NavigateBrowser request
-        # latest OpenBrowser request: an agent-driven "spawn a card on the
-        # canvas, arrow-link it to me, then drive it" op ({"kind","url","seq"},
-        # seq strictly increasing) or None. Unlike browser_nav (which drives a
-        # browser the USER linked), canvas_op tells the card to CREATE the
-        # browser card itself and register the link — no manual gesture.
-        self.canvas_op: dict | None = None
+        # QUEUE of agent-driven "spawn a card on the canvas, arrow-link it to
+        # me, then fill/drive it" ops (OpenBrowser -> {"kind":"browser","url"},
+        # CreateCard -> {"kind":"note"|"document","title","content"}), each with
+        # a strictly-increasing "seq". A LIST, not a single slot: the model can
+        # emit several of these tools in ONE turn (sub-second apart, faster than
+        # the frontend's 1.5s poll), so a single field would drop all but the
+        # last. The card drains every op with seq > its high-water mark, in seq
+        # order, each poll. Bounded (see _push_canvas_op) so a long-lived
+        # session cannot grow it without limit.
+        self.canvas_ops: list[dict] = []
         self.last_used = next(_session_touch)
 
 
@@ -2335,7 +2342,7 @@ async def get_session(session_id: str):
         "depth": sess.depth,
         "model": sess.model,
         "browser_nav": sess.browser_nav,
-        "canvas_op": sess.canvas_op,
+        "canvas_ops": list(sess.canvas_ops),
     }
 
 
@@ -2504,11 +2511,32 @@ def _governs_cycle(parent_id: str, child_id: str) -> bool:
 # seq against the last one it acted on, so repeats of the SAME url still fire.
 _browser_nav_seq = itertools.count(1)
 
-# Module-wide monotonic counter for canvas_op (OpenBrowser) requests. Same
-# seq-gated poll contract as browser_nav, on its own field so the two never
-# collide: a card can hold both a "spawn a browser" op and a "drive the linked
-# browser" op independently.
+# Module-wide monotonic counter for canvas_op (OpenBrowser + CreateCard)
+# requests. Same seq-gated poll contract as browser_nav, on its own field so
+# the two never collide: a card can hold both a "spawn a browser" op and a
+# "drive the linked browser" op independently. canvas_op is last-writer-wins
+# across all its kinds (browser / note / document).
 _canvas_op_seq = itertools.count(1)
+
+# Per-kind content caps for CreateCard (the agent authors the content inline).
+# A note is short markdown/text; a document is a full self-contained HTML page
+# (300k matches app/document.js PERSIST_HTML_MAX so an in-cap document persists
+# per board — a larger one still renders but the card will not save it).
+_CREATE_CARD_CAPS = {"note": 8_000, "document": 300_000}
+
+# Bound on a session's canvas-op queue. The frontend drains ops by seq every
+# poll, so this only ever holds a turn's worth; the cap is a backstop against a
+# runaway loop. Dropping the OLDEST when over cap is safe: monotonic seqs mean
+# an already-drained op has seq <= the card's high-water mark and would be
+# skipped anyway.
+_MAX_CANVAS_OPS = 50
+
+
+def _push_canvas_op(sess: "_AgentSession", op: dict) -> None:
+    """Append a canvas op to the session's queue, trimming to the cap."""
+    sess.canvas_ops.append(op)
+    if len(sess.canvas_ops) > _MAX_CANVAS_OPS:
+        del sess.canvas_ops[: -_MAX_CANVAS_OPS]
 
 _HTTP_URL_RE = re.compile(r"^https?://")
 
@@ -2766,15 +2794,80 @@ def _orchestra_tools(parent_id: str) -> list:
             # The spawner was deleted/evicted mid-turn; there is no session for
             # the card to poll, so the request has nowhere to land.
             return _tool_text("Your session is gone; cannot open a browser.")
-        parent.canvas_op = {
+        _push_canvas_op(parent, {
             "kind": "browser",
             "url": url,
             "seq": next(_canvas_op_seq),
-        }
+        })
         return _tool_text(
             f"Opening {url} in a browser card on your dashboard — a new card"
             " will appear beside yours, connected by an arrow, and load the"
             " page (or an already-linked browser will navigate to it)."
+        )
+
+    @tool(
+        "CreateCard",
+        "Create a card on the dashboard beside your card and fill it with"
+        " content you write, connected to your card by an arrow (no manual"
+        " linking). kind='note' is short markdown or plain text; kind='document'"
+        " is a COMPLETE self-contained, print-ready HTML document. It renders in"
+        " a locked-down sandbox with a strict Content-Security-Policy: use"
+        " inline CSS and data: images only — scripts, forms, and ALL external"
+        " network/image/font/stylesheet loads are blocked, so anything remote"
+        " simply will not appear. Author the full content yourself in this call;"
+        " use this to hand the user a written deliverable they can see on the"
+        " canvas.",
+        {
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["note", "document"],
+                    "description": "The card type: 'note' (short text) or"
+                    " 'document' (a full self-contained HTML document).",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Optional short title for the card.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "The full note text, or a complete"
+                    " self-contained HTML document when kind='document'.",
+                },
+            },
+            "required": ["kind", "content"],
+        },
+    )
+    async def _create_card(args):
+        kind = str(args.get("kind") or "").strip()
+        if kind not in _CREATE_CARD_CAPS:
+            return _tool_text('kind must be "note" or "document".')
+        content = str(args.get("content") or "")
+        if not content.strip():
+            return _tool_text("content is required — write the card's content.")
+        cap = _CREATE_CARD_CAPS[kind]
+        if len(content) > cap:
+            return _tool_text(
+                f"content is too long for a {kind} card ({len(content)} chars;"
+                f" max {cap})."
+            )
+        parent = _sessions.get(parent_id)
+        if parent is None:
+            # The spawner was deleted/evicted mid-turn; there is no session for
+            # the card to poll, so the request has nowhere to land.
+            return _tool_text("Your session is gone; cannot create a card.")
+        title = str(args.get("title") or "").strip()
+        _push_canvas_op(parent, {
+            "kind": kind,
+            "title": title,
+            "content": content,
+            "seq": next(_canvas_op_seq),
+        })
+        return _tool_text(
+            f"Creating a {kind} card on your dashboard, connected to your card"
+            " by an arrow — it will appear beside yours filled with the content"
+            " you wrote."
         )
 
     @tool(
@@ -2875,13 +2968,14 @@ def _orchestra_tools(parent_id: str) -> list:
         )
 
     # NOTE: _delegate_agent stays at index 3 (tests unpack it by index); new
-    # tools append to the END.
+    # tools append to the END (open_browser [4], create_card [5]).
     return [
         _spawn_agent,
         _check_agent,
         _navigate_browser,
         _delegate_agent,
         _open_browser,
+        _create_card,
     ]
 
 

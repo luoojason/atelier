@@ -2,8 +2,8 @@
 registry the tool-inspector card renders: the 16 atelier LIGHT_TOOLS
 introspected with the SAME schema builder sdk_tools uses to register them,
 plus the orchestra tools (SpawnAgent/CheckAgent/NavigateBrowser/OpenBrowser/
-DelegateToSubagent) with their declared schemas. Fixed shape, never 500, no
-token (read-only GET).
+CreateCard/DelegateToSubagent) with their declared schemas. Fixed shape, never
+500, no token (read-only GET).
 
 Needs the extension venv:
 
@@ -34,6 +34,7 @@ ORCHESTRA_NAMES = {
     "NavigateBrowser",
     "DelegateToSubagent",
     "OpenBrowser",
+    "CreateCard",
 }
 
 
@@ -98,6 +99,11 @@ def test_orchestra_entries_present(client):
     assert orchestra["OpenBrowser"]["input_schema"]["required"] == ["url"]
     # OpenBrowser spawns a NEW card (vs NavigateBrowser driving a linked one)
     assert "arrow" in orchestra["OpenBrowser"]["description"]
+    assert orchestra["CreateCard"]["input_schema"]["required"] == ["kind", "content"]
+    assert orchestra["CreateCard"]["input_schema"]["properties"]["kind"]["enum"] == [
+        "note",
+        "document",
+    ]
     assert orchestra["DelegateToSubagent"]["input_schema"]["required"] == [
         "subagent",
         "task",

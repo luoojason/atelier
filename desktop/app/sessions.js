@@ -15,7 +15,7 @@
      GET    /sessions                            -> {"sessions":[{id,name,status,
                                                     messages_len,parent_id,depth}]}
      GET    /sessions/{id}                       -> {id,name,status,parent_id,
-                                                    depth,browser_nav,canvas_op,
+                                                    depth,browser_nav,canvas_ops,
                                                     messages:[{role,text,ts}]}
      POST   /sessions/{id}/message   {"message"} -> 202 {"status":"running"}
                                        (409 {"error":"turn in progress"} mid-turn)
@@ -64,17 +64,29 @@
    r15 note-clobbering rule stays (the link-status note yields to any note
    text, including these).
 
-   Agent-driven browser spawn (round 22): the backend's OpenBrowser orchestra
-   tool lets an agent SPAWN a browser card connected to its own card — no
-   user gesture. The session detail carries canvas_op = {kind, url, seq} | null.
-   Each card gates on a monotonic lastCanvasOpSeq (start 0) exactly like the
-   r16 nav gate. For kind "browser", handleCanvasOp -> openLinkedBrowser
-   reuses an already-linked browser (Atelier.links.browserElFor) if present,
-   otherwise A.spawnApp('browser') beside this card + Atelier.links.link (the
-   r22 programmatic link — draws the arrow AND registers the pair so later
-   NavigateBrowser drives it) + AtelierApps.browserNavigate. core's spawnApp,
-   link.js, and apps.js are all guarded — without them the op is consumed and
-   the note explains. Unknown kinds are a forward-compat no-op.
+   Agent-driven card spawn (rounds 22-23): the backend's orchestra tools let an
+   agent SPAWN a card connected to its own card — no user gesture. The session
+   detail carries canvas_ops = [{kind, seq, ...payload}, …] — a QUEUE (the model
+   can emit several spawn tools in one turn, faster than this poll; a single
+   field would drop all but the last). handleCanvasOps drains every op past the
+   monotonic lastCanvasOpSeq (start 0) high-water mark, in seq order, then
+   dispatchCanvasOp routes by kind:
+     • kind "browser" (r22, OpenBrowser): {url}. openLinkedBrowser reuses an
+       already-linked browser (Atelier.links.browserElFor) if present, else
+       A.spawnApp('browser') below this card + Atelier.links.link (the
+       programmatic link — draws the arrow AND registers the pair so later
+       NavigateBrowser drives it) + AtelierApps.browserNavigate.
+     • kind "note"/"document" (r23, CreateCard): {title, content}.
+       openLinkedCard spawns the card below this one (AtelierApps.spawnNote for
+       a note; AtelierDocuments.spawn for a document, rendering the agent's HTML
+       in a sandbox="" iframe), fills it, and draws the arrow via
+       A.arrows.link DIRECTLY — NOT the browser ride-along registry (a note is
+       not a browser; browserElFor has no type guard). arrows.js auto-unlinks
+       on card:removed, so no manual teardown.
+   Cards spawned below cascade (belowPos) so a burst doesn't stack. core's
+   spawnApp, link.js, apps.js, arrows.js, and the deliverable-card globals are
+   all guarded — without them the op is consumed and the note explains. Unknown
+   kinds are a forward-compat no-op.
 
    Sessions accessor (round 17): window.AtelierSessions = { reveal(id, name) }
    is the small cross-module surface other modules (the agent-orbs widget's
@@ -450,6 +462,7 @@
     let lastNavSeq = 0;     // r16: highest agent-requested browser_nav.seq handled
     let lastCanvasOpSeq = 0; // r22: highest agent-requested canvas_op.seq handled
     let attachBaselined = false; // r22: attached cards adopt existing seqs once
+    let spawnedBelow = 0;   // r23: cascade counter for cards spawned below this one
 
     if (attached) trackSession(sessionId, card); // fresh cards register in ensureSession
 
@@ -516,13 +529,87 @@
     // itself, arrow-link it, and drive it — no manual gesture. Both spawnApp
     // (core), Atelier.links (link.js), and AtelierApps (apps.js) are guarded:
     // without them the op is consumed (seq advances) and the note explains.
-    function handleCanvasOp(op) {
-      if (closed || !op || typeof op.seq !== 'number') return;
-      if (op.seq <= lastCanvasOpSeq) return; // already handled (polls repeat it)
-      lastCanvasOpSeq = op.seq;
+    // Drain the canvas-op QUEUE (r22 browser + r23 note/document). The backend
+    // serves a LIST because the model can emit several spawn tools in ONE turn,
+    // sub-second apart — faster than this 1.5s poll — so a single field would
+    // silently drop all but the last (a lost deliverable). Act on every op past
+    // the high-water mark, in seq order, exactly once; repeats across polls
+    // (seq <= lastCanvasOpSeq) are skipped.
+    function handleCanvasOps(ops) {
+      if (closed || !Array.isArray(ops)) return;
+      const pending = ops
+        .filter((op) => op && typeof op.seq === 'number' && op.seq > lastCanvasOpSeq)
+        .sort((a, b) => a.seq - b.seq);
+      for (const op of pending) {
+        lastCanvasOpSeq = op.seq;
+        dispatchCanvasOp(op);
+      }
+    }
+
+    function dispatchCanvasOp(op) {
       if (op.kind === 'browser') openLinkedBrowser(String(op.url || ''));
+      else if (op.kind === 'note' || op.kind === 'document') openLinkedCard(op.kind, op);
       // unknown kinds are consumed silently — a forward-compat no-op so an
       // older card never chokes on a newer backend op it does not understand.
+    }
+
+    // Position for a card the agent spawns below this one. The right lane (used
+    // by auto-revealed sub-agent children) would collide, so drop into the free
+    // lane BELOW; successive spawns cascade by `step` so a burst of CreateCard
+    // / OpenBrowser ops don't stack exactly on top of each other. left/top are
+    // world coords (core.js/arrows.js convention); using our own offsetHeight
+    // needs no target-card dimensions. Only the ACT of spawning advances the
+    // counter (the browser reuse path never calls this).
+    function belowPos() {
+      const step = spawnedBelow * 34;
+      const p = {
+        x: (parseFloat(card.style.left) || 0) + step,
+        y: (parseFloat(card.style.top) || 0) + card.offsetHeight + 40 + step,
+      };
+      spawnedBelow += 1;
+      return p;
+    }
+
+    // r23: agent-created content card (CreateCard). Generalizes the r22
+    // spawn+link path to NON-browser cards: spawn the card below this one,
+    // fill it with the agent-authored content, and draw the connecting arrow
+    // via A.arrows.link DIRECTLY — NOT the browser link registry (A.links),
+    // which is single-slot ride-along state for NavigateBrowser and has no
+    // type guard; a note/document only needs the visual arrow, and arrows.js
+    // auto-unlinks it on card:removed for either endpoint. All target modules
+    // (AtelierApps.spawnNote, AtelierDocuments.spawn, Atelier.arrows) are
+    // optional and guarded — without them the op is consumed and the note
+    // explains. Content is server-derived: notes render through mdRender
+    // (HTML-inert) and documents through document.js's sandbox="" iframe, so
+    // neither can inject markup into the app.
+    function openLinkedCard(type, op) {
+      const pos = belowPos();
+      let cardEl = null;
+      if (type === 'note') {
+        const api = window.AtelierApps;
+        if (api && typeof api.spawnNote === 'function') {
+          cardEl = api.spawnNote(String(op.content || ''), pos);
+        }
+      } else if (type === 'document') {
+        const docs = window.AtelierDocuments;
+        if (docs && typeof docs.spawn === 'function') {
+          const inst = docs.spawn({
+            worldPos: pos,
+            html: String(op.content || ''),
+            title: String(op.title || ''),
+          });
+          cardEl = inst && inst.handle ? inst.handle.el : null;
+        }
+      }
+      if (!cardEl) {
+        setNote('Agent tried to create a ' + type + ' card but that card type '
+          + 'is unavailable here.');
+        return;
+      }
+      const arrows = window.Atelier && window.Atelier.arrows;
+      if (arrows && typeof arrows.link === 'function') arrows.link(card, cardEl);
+      setNote('Agent created a ' + type + ' card on the dashboard'
+        + (op.title ? ' — ' + String(op.title) : '') + '.');
     }
 
     // Spawn (or reuse) a browser card linked to THIS agent card and navigate
@@ -548,16 +635,10 @@
             + 'unavailable here.');
           return;
         }
-        // Place the browser BELOW this card, not to its right: the right lane
-        // (card.left + offsetWidth + CHILD_DX, stepping down by CHILD_DY) is
-        // where auto-revealed sub-agent children stack, and a browser dropped
-        // there would land exactly on the k=0 child slot. Below the card is a
-        // free lane. left/top are world coords (core.js/arrows.js convention);
-        // positioning by our own offsetHeight needs no browser-card dimensions.
-        const pos = {
-          x: (parseFloat(card.style.left) || 0),
-          y: (parseFloat(card.style.top) || 0) + card.offsetHeight + 40,
-        };
+        // Place the browser in the free lane BELOW this card (the right lane is
+        // the sub-agent child column; see belowPos), cascading past any card
+        // already spawned below.
+        const pos = belowPos();
         browserEl = A.spawnApp('browser', pos);
         spawned = true;
         if (browserEl && links && typeof links.link === 'function') {
@@ -711,18 +792,25 @@
       // for them.)
       if (attached && !attachBaselined) {
         attachBaselined = true;
-        const bn = r.data.browser_nav, co = r.data.canvas_op;
+        const bn = r.data.browser_nav;
         if (bn && typeof bn.seq === 'number') lastNavSeq = bn.seq;
-        if (co && typeof co.seq === 'number') lastCanvasOpSeq = co.seq;
+        // adopt the highest existing canvas-op seq so a revealed depth-0
+        // session does not replay a queue of stale ops into spurious spawns
+        const ops = Array.isArray(r.data.canvas_ops) ? r.data.canvas_ops : [];
+        for (const op of ops) {
+          if (op && typeof op.seq === 'number' && op.seq > lastCanvasOpSeq) {
+            lastCanvasOpSeq = op.seq;
+          }
+        }
       }
       // r16: AFTER the routine setNote('') so a fresh nav request's note
       // wins this cycle (the next healthy poll clears it — transient by
       // design; a nav landing on the turn's final poll stays visible).
       handleBrowserNav(r.data.browser_nav);
-      // r22: agent-driven card spawn (OpenBrowser). Runs after handleBrowserNav
-      // so, in the rare case both land on the same poll, the spawn note wins
-      // (the newer, more visible action). Each is seq-gated independently.
-      handleCanvasOp(r.data.canvas_op);
+      // r22/r23: drain the agent-driven canvas-op queue (OpenBrowser +
+      // CreateCard). A LIST so several ops from one turn all fire (see
+      // handleCanvasOps); runs after handleBrowserNav so a spawn note wins.
+      handleCanvasOps(r.data.canvas_ops);
       if (r.data.status === 'running') {
         showThinking();
         schedulePoll();

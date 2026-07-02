@@ -1162,7 +1162,20 @@
     }
     return false;
   }
-  window.AtelierApps = { browserInfo, browserNavigate };
+  // spawnNote(text, worldPos) -> the note card ELEMENT (r23): spawn a note card
+  // pre-filled with agent-authored text. Threads the text through makeApp's
+  // config (cfg.text) — the ONLY correct path, because buildNote applies
+  // cfg.text at build (auto-rendering markdown) and makeApp persists it
+  // synchronously; a raw DOM poke of the textarea would neither fire the input
+  // listener nor persist. sessions.js calls this for a CreateCard(kind='note')
+  // canvas_op and draws the connecting arrow itself. The text is markdown-
+  // rendered by mdRender, which is HTML-inert (see the self-check), so
+  // agent-authored text cannot inject markup.
+  function spawnNote(text, worldPos) {
+    const h = makeApp('note', { config: { text: String(text || '') }, pos: worldPos });
+    return h ? h.el : null;
+  }
+  window.AtelierApps = { browserInfo, browserNavigate, spawnNote };
 
   // ── self-check ────────────────────────────────────────────────────────────
   (function selfCheck() {

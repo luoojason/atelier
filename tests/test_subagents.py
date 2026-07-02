@@ -446,11 +446,11 @@ def _open_browser_handler(parent_id):
 def test_open_browser_sets_canvas_op_and_seq_increments(captured):
     parent = _register_parent()
     ob = _open_browser_handler(parent.id)
-    assert parent.canvas_op is None
+    assert parent.canvas_ops == []
 
     reply = _text(_call(ob, {"url": "https://example.com/a"}))
     assert "example.com/a" in reply
-    first = parent.canvas_op
+    first = parent.canvas_ops[-1]
     assert set(first) == {"kind", "url", "seq"}
     assert first["kind"] == "browser"
     assert first["url"] == "https://example.com/a"
@@ -458,7 +458,7 @@ def test_open_browser_sets_canvas_op_and_seq_increments(captured):
 
     # a second request strictly advances seq so the poller distinguishes it
     _call(ob, {"url": "http://example.org/b"})
-    second = parent.canvas_op
+    second = parent.canvas_ops[-1]
     assert second["url"] == "http://example.org/b"
     assert second["seq"] == first["seq"] + 1
 
@@ -472,11 +472,11 @@ def test_open_browser_and_navigate_use_independent_seq_counters(captured):
 
     _call(ob, {"url": "https://a.example/1"})
     _call(nav, {"url": "https://b.example/2"})
-    assert parent.canvas_op["url"] == "https://a.example/1"
+    assert parent.canvas_ops[-1]["url"] == "https://a.example/1"
     assert parent.browser_nav["url"] == "https://b.example/2"
     # both are set and independent — the nav call did not touch canvas_op
     _call(ob, {"url": "https://a.example/3"})
-    assert parent.canvas_op["url"] == "https://a.example/3"
+    assert parent.canvas_ops[-1]["url"] == "https://a.example/3"
     assert parent.browser_nav["url"] == "https://b.example/2"  # unchanged
 
 
@@ -492,7 +492,7 @@ def test_open_browser_rejects_non_http_urls(captured):
         {},
     ):
         assert _text(_call(ob, args)) == "Only http(s) URLs can be opened."
-    assert parent.canvas_op is None  # nothing was ever recorded
+    assert parent.canvas_ops == []  # nothing was ever recorded
 
 
 def test_open_browser_rejects_private_and_loopback_hosts(captured):
@@ -515,11 +515,11 @@ def test_open_browser_rejects_private_and_loopback_hosts(captured):
     ):
         reply = _text(_call(ob, {"url": url}))
         assert "private, loopback, or link-local" in reply, url
-    assert parent.canvas_op is None  # nothing recorded for any blocked host
+    assert parent.canvas_ops == []  # nothing recorded for any blocked host
 
     # a public host still passes and records the op
     _call(ob, {"url": "https://example.com/ok"})
-    assert parent.canvas_op["url"] == "https://example.com/ok"
+    assert parent.canvas_ops[-1]["url"] == "https://example.com/ok"
 
 
 def test_agent_open_host_blocked_helper_edges():
@@ -544,19 +544,19 @@ def test_open_browser_with_parent_gone(captured):
 
 def test_detail_carries_canvas_op_and_list_does_not(client, captured):
     sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
-    assert client.get(f"/sessions/{sid}").json()["canvas_op"] is None
+    assert client.get(f"/sessions/{sid}").json()["canvas_ops"] == []
 
     ob = _open_browser_handler(sid)
     _call(ob, {"url": "https://example.com/page"})
 
     detail = client.get(f"/sessions/{sid}").json()
-    assert detail["canvas_op"]["kind"] == "browser"
-    assert detail["canvas_op"]["url"] == "https://example.com/page"
-    assert detail["canvas_op"]["seq"] >= 1
+    assert detail["canvas_ops"][-1]["kind"] == "browser"
+    assert detail["canvas_ops"][-1]["url"] == "https://example.com/page"
+    assert detail["canvas_ops"][-1]["seq"] >= 1
 
     # the list route deliberately does NOT carry canvas_op
     for s in client.get("/sessions").json()["sessions"]:
-        assert "canvas_op" not in s
+        assert "canvas_ops" not in s
 
 
 def test_open_browser_tool_description_mentions_spawning_and_arrow():
@@ -565,6 +565,148 @@ def test_open_browser_tool_description_mentions_spawning_and_arrow():
     assert ob_tool.input_schema["required"] == ["url"]
     # the description must distinguish it from NavigateBrowser: it SPAWNS a card
     assert "arrow" in ob_tool.description
+
+
+# ── CreateCard (agent-authored note/document cards, round 23) ─────────────────
+
+def _create_card_handler(parent_id):
+    """The CreateCard handler coroutine (the 6th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[5].handler
+
+
+def test_create_card_note_sets_canvas_op_and_seq_increments(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    assert parent.canvas_ops == []
+
+    reply = _text(_call(cc, {"kind": "note", "content": "remember: milk", "title": "Groceries"}))
+    assert "note" in reply
+    first = parent.canvas_ops[-1]
+    assert set(first) == {"kind", "title", "content", "seq"}
+    assert first["kind"] == "note"
+    assert first["title"] == "Groceries"
+    assert first["content"] == "remember: milk"
+    assert isinstance(first["seq"], int)
+
+    _call(cc, {"kind": "note", "content": "second"})
+    second = parent.canvas_ops[-1]
+    assert second["content"] == "second"
+    assert second["title"] == ""  # optional title defaults to empty
+    assert second["seq"] == first["seq"] + 1
+
+
+def test_create_card_document_carries_html_content(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    html = "<!doctype html><html><body><h1>Memo</h1></body></html>"
+    _text(_call(cc, {"kind": "document", "content": html, "title": "Memo"}))
+    op = parent.canvas_ops[-1]
+    assert op["kind"] == "document"
+    assert op["content"] == html
+    assert op["title"] == "Memo"
+
+
+def test_create_card_rejects_unknown_kind(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    for kind in ("browser", "deck", "", "NOTE", "widget"):
+        reply = _text(_call(cc, {"kind": kind, "content": "x"}))
+        assert reply == 'kind must be "note" or "document".'
+    assert parent.canvas_ops == []
+
+
+def test_create_card_rejects_empty_content(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    for content in ("", "   ", "\n\t "):
+        reply = _text(_call(cc, {"kind": "note", "content": content}))
+        assert reply == "content is required — write the card's content."
+    assert _text(_call(cc, {"kind": "note"})) == "content is required — write the card's content."
+    assert parent.canvas_ops == []
+
+
+def test_create_card_enforces_per_kind_content_caps(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    # a note over 8k is rejected; a document of the same size is fine
+    big = "x" * 8_001
+    assert "too long for a note card" in _text(_call(cc, {"kind": "note", "content": big}))
+    assert parent.canvas_ops == []
+    _call(cc, {"kind": "document", "content": big})
+    assert parent.canvas_ops[-1]["kind"] == "document"  # 8001 < the 300k document cap
+    # a document over 300k is rejected
+    huge = "y" * 300_001
+    assert "too long for a document card" in _text(_call(cc, {"kind": "document", "content": huge}))
+
+
+def test_create_card_with_parent_gone(captured):
+    cc = _create_card_handler("deadbeef00000000deadbeef00000000")
+    assert _text(_call(cc, {"kind": "note", "content": "x"})) == (
+        "Your session is gone; cannot create a card."
+    )
+
+
+def test_detail_carries_canvas_op_for_a_created_card(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    cc = _create_card_handler(sid)
+    _call(cc, {"kind": "note", "content": "hello world", "title": "T"})
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["canvas_ops"][-1]["kind"] == "note"
+    assert detail["canvas_ops"][-1]["content"] == "hello world"
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "canvas_ops" not in s  # list route never carries it
+
+
+def test_create_card_tool_description_and_schema():
+    cc_tool = lite_server._orchestra_tools("p")[5]
+    assert cc_tool.name == "CreateCard"
+    assert cc_tool.input_schema["required"] == ["kind", "content"]
+    assert cc_tool.input_schema["properties"]["kind"]["enum"] == ["note", "document"]
+    # the description must warn the document HTML is sandboxed (no scripts)
+    assert "sandbox" in cc_tool.description.lower() or "no scripts" in cc_tool.description.lower()
+
+
+# ── canvas_ops is a QUEUE (the r23 review fix — multiple ops per turn) ─────────
+
+def test_canvas_ops_is_a_queue_not_a_single_slot(captured):
+    # several spawn ops emitted in one turn must ALL be retained; a single slot
+    # would drop all but the last, silently losing an agent-authored deliverable
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    ob = _open_browser_handler(parent.id)
+    _call(cc, {"kind": "note", "content": "one"})
+    _call(cc, {"kind": "document", "content": "<h1>two</h1>"})
+    _call(ob, {"url": "https://example.com/three"})
+    assert [op["kind"] for op in parent.canvas_ops] == ["note", "document", "browser"]
+    seqs = [op["seq"] for op in parent.canvas_ops]
+    assert seqs == sorted(seqs) and len(set(seqs)) == 3  # strictly increasing, distinct
+
+
+def test_canvas_ops_queue_is_bounded(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    over = lite_server._MAX_CANVAS_OPS + 15
+    for i in range(over):
+        _call(cc, {"kind": "note", "content": f"n{i}"})
+    # capped at the max; the OLDEST were dropped, the newest survive in order
+    assert len(parent.canvas_ops) == lite_server._MAX_CANVAS_OPS
+    assert parent.canvas_ops[-1]["content"] == f"n{over - 1}"
+    assert parent.canvas_ops[0]["content"] == f"n{over - lite_server._MAX_CANVAS_OPS}"
+    seqs = [op["seq"] for op in parent.canvas_ops]
+    assert seqs == sorted(seqs)
+
+
+def test_detail_carries_canvas_ops_list_and_list_route_omits_it(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["canvas_ops"] == []
+    cc = _create_card_handler(sid)
+    _call(cc, {"kind": "note", "content": "a"})
+    _call(cc, {"kind": "note", "content": "b"})
+    detail = client.get(f"/sessions/{sid}").json()
+    assert isinstance(detail["canvas_ops"], list) and len(detail["canvas_ops"]) == 2
+    assert [op["content"] for op in detail["canvas_ops"]] == ["a", "b"]
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "canvas_ops" not in s  # list route never carries the queue
 
 
 # ── the structural depth cap ─────────────────────────────────────────────────
@@ -585,6 +727,7 @@ def test_build_options_with_spawner_gains_orchestra():
     assert "mcp__orchestra__CheckAgent" in opts.allowed_tools
     assert "mcp__orchestra__NavigateBrowser" in opts.allowed_tools
     assert "mcp__orchestra__OpenBrowser" in opts.allowed_tools
+    assert "mcp__orchestra__CreateCard" in opts.allowed_tools
     # the base allowlist is intact alongside the orchestra tools (Notion tools
     # are gated on a stored token — excluded here since none is set)
     assert (
