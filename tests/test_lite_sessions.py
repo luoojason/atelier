@@ -516,3 +516,101 @@ def test_governs_cycle_helper_walks_parent_chain():
     d = lite_server._AgentSession("d" * 32, "D")
     lite_server._sessions[d.id] = d
     assert lite_server._governs_cycle(a.id, d.id) is False
+
+
+def test_govern_sets_parent_id_and_depth(client):
+    parent = _create(client, name="A")["id"]
+    child = _create(client, name="B")["id"]
+
+    resp = client.post(f"/sessions/{parent}/govern", json={"child_id": child})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+    detail = client.get(f"/sessions/{child}").json()
+    assert detail["parent_id"] == parent
+    assert detail["depth"] == 1
+
+    # nesting deepens: govern a grandchild under the depth-1 child -> depth 2
+    grand = _create(client, name="C")["id"]
+    assert client.post(
+        f"/sessions/{child}/govern", json={"child_id": grand}
+    ).json() == {"ok": True}
+    assert client.get(f"/sessions/{grand}").json()["depth"] == 2
+
+
+def test_govern_re_govern_moves_child_to_new_parent(client):
+    p1 = _create(client, name="P1")["id"]
+    p2 = _create(client, name="P2")["id"]
+    child = _create(client, name="B")["id"]
+
+    assert client.post(f"/sessions/{p1}/govern", json={"child_id": child}).status_code == 200
+    assert client.post(f"/sessions/{p2}/govern", json={"child_id": child}).status_code == 200
+    # single-parent invariant: the child now points at p2, not p1
+    assert client.get(f"/sessions/{child}").json()["parent_id"] == p2
+
+
+def test_govern_unknown_parent_is_400(client):
+    child = _create(client, name="B")["id"]
+    resp = client.post("/sessions/nope/govern", json={"child_id": child})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "unknown session"}
+
+
+def test_govern_unknown_child_is_400(client):
+    parent = _create(client, name="A")["id"]
+    resp = client.post(f"/sessions/{parent}/govern", json={"child_id": "nope"})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "unknown session"}
+
+
+def test_govern_self_is_400(client):
+    a = _create(client, name="A")["id"]
+    resp = client.post(f"/sessions/{a}/govern", json={"child_id": a})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "cannot govern self"}
+
+
+def test_govern_cycle_across_chain_is_400(client):
+    a = _create(client, name="A")["id"]
+    b = _create(client, name="B")["id"]
+    c = _create(client, name="C")["id"]
+    assert client.post(f"/sessions/{a}/govern", json={"child_id": b}).status_code == 200
+    assert client.post(f"/sessions/{b}/govern", json={"child_id": c}).status_code == 200
+    # C governing A would close A->B->C->A
+    resp = client.post(f"/sessions/{c}/govern", json={"child_id": a})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "would create a cycle"}
+
+
+def test_govern_child_limit_reached_is_400(client):
+    parent = _create(client, name="P")["id"]
+    kids = [
+        _create(client, name=f"K{i}")["id"]
+        for i in range(lite_server._MAX_CHILDREN)
+    ]
+    for k in kids:
+        assert client.post(
+            f"/sessions/{parent}/govern", json={"child_id": k}
+        ).status_code == 200
+    extra = _create(client, name="extra")["id"]
+    resp = client.post(f"/sessions/{parent}/govern", json={"child_id": extra})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "child limit reached"}
+
+
+def test_govern_max_depth_reached_is_400(client):
+    # build a full chain L0(0)->L1(1)->...->L_MAXDEPTH(_MAX_DEPTH)
+    ids = [
+        _create(client, name=f"L{i}")["id"]
+        for i in range(lite_server._MAX_DEPTH + 1)
+    ]
+    for parent, child in zip(ids, ids[1:]):
+        assert client.post(
+            f"/sessions/{parent}/govern", json={"child_id": child}
+        ).status_code == 200
+    assert client.get(f"/sessions/{ids[-1]}").json()["depth"] == lite_server._MAX_DEPTH
+    # one more level would be depth _MAX_DEPTH + 1 -> rejected
+    extra = _create(client, name="deep")["id"]
+    resp = client.post(f"/sessions/{ids[-1]}/govern", json={"child_id": extra})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": "max depth reached"}

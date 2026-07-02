@@ -1805,6 +1805,53 @@ async def delete_session(session_id: str):
     return {"ok": True}
 
 
+class SessionGovernRequest(BaseModel):
+    child_id: str
+
+
+def _govern_error(msg: str) -> JSONResponse:
+    # Govern rejections are 400 (distinct from the /sessions 404 for a wholly
+    # unknown route id) so the composer can surface the exact reason as a toast.
+    return JSONResponse({"error": msg}, status_code=400)
+
+
+@app.post("/sessions/{session_id}/govern")
+async def govern_session(session_id: str, req: SessionGovernRequest):
+    """Designate req.child_id as a governed sub-agent of session_id.
+
+    Sets child.parent_id = session_id and child.depth = parent.depth + 1 so the
+    frontend sweep re-reveals the arrow after a reload or board switch. Every
+    rejection is a 400 with a distinct "error" string: unknown session, cannot
+    govern self, would create a cycle, child limit reached, max depth reached.
+    Single-parent invariant: re-governing a child just MOVES it (its old
+    parent_id is overwritten). _MAX_DEPTH/_governs_cycle/_MAX_CHILDREN are
+    defined lower in the module and resolved at call time.
+    """
+    parent = _sessions.get(session_id)
+    if parent is None:
+        return _govern_error("unknown session")
+    if req.child_id == session_id:
+        return _govern_error("cannot govern self")
+    child = _sessions.get(req.child_id)
+    if child is None:
+        return _govern_error("unknown session")
+    if _governs_cycle(session_id, req.child_id):
+        return _govern_error("would create a cycle")
+    # count current children, excluding this child so a re-govern is idempotent
+    existing = sum(
+        1
+        for s in _sessions.values()
+        if s.parent_id == session_id and s.id != req.child_id
+    )
+    if existing >= _MAX_CHILDREN:
+        return _govern_error("child limit reached")
+    if parent.depth + 1 > _MAX_DEPTH:
+        return _govern_error("max depth reached")
+    child.parent_id = session_id
+    child.depth = parent.depth + 1
+    return {"ok": True}
+
+
 # --- Sub-agent orchestration (the "orchestra" MCP server) -----------------------
 #
 # Each depth-0 session's client gets its OWN in-process orchestra server whose
