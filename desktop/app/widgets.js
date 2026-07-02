@@ -566,6 +566,10 @@
     dragId = null;
   });
 
+  // core's tidy() (zoombar ✦) moves every card without any drag gesture —
+  // flush widget rects when it announces the rearrange.
+  A.bus.on('cards:rearranged', () => persist());
+
   // core wires .card-x → handle.remove() → emits card:removed; clean up here
   A.bus.on('card:removed', (d) => {
     const node = d && d.el;

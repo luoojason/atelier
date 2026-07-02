@@ -5,6 +5,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const cp = require('child_process');
+const crypto = require('crypto');
 
 // A Finder/launchd-launched app inherits a minimal PATH that omits the user's
 // bin dirs, so the backend's `claude` CLI (the subscription model) would not be
@@ -36,6 +37,15 @@ const HEALTH_URL = `http://127.0.0.1:${PORT}/health`;
 // the SAME file the daemon runs — not the repo's example fallback.
 const JOBS_FILE = path.join(os.homedir(), '.atelier', 'jobs.yaml');
 const JOBS_TEMPLATE = path.join(BACKEND_DIR, 'scheduler', 'jobs.atelier.yaml');
+
+// Shared secret for the backend's MUTATING routes (POST /sessions etc.). The
+// backend's origin regex must keep allowing Origin "null" (the file:// renderer
+// sends it), and any internet page can mint "null" via a sandboxed iframe — so
+// origin gating alone cannot protect agent-spawning writes. Minted fresh per
+// launch, threaded to the backend + scheduler via spawn env and to the renderer
+// via preload (process.env is part of the sandboxed-preload surface).
+const ATELIER_TOKEN = crypto.randomBytes(32).toString('hex');
+process.env.ATELIER_TOKEN = ATELIER_TOKEN; // preload.js reads it from here
 
 let backendProc = null;
 let mainWindow = null;
@@ -91,6 +101,7 @@ function startBackend() {
       DEFAULT_MODEL: 'claude-cli',
       PORT: String(PORT),
       SWARM_JOBS_FILE: JOBS_FILE, // GET /jobs must read the daemon's file, not the repo fallback
+      ATELIER_TOKEN, // mutating routes require this header once set
       PYTHONUNBUFFERED: '1',
       PYTHONDONTWRITEBYTECODE: '1', // never write .pyc into the sealed Resources tree
       CLAUDE_ISOLATED: '1',
@@ -202,6 +213,7 @@ function startScheduler() {
       SWARM_BASE_URL: `http://127.0.0.1:${PORT}`,
       SWARM_JOBS_FILE: JOBS_FILE,
       SWARM_AIEOS_URL: 'http://127.0.0.1:7824',
+      ATELIER_TOKEN, // the daemon POSTs the backend's compat route (mutating)
       PYTHONUNBUFFERED: '1',
       PYTHONDONTWRITEBYTECODE: '1', // never write .pyc into the sealed Resources tree
     },
@@ -295,8 +307,36 @@ app.on('web-contents-created', (_event, contents) => {
     webPreferences.contextIsolation = true;
   });
   if (contents.getType() === 'webview') {
-    // ponytail: popups denied in v1 — OAuth-in-browser-card needs routing later
-    contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+    // Tab dispositions (target=_blank links, cmd-click) are routed to the
+    // renderer over 'atelier:webview-new-window' — apps.js opens them as tabs
+    // in a browser card. Everything else (a real window.open popup, i.e. an
+    // OAuth flow) gets a hardened child window: no Node, isolated, sandboxed,
+    // parented to the main window so it dies with it.
+    contents.setWindowOpenHandler(({ url, disposition }) => {
+      // Scheme allowlist FIRST: web content can request any URL (file:///…,
+      // javascript:, custom schemes) via window.open + a features string that
+      // forces a 'new-window' disposition. Only http(s) may leave the webview
+      // — for tab routing AND real popups (the OAuth use case is https).
+      if (!/^https?:/i.test(url)) return { action: 'deny' };
+      if (disposition === 'foreground-tab' || disposition === 'background-tab') {
+        mainWindow.webContents.send('atelier:webview-new-window', { url });
+        return { action: 'deny' };
+      }
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 520,
+          height: 680,
+          parent: mainWindow,
+          fullscreenable: false,
+          webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true,
+            sandbox: true,
+          },
+        },
+      };
+    });
   } else {
     // window.open from the app's own pages must never spawn an in-app
     // BrowserWindow (chromeless, un-handled, popup-spammable). Hand http(s)

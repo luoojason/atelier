@@ -15,6 +15,7 @@ tests can pass a fake and never touch the network.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 # The path segment the agency server mounts its routes under. The server
@@ -55,10 +56,20 @@ def build_request(
 
 
 def _auth_headers(app_token: Optional[str]) -> dict:
-    """Return the Bearer auth header when a token is configured, else empty."""
+    """Auth headers: Bearer when configured, plus the Atelier shared secret.
+
+    ATELIER_TOKEN is minted per launch by the desktop app's main.js and passed
+    to this daemon via spawn env; the lite backend requires it on mutating
+    routes (this client's POST). Unset (standalone daemon against a token-less
+    backend) adds nothing, preserving the historical empty-headers behavior.
+    """
+    headers: dict[str, str] = {}
     if app_token:
-        return {"Authorization": f"Bearer {app_token}"}
-    return {}
+        headers["Authorization"] = f"Bearer {app_token}"
+    atelier_token = os.getenv("ATELIER_TOKEN")
+    if atelier_token:
+        headers["X-Atelier-Token"] = atelier_token
+    return headers
 
 
 def summarize_response(status_code: int, payload: Any) -> dict:

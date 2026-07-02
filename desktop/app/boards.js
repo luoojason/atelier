@@ -40,14 +40,29 @@
       'atelier:board.<id>.state' for whichever board is NOT active.
    6. Click "⌄" in the Dashboards header -> the "All boards" panel opens:
       cover thumbnails, names, updated dates, a search box that filters by
-      name, and Open / Rename / Duplicate / Delete on each card.
-   7. Rename Board 2 to "Scratch" (also: double-click the ACTIVE sidebar row
-      to rename it). Duplicate it -> "Scratch (copy)" appears with the same
-      thumb. Delete "Scratch" -> confirm() -> row disappears; deleting the
-      active board lands you on the first remaining board.
+      name, Open / Rename / Duplicate / Export / Delete on each card, and an
+      "Export boards" + "Import" footer.
+   7. Click Rename on Board 2's card -> the name swaps to an inline <input>
+      (value selected). Type "Scratch" + Enter (or click away to blur) ->
+      committed; Escape cancels; whitespace-only input is a no-op. Same
+      inline input on double-clicking the ACTIVE sidebar row's name.
+      Duplicate it -> "Scratch (copy)" appears with the same thumb. Delete
+      "Scratch" -> confirm() -> row disappears; deleting the active board
+      lands you on the first remaining board.
    8. ⌘K -> type "board" -> "New board", "All boards" and one
       "Switch board: <name>" per board are in the palette.
-   9. Console shows "[boards] ready — …" and no console.assert failures.
+   9. In the All boards footer click "Export boards" -> atelier-boards.json
+      downloads: {format:"atelier-boards", version:1, exportedAt,
+      boards:[{id,name,createdAt,updatedAt,state}]} — the ACTIVE board's
+      state is captured live (debounced saves flushed first), and NO
+      thumbnails are inside. A card's own "Export" button downloads just
+      that one board (atelier-board-<slug>.json).
+  10. Click "Import" in the footer -> pick that file -> toast
+      "Imported N board(s)", new rows appear with FRESH ids (" (imported)"
+      suffix only on a name clash) and nothing switches; opening one shows
+      the exported canvas. Re-picking the SAME file works (input resets).
+      Feeding it a random/malformed .json -> toast only, no uncaught throw.
+  11. Console shows "[boards] ready — …" and no console.assert failures.
    =========================================================================== */
 
 (function () {
@@ -270,12 +285,38 @@
     writeIndex(idx);
   }
 
-  function promptRename(id) {
+  // Inline rename: swap a name element's text for an <input> in place.
+  // Enter/blur commits (rename() trims + ignores empty/unchanged), Escape
+  // cancels. Names re-enter the DOM via textContent / input.value only.
+  function startInlineRename(nameEl, id) {
     const b = readIndex().find((x) => x.id === id);
-    if (!b) return;
-    const nm = window.prompt('Rename board', b.name); // ponytail: window.prompt v1 — inline input is the upgrade path
-    if (nm == null) return;
-    rename(id, nm);
+    if (!b || !nameEl || nameEl.querySelector('input')) return;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'bd-rename-input';
+    input.value = b.name;
+    nameEl.textContent = '';
+    nameEl.appendChild(input);
+    input.focus();
+    input.select();
+    let done = false;
+    function finish(commit) {
+      if (done) return;                              // blur re-fires when input.remove() runs
+      done = true;
+      const nm = input.value;
+      input.remove();
+      nameEl.textContent = b.name;                   // restore; a successful rename re-renders anyway
+      if (commit) rename(id, nm);
+    }
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation();                           // keep Escape from closing the panel, ⌘K from opening, etc.
+      if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+      else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener('blur', () => finish(true));
+    // clicks inside the input must not bubble into row switch / re-rename
+    input.addEventListener('click', (e) => e.stopPropagation());
+    input.addEventListener('dblclick', (e) => e.stopPropagation());
   }
 
   async function duplicate(id) {
@@ -328,6 +369,125 @@
     location.reload();
   }
 
+  // ── export / import ────────────────────────────────────────────────────────
+  // File shape: {format:"atelier-boards", version:1, exportedAt,
+  //   boards:[{id, name, createdAt, updatedAt, state:{rawKey: rawValue}}]}.
+  // Thumbnails are NEVER exported — they are bulky derived data that live on
+  // their own 'atelier:board.<id>.thumb' keys (outside the state snapshots)
+  // and regenerate from live capture after the board is opened.
+  function boardExportEntry(b) {
+    let state = {};
+    if (b.id === activeId()) {
+      // The active board's state IS the live keys — flush the siblings'
+      // debounced saves first, exactly like switch-away does (they listen on
+      // 'boards:will-switch' and persist+disarm; the payload is ignored).
+      try { A.bus.emit('boards:will-switch', { to: b.id, reason: 'export' }); } catch {}
+      state = collectLiveScoped();
+    } else {
+      try {
+        const snap = JSON.parse(localStorage.getItem(stateKey(b.id)) || 'null');
+        if (snap && typeof snap === 'object' && !Array.isArray(snap)) state = snap;
+      } catch { state = {}; }                        // unreadable snapshot exports as empty board
+    }
+    return { id: b.id, name: b.name, createdAt: b.createdAt, updatedAt: b.updatedAt, state };
+  }
+
+  function downloadJSON(payload, filename) {
+    let json = null;
+    try { json = JSON.stringify(payload); }
+    catch (err) { console.warn('[boards] export serialize failed', err); A.ui.toast('Export failed'); return false; }
+    const a = document.createElement('a');
+    a.download = filename;
+    // ponytail: data-URL download — a Blob/object-URL is the upgrade if boards outgrow it.
+    a.href = 'data:application/json,' + encodeURIComponent(json);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return true;
+  }
+
+  function exportBoards(list, filename) {
+    if (!list.length) { A.ui.toast('Nothing to export'); return; }
+    const payload = {
+      format: 'atelier-boards',
+      version: 1,
+      exportedAt: Date.now(),
+      boards: list.map(boardExportEntry),
+    };
+    if (downloadJSON(payload, filename)) {
+      A.ui.toast('Exported ' + payload.boards.length + ' board(s)');
+    }
+  }
+
+  function exportAll() { exportBoards(readIndex(), 'atelier-boards.json'); }
+
+  function exportOne(id) {
+    const b = readIndex().find((x) => x.id === id);
+    if (!b) return;
+    const slug = b.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+    exportBoards([b], 'atelier-board-' + (slug || 'untitled') + '.json');
+  }
+
+  // Never throws on user input: every malformed path lands on a toast.
+  function importBoardsText(text) {
+    let data = null;
+    try { data = JSON.parse(text); } catch { data = null; }
+    if (!data || data.format !== 'atelier-boards' || !Array.isArray(data.boards)) {
+      A.ui.toast('Import failed — not an Atelier boards file');
+      return;
+    }
+    const malformed = data.boards.some((b) =>
+      !b || typeof b.name !== 'string' || !b.name.trim() ||
+      !b.state || typeof b.state !== 'object' || Array.isArray(b.state));
+    if (malformed) { A.ui.toast('Import failed — malformed board entries'); return; }
+    if (!data.boards.length) { A.ui.toast('No boards in that file'); return; }
+
+    const idx = readIndex();
+    const names = new Set(idx.map((x) => x.name));   // also tracks names added this batch
+    const added = [];
+    let full = false;
+    for (const src of data.boards) {
+      let name = src.name.trim();
+      if (names.has(name)) name += ' (imported)';    // suffix only on an actual clash
+      const nid = randHex();                         // FRESH id — imports never collide/overwrite
+      // Store as an inactive-board snapshot; keep only keys restoreSnapshot
+      // would accept, so hostile files can't smuggle index/global/thumb keys.
+      const snap = {};
+      Object.keys(src.state).forEach((k) => {
+        if (isBoardScoped(k) && typeof src.state[k] === 'string') snap[k] = src.state[k];
+      });
+      try { localStorage.setItem(stateKey(nid), JSON.stringify(snap)); }
+      catch (err) { console.warn('[boards] import snapshot write failed', err); full = true; break; }
+      const now = Date.now();
+      names.add(name);
+      added.push({
+        id: nid,
+        name,
+        createdAt: Number.isFinite(src.createdAt) ? src.createdAt : now,
+        updatedAt: Number.isFinite(src.updatedAt) ? src.updatedAt : now,
+        previewUpdatedAt: 0,                         // thumbs aren't exported; captured after first open
+      });
+    }
+    if (added.length) writeIndex(idx.concat(added)); // stays on the current board — no auto-switch
+    A.ui.toast(full
+      ? 'Imported ' + added.length + ' of ' + data.boards.length + ' board(s) — storage is full'
+      : 'Imported ' + added.length + ' board(s)');
+  }
+
+  function importBoardsFile(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onerror = () => A.ui.toast('Import failed — could not read file');
+    reader.onload = () => {
+      try { importBoardsText(String(reader.result)); }
+      catch (err) {
+        console.warn('[boards] import failed', err);
+        A.ui.toast('Import failed — malformed boards file');
+      }
+    };
+    reader.readAsText(file);
+  }
+
   // ── injected CSS (warm palette via the shared :root vars) ──────────────────
   (function injectStyles() {
     if (document.getElementById('atelier-boards-styles')) return;
@@ -368,6 +528,12 @@
       .bd-btn-danger:hover { background: var(--accent-soft); color: var(--accent);
         border-color: var(--accent); }
       .bd-empty { color: var(--ink-dim); font-size: 12.5px; padding: 8px 2px; }
+      .bd-foot { display: flex; gap: 6px; justify-content: flex-end;
+        border-top: 1px solid var(--border-soft); padding-top: 10px; }
+      .bd-rename-input { font: inherit; font-size: inherit; font-weight: inherit;
+        color: var(--ink); background: var(--panel); border: 1px solid var(--accent);
+        border-radius: 6px; padding: 1px 5px; width: 100%; min-width: 0;
+        box-sizing: border-box; outline: none; }
     `;
     const style = document.createElement('style');
     style.id = 'atelier-boards-styles';
@@ -408,7 +574,7 @@
       row.title = b.name;
       row.addEventListener('click', () => switchTo(b.id));
       // switchTo no-ops on the active row, so dblclick-rename is reachable there
-      row.addEventListener('dblclick', () => { if (b.id === activeId()) promptRename(b.id); });
+      row.addEventListener('dblclick', () => { if (b.id === activeId()) startInlineRename(name, b.id); });
       rowsHost.appendChild(row);
     });
   }
@@ -447,7 +613,6 @@
     search.placeholder = 'Search boards…';
     const grid = document.createElement('div');
     grid.className = 'bd-grid';
-    wrap.append(search, grid);
 
     function actionBtn(label, danger, fn) {
       const btn = document.createElement('button');
@@ -457,6 +622,24 @@
       btn.addEventListener('click', fn);
       return btn;
     }
+
+    // footer: whole-collection export + import (hidden file input)
+    const foot = document.createElement('div');
+    foot.className = 'bd-foot';
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.json,application/json';
+    fileInput.style.display = 'none';
+    fileInput.addEventListener('change', () => {
+      importBoardsFile(fileInput.files && fileInput.files[0]);
+      fileInput.value = '';                          // same file re-selectable next time
+    });
+    foot.append(
+      actionBtn('Export boards', false, exportAll),
+      actionBtn('Import', false, () => fileInput.click()),
+      fileInput
+    );
+    wrap.append(search, grid, foot);
 
     function renderGrid() {
       grid.innerHTML = '';
@@ -487,8 +670,9 @@
         actions.className = 'bd-card-actions';
         actions.append(
           actionBtn('Open', false, () => switchTo(b.id)),
-          actionBtn('Rename', false, () => promptRename(b.id)),
+          actionBtn('Rename', false, () => startInlineRename(nm, b.id)),
           actionBtn('Duplicate', false, () => duplicate(b.id)),
+          actionBtn('Export', false, () => exportOne(b.id)),
           actionBtn('Delete', true, () => remove(b.id))
         );
         card.append(buildThumb(b.id, 'bd-cover'), meta, actions);

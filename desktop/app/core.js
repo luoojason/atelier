@@ -4,8 +4,9 @@
    Atelier core — desktop/app/core.js
 
    Owns the canvas (pan / wheel-zoom), floating cards (drag / resize / raise),
-   the dock, the chat card, and the backend status. Builds and exposes
-   `window.Atelier`, the single API every feature module builds against.
+   marquee multi-select, tidy/auto-arrange, the live minimap, the dock, the
+   chat card, and the backend status. Builds and exposes `window.Atelier`,
+   the single API every feature module builds against.
 
    Feature modules (app/widgets.js, app/apps.js, app/palette.js,
    app/customization.js) load AFTER this file and must only touch
@@ -40,6 +41,23 @@
       Press Escape while a floating panel is open — the topmost panel
       closes; with none open, bus 'shortcut:escape' fires. Cmd/Ctrl+M is
       ignored while typing in an input/textarea; Escape always works.
+  10. SHIFT-drag on empty canvas draws a selection marquee (plain drag still
+      pans); after a 4px threshold the box appears and cards whose world
+      rect intersects it get class 'selected' (accent outline). Shift-drag
+      across already-selected cards XORs them against the pre-drag
+      selection. Bus 'selection:changed' {count} fires. Escape clears the
+      selection BEFORE panel-closing (mid-drag it cancels the marquee and
+      restores the pre-drag selection). Dragging ANY selected card's bar
+      moves the whole selection together. Delete/Backspace (not while
+      typing) removes every selected card — each fires card:removed.
+  11. Zoombar ✦ (Auto-arrange) or Atelier.canvas.tidy() — cards sort by
+      (y, x) and flow left→right into viewport-wide rows with 24px gutters,
+      animating (CSS transition via .tidying) into place, then fitToView().
+  12. Zoombar ▣ (Minimap) toggles the minimap; the static .mm-card divs are
+      replaced at boot by a live SVG (cards = soft accent rects, viewport =
+      stroked rect), redrawn throttled ~250ms on card add/remove/drag-end
+      and pan/zoom. Click or drag on it pans so that world point centers.
+      On/off persists in Atelier.store key 'minimap' (default ON).
    =========================================================================== */
 
 (function () {
@@ -57,6 +75,7 @@
   function applyTransform() {
     content.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
     zoomLabel.textContent = Math.round(zoom * 100) + '%';
+    scheduleMinimap(); // hoisted; throttled ~250ms, so per-mousemove calls are cheap
   }
   function zoomAt(nz, cx, cy) {              // keep screen point (cx,cy) fixed
     nz = Math.min(MAX_Z, Math.max(MIN_Z, nz));
@@ -85,6 +104,7 @@
   let panning = null;
   canvas.addEventListener('mousedown', (e) => {
     if (e.target.closest('.card, .dock, .minimap, .zoombar')) return;
+    if (e.shiftKey) return; // shift-drag is the selection marquee (see below), never pan
     panning = { x: e.clientX, y: e.clientY, px: panX, py: panY };
     canvas.classList.add('panning');
   });
@@ -197,6 +217,21 @@
   let cardSeq = 0;
   function bringToFront(card) { card.style.zIndex = ++zTop; }
 
+  // ── selection state (marquee gestures live after addCard, below) ──────────
+  const selected = new Set();        // card elements carrying class 'selected'
+  const cardHandles = new WeakMap(); // card element -> addCard handle (for Delete)
+  function emitSelection() { bus.emit('selection:changed', { count: selected.size }); }
+  function setSelected(el, on) {
+    if (on) { if (!selected.has(el)) { selected.add(el); el.classList.add('selected'); } }
+    else if (selected.delete(el)) el.classList.remove('selected');
+  }
+  function clearSelection() {
+    if (!selected.size) return;
+    selected.forEach((el) => el.classList.remove('selected'));
+    selected.clear();
+    emitSelection();
+  }
+
   function makeInteractive(card) {
     bringToFront(card);
     card.addEventListener('mousedown', () => bringToFront(card));
@@ -205,14 +240,28 @@
     if (bar) {
       bar.addEventListener('mousedown', (e) => {
         if (e.target.closest('.card-x')) return;
+        // Dragging a SELECTED card's bar moves the whole selection together.
+        // ponytail: group-drag persistence rides on the module owning the
+        // grabbed card (apps/widgets each persist ALL their instances on
+        // mouseup); foreign cards in a mixed selection catch up on their
+        // module's next gesture or the boards:will-switch flush.
+        const group = card.classList.contains('selected') && selected.size
+          ? Array.from(selected) : [card];
         const start = {
           x: e.clientX, y: e.clientY,
-          l: parseFloat(card.style.left) || 0,
-          t: parseFloat(card.style.top) || 0,
+          cards: group.map((el) => ({
+            el,
+            l: parseFloat(el.style.left) || 0,
+            t: parseFloat(el.style.top) || 0,
+          })),
         };
         const move = (ev) => {
-          card.style.left = start.l + (ev.clientX - start.x) / zoom + 'px';
-          card.style.top = start.t + (ev.clientY - start.y) / zoom + 'px';
+          const dx = (ev.clientX - start.x) / zoom;
+          const dy = (ev.clientY - start.y) / zoom;
+          start.cards.forEach((c) => {
+            c.el.style.left = c.l + dx + 'px';
+            c.el.style.top = c.t + dy + 'px';
+          });
         };
         const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
         window.addEventListener('mousemove', move);
@@ -264,7 +313,13 @@
     const handle = {
       el,
       id,
-      remove() { el.remove(); bus.emit('card:removed', { id, el }); },
+      remove() {
+        const wasSelected = selected.delete(el);
+        if (wasSelected) el.classList.remove('selected');
+        el.remove();
+        bus.emit('card:removed', { id, el });
+        if (wasSelected) emitSelection();
+      },
       setRect(rect = {}) {
         if (rect.x != null) el.style.left = rect.x + 'px';
         if (rect.y != null) el.style.top = rect.y + 'px';
@@ -280,6 +335,8 @@
         };
       },
     };
+
+    cardHandles.set(el, handle); // Delete-key removal routes through the handle
 
     // close button routes through the handle so card:removed fires
     const x0 = el.querySelector('.card-x');
@@ -297,6 +354,220 @@
     dblClickCbs.forEach((cb) => { try { cb(x, y, e); } catch (err) { console.error('[Atelier] onDoubleClick handler', err); } });
   });
   function onDoubleClick(cb) { dblClickCbs.add(cb); return () => dblClickCbs.delete(cb); }
+
+  // ── marquee multi-select (Shift+drag on empty canvas) ─────────────────────
+  // Screen-space overlay div; on move/up, cards whose WORLD rect AABB-
+  // intersects the marquee are XORed against the pre-drag selection.
+  let marq = null; // { sx, sy, preSel, box } — box appears past the 4px threshold
+
+  function marqueeApply(x1, y1, x2, y2) { // screen corners -> live XOR select
+    const a = screenToWorld(x1, y1), b = screenToWorld(x2, y2);
+    Array.from(content.children).forEach((el) => {
+      if (!el.classList.contains('card')) return;
+      const x = parseFloat(el.style.left) || 0;
+      const y = parseFloat(el.style.top) || 0;
+      const hit = x < b.x && x + el.offsetWidth > a.x &&
+                  y < b.y && y + el.offsetHeight > a.y;
+      setSelected(el, hit ? !marq.preSel.has(el) : marq.preSel.has(el));
+    });
+  }
+
+  function cancelMarquee() { // Escape mid-drag: restore the pre-drag selection
+    if (!marq) return;
+    const pre = marq.preSel;
+    if (marq.box) marq.box.remove();
+    marq = null;
+    Array.from(content.children).forEach((el) => {
+      if (el.classList.contains('card')) setSelected(el, pre.has(el));
+    });
+    emitSelection();
+  }
+
+  canvas.addEventListener('mousedown', (e) => {
+    if (!e.shiftKey) return; // plain drag stays pan (handler above owns it)
+    if (e.target.closest('.card, .dock, .minimap, .zoombar')) return;
+    e.preventDefault();
+    marq = { sx: e.clientX, sy: e.clientY, preSel: new Set(selected), box: null };
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!marq) return;
+    if (!marq.box) {
+      const dx = e.clientX - marq.sx, dy = e.clientY - marq.sy;
+      if (dx * dx + dy * dy < 16) return; // 4px threshold before the marquee appears
+      ensureStyles();
+      marq.box = document.createElement('div');
+      marq.box.className = 'atelier-marquee';
+      canvas.appendChild(marq.box);
+    }
+    const r = canvas.getBoundingClientRect();
+    const x1 = Math.min(marq.sx, e.clientX), y1 = Math.min(marq.sy, e.clientY);
+    const x2 = Math.max(marq.sx, e.clientX), y2 = Math.max(marq.sy, e.clientY);
+    marq.box.style.left = (x1 - r.left) + 'px';
+    marq.box.style.top = (y1 - r.top) + 'px';
+    marq.box.style.width = (x2 - x1) + 'px';
+    marq.box.style.height = (y2 - y1) + 'px';
+    marqueeApply(x1, y1, x2, y2); // live preview; mouseup only finalizes
+  });
+  window.addEventListener('mouseup', () => {
+    if (!marq) return;
+    const drew = !!marq.box; // sub-threshold shift-click leaves selection alone
+    if (marq.box) marq.box.remove();
+    marq = null;
+    if (drew) emitSelection();
+  });
+
+  function deleteSelected() {
+    // route through the handles so card:removed fires for every card
+    Array.from(selected).forEach((el) => {
+      const h = cardHandles.get(el);
+      if (h) h.remove();
+    });
+  }
+
+  // ── tidy / auto-arrange (zoombar ✦) ───────────────────────────────────────
+  // OpenSwarm-style: sort by (y, then x), flow left→right into rows of total
+  // width ~ the current viewport in world units, 24px gutters, row height =
+  // tallest card in the row; animate via .tidying, then fitToView().
+  function tidy() {
+    const cards = Array.from(content.children).filter((el) => el.classList.contains('card'));
+    if (!cards.length) return;
+    ensureStyles();
+    cards.sort((c1, c2) => {
+      const dy = (parseFloat(c1.style.top) || 0) - (parseFloat(c2.style.top) || 0);
+      return dy || ((parseFloat(c1.style.left) || 0) - (parseFloat(c2.style.left) || 0));
+    });
+    const r = canvas.getBoundingClientRect();
+    const origin = screenToWorld(r.left + 24, r.top + 24); // near viewport top-left
+    const maxW = Math.max(360, r.width / zoom - 48);
+    let cx = origin.x, cy = origin.y, rowH = 0;
+    cards.forEach((el) => {
+      const w = el.offsetWidth, h = el.offsetHeight;
+      if (cx > origin.x && cx - origin.x + w > maxW) { cx = origin.x; cy += rowH + 24; rowH = 0; }
+      el.classList.add('tidying');
+      el.style.left = cx + 'px';
+      el.style.top = cy + 'px';
+      cx += w + 24;
+      rowH = Math.max(rowH, h);
+    });
+    setTimeout(() => cards.forEach((el) => el.classList.remove('tidying')), 400);
+    fitToView(); // reads the already-set target positions, so it fits the end state
+    // Tidy moves cards without any mousedown/mouseup on them, so the app and
+    // widget modules' gesture-based persistence never fires — announce the
+    // rearrange so they flush their rects now (customization.js's observer
+    // already catches the built-in cards).
+    bus.emit('cards:rearranged', {});
+  }
+  const tidyBtn = document.querySelector('.zoombar [title="Auto-arrange"]');
+  if (tidyBtn) tidyBtn.addEventListener('click', tidy);
+
+  // ── minimap (zoombar ▣; replaces the static .mm-card divs with live SVG) ──
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const minimapEl = document.querySelector('.minimap');
+  let mmSvg = null;
+  let mmMap = null; // world->minimap transform of the last draw (for inverse)
+  let mmVisible = store.get('minimap', true) !== false; // default ON (shell shows one)
+  let mmLast = 0, mmTimer = null;
+
+  function drawMinimap() {
+    if (!mmSvg || !mmVisible) return;
+    const box = mmSvg.getBoundingClientRect();
+    const W = box.width || 166, H = box.height || 104;
+    const r = canvas.getBoundingClientRect();
+    const rects = Array.from(content.children)
+      .filter((el) => el.classList.contains('card'))
+      .map((el) => ({
+        x: parseFloat(el.style.left) || 0, y: parseFloat(el.style.top) || 0,
+        w: el.offsetWidth, h: el.offsetHeight,
+      }));
+    // union bbox of all card world-rects plus the viewport rect
+    const vp = { x: -panX / zoom, y: -panY / zoom, w: r.width / zoom, h: r.height / zoom };
+    let minX = vp.x, minY = vp.y, maxX = vp.x + vp.w, maxY = vp.y + vp.h;
+    rects.forEach((c) => {
+      minX = Math.min(minX, c.x); minY = Math.min(minY, c.y);
+      maxX = Math.max(maxX, c.x + c.w); maxY = Math.max(maxY, c.y + c.h);
+    });
+    const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
+    const scale = Math.min(W / bw, H / bh);
+    const ox = (W - bw * scale) / 2, oy = (H - bh * scale) / 2;
+    mmMap = { scale, minX, minY, ox, oy };
+    const px = (wx) => (wx - minX) * scale + ox;
+    const py = (wy) => (wy - minY) * scale + oy;
+
+    mmSvg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+    mmSvg.textContent = '';
+    rects.forEach((c) => {
+      const el = document.createElementNS(SVG_NS, 'rect');
+      el.setAttribute('x', px(c.x)); el.setAttribute('y', py(c.y));
+      el.setAttribute('width', Math.max(2, c.w * scale));
+      el.setAttribute('height', Math.max(2, c.h * scale));
+      el.setAttribute('rx', 2);
+      el.setAttribute('fill-opacity', '0.25');
+      el.style.fill = 'var(--accent)';
+      mmSvg.appendChild(el);
+    });
+    const v = document.createElementNS(SVG_NS, 'rect');
+    v.setAttribute('x', px(vp.x)); v.setAttribute('y', py(vp.y));
+    v.setAttribute('width', Math.max(2, vp.w * scale));
+    v.setAttribute('height', Math.max(2, vp.h * scale));
+    v.setAttribute('rx', 2);
+    v.setAttribute('fill', 'none');
+    v.setAttribute('stroke-width', '1.5');
+    v.style.stroke = 'var(--accent)';
+    mmSvg.appendChild(v);
+  }
+
+  function scheduleMinimap() { // throttled ~250ms with a trailing call
+    if (!mmSvg || !mmVisible) return;
+    clearTimeout(mmTimer);
+    const wait = Math.max(0, 250 - (Date.now() - mmLast));
+    mmTimer = setTimeout(() => { mmLast = Date.now(); drawMinimap(); }, wait);
+  }
+
+  function minimapPanTo(clientX, clientY) { // inverse transform; center that point
+    if (!mmMap || !mmSvg) return;
+    const box = mmSvg.getBoundingClientRect();
+    const wx = (clientX - box.left - mmMap.ox) / mmMap.scale + mmMap.minX;
+    const wy = (clientY - box.top - mmMap.oy) / mmMap.scale + mmMap.minY;
+    const r = canvas.getBoundingClientRect();
+    setViewport({ panX: r.width / 2 - wx * zoom, panY: r.height / 2 - wy * zoom });
+  }
+
+  function applyMinimapVisibility() {
+    if (minimapEl) minimapEl.style.display = mmVisible ? '' : 'none';
+  }
+
+  // Called from the boot section (ensureStyles reads state declared below).
+  function minimapInit() {
+    if (!minimapEl) return;
+    ensureStyles();
+    minimapEl.textContent = ''; // drop the static .mm-frame / .mm-card markup
+    mmSvg = document.createElementNS(SVG_NS, 'svg');
+    mmSvg.setAttribute('class', 'mm-svg');
+    minimapEl.appendChild(mmSvg);
+    // click (or drag) pans the canvas so the pointed world point centers
+    mmSvg.addEventListener('mousedown', (e) => {
+      e.preventDefault();
+      minimapPanTo(e.clientX, e.clientY);
+      const move = (ev) => minimapPanTo(ev.clientX, ev.clientY);
+      const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+      window.addEventListener('mousemove', move);
+      window.addEventListener('mouseup', up);
+    });
+    const btn = document.querySelector('.zoombar [title="Minimap"]');
+    if (btn) btn.addEventListener('click', () => {
+      mmVisible = !mmVisible;
+      // ponytail: 'atelier:minimap' is board-scoped under boards.js, so the
+      // toggle travels with each board; a GLOBAL_KEYS entry is the upgrade.
+      store.set('minimap', mmVisible);
+      applyMinimapVisibility();
+      if (mmVisible) drawMinimap();
+    });
+    applyMinimapVisibility();
+    bus.on('card:added', scheduleMinimap);
+    bus.on('card:removed', scheduleMinimap);
+    window.addEventListener('mouseup', scheduleMinimap); // drag/resize/pan/marquee end
+    drawMinimap();
+  }
 
   // ── app + widget registries ───────────────────────────────────────────────
   const appRegistry = new Map();
@@ -365,6 +636,12 @@
         box-shadow: var(--shadow); z-index: 9000; display: flex; flex-direction: column;
         overflow: hidden; }
       .atelier-panel-body { padding: 14px; overflow: auto; max-height: 60vh; color: var(--ink); }
+      .card.selected { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .card.tidying { transition: left .35s ease, top .35s ease; }
+      .atelier-marquee { position: absolute; z-index: 9998; pointer-events: none;
+        border: 1.5px solid var(--accent); background: var(--accent-soft);
+        opacity: 0.45; border-radius: 4px; }
+      .minimap .mm-svg { display: block; width: 100%; height: 100%; }
     `;
     const style = document.createElement('style');
     style.id = 'atelier-core-styles';
@@ -481,12 +758,16 @@
   // with fetch (the page has no CSP and widgets already fetch the backend
   // directly); throws on any transport/shape problem so send() can fall back
   // to the blocking POST /chat. onDelta(text) fires per token chunk.
-  // ponytail: direct fetch, no preload hop — the shared-secret-header upgrade
-  // moves this (and the widget fetches) behind the preload bridge together.
+  // ponytail: direct fetch, no preload hop — but mutating routes carry the
+  // shared-secret header (window.atelier.token, minted by main.js) when the
+  // preload bridge is present; absent (plain browser) the backend has no token
+  // set and does not enforce it.
   async function streamChat(message, onDelta) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (window.atelier && window.atelier.token) headers['X-Atelier-Token'] = window.atelier.token;
     const res = await fetch('http://127.0.0.1:8765/chat/stream', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ message }),
     });
     if (!res.ok || !res.body) throw new Error('stream unavailable');
@@ -603,12 +884,15 @@
     });
   });
 
-  // ── keyboard shortcuts (Cmd/Ctrl+M add-app, Escape close/escape) ──────────
+  // ── keyboard shortcuts (Escape, Delete/Backspace, Cmd/Ctrl+M add-app) ─────
   window.addEventListener('keydown', (e) => {
     if (e.defaultPrevented) return; // palette & friends handle their own keys
     if (e.key === 'Escape') {
-      // Escape works even while typing. Close the topmost floating panel if
-      // one is open (uniform z-index, so last in DOM order paints on top).
+      // Escape works even while typing. Marquee/selection clearing comes
+      // FIRST; then close the topmost floating panel if one is open
+      // (uniform z-index, so last in DOM order paints on top).
+      if (marq) { cancelMarquee(); return; }
+      if (selected.size) { clearSelection(); return; }
       const panels = document.querySelectorAll('.atelier-panel');
       if (panels.length) panels[panels.length - 1].remove();
       else bus.emit('shortcut:escape');
@@ -616,6 +900,11 @@
     }
     const t = e.target;
     if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if ((e.key === 'Delete' || e.key === 'Backspace') && selected.size) {
+      e.preventDefault();
+      deleteSelected(); // via the handles, so card:removed fires per card
+      return;
+    }
     if ((e.metaKey || e.ctrlKey) && (e.key === 'm' || e.key === 'M')) {
       e.preventDefault();
       bus.emit('shortcut:add-app', {});
@@ -628,7 +917,12 @@
 
   // ── publish the API ───────────────────────────────────────────────────────
   window.Atelier = {
-    canvas: { addCard, onDoubleClick, viewport, screenToWorld, fitToView, setViewport },
+    canvas: { addCard, onDoubleClick, viewport, screenToWorld, fitToView, setViewport, tidy },
+    selection: {
+      get: () => Array.from(selected),   // selected card elements
+      clear: clearSelection,
+      count: () => selected.size,
+    },
     bus,
     store,
     backend,
@@ -643,6 +937,8 @@
   };
 
   // ── boot: register the pre-existing metrics + chat cards through addCard ──
+  ensureStyles();   // selection/marquee/tidy/minimap CSS must exist up front
+  minimapInit();    // before the addCard loop so card:added redraws are caught
   document.querySelectorAll('#content > .card').forEach((el) => {
     const x = parseFloat(el.style.left) || 0;
     const y = parseFloat(el.style.top) || 0;
@@ -666,6 +962,10 @@
       ['canvas.screenToWorld', typeof A.canvas.screenToWorld === 'function'],
       ['canvas.fitToView', typeof A.canvas.fitToView === 'function'],
       ['canvas.setViewport', typeof A.canvas.setViewport === 'function'],
+      ['canvas.tidy', typeof A.canvas.tidy === 'function'],
+      ['selection.get', A.selection && typeof A.selection.get === 'function'],
+      ['selection.clear', A.selection && typeof A.selection.clear === 'function'],
+      ['selection.count', A.selection && typeof A.selection.count === 'function'],
       ['bus.on', A.bus && typeof A.bus.on === 'function'],
       ['bus.emit', A.bus && typeof A.bus.emit === 'function'],
       ['store.get', A.store && typeof A.store.get === 'function'],

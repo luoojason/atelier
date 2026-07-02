@@ -26,9 +26,12 @@ Run:
 import asyncio
 import contextlib
 import datetime
+import itertools
 import json
 import os
 import re
+import secrets
+import uuid
 from pathlib import Path
 
 from claude_agent_sdk import (
@@ -62,7 +65,7 @@ from scheduler import notify as swarm_notify
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 ATELIER_INSTRUCTIONS = """You are Atelier, a studio assistant running on the user's own Claude subscription.
@@ -217,6 +220,10 @@ async def _lifespan(app: FastAPI):
             await _chat_client.disconnect()
         finally:
             _chat_client = None
+    # Tear down every multi-card agent session (see the sessions section below).
+    for sess in list(_sessions.values()):
+        await _close_session_client(sess)
+    _sessions.clear()
 
 
 app = FastAPI(title="Atelier Lite", lifespan=_lifespan)
@@ -228,10 +235,17 @@ app = FastAPI(title="Atelier Lite", lifespan=_lifespan)
 # page (Origin "null" or "file://"), local dev pages, and no-Origin clients
 # (curl, main.js's Node fetch, TestClient). Everything else is rejected
 # server-side too, since CORS alone only hides the response.
-# ponytail: origin gating in v1 — a shared-secret header minted by main.js and
-# threaded through preload + spawn env is the upgrade path.
+#
+# Origin gating alone is not enough for the MUTATING routes: any internet page
+# can mint Origin "null" (<iframe sandbox="allow-scripts" srcdoc=...>) and
+# "null" must stay allowed because the Electron file:// renderer sends it. So
+# writes additionally require a shared-secret header: main.js mints
+# ATELIER_TOKEN fresh per launch and threads it to the renderer via preload
+# and to both sidecars via spawn env. Token unset (dev uvicorn, plain-browser
+# testing, TestClient) -> the token gate is off and origin gating is the wall.
 _ORIGIN_RE = r"^(null|file://|https?://(localhost|127\.0\.0\.1)(:\d+)?)$"
 _origin_ok = re.compile(_ORIGIN_RE).match
+_MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 
 app.add_middleware(
     CORSMiddleware,
@@ -247,6 +261,11 @@ async def _reject_foreign_origins(request: Request, call_next):
     origin = request.headers.get("origin")
     if origin is not None and not _origin_ok(origin):
         return JSONResponse({"detail": "origin not allowed"}, status_code=403)
+    token = os.getenv("ATELIER_TOKEN", "")  # call-time read so tests can tune it
+    if token and request.method in _MUTATING_METHODS:
+        supplied = request.headers.get("x-atelier-token", "")
+        if not secrets.compare_digest(supplied, token):
+            return JSONResponse({"detail": "missing or bad token"}, status_code=403)
     return await call_next(request)
 
 
@@ -525,6 +544,226 @@ async def get_response_compat(req: AgencyResponseRequest):
             "response": f"Atelier hit an error and could not finish that turn: {exc}",
             "error": True,
         }
+
+
+# --- Multi-card agent sessions ------------------------------------------------
+#
+# Each Agent card in the desktop app owns ONE of these sessions: a fresh
+# conversation on its own ClaudeSDKClient (same build_options() isolation as
+# /chat and the compat route, but a separate client from BOTH — a card can
+# never pollute the main chat context or a scheduled job's).
+#
+# Shape (fixed contract with app/sessions.js + tests):
+#   POST   /sessions                {"name"?}    -> {"id","name"}
+#   GET    /sessions                             -> {"sessions":[{id,name,status,messages_len}]}
+#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}]}
+#   POST   /sessions/{id}/message   {"message"}  -> 202 {"status":"running"} (fire-and-poll)
+#   DELETE /sessions/{id}                        -> {"ok":true}
+#   unknown id -> 404 {"error":"unknown session"}; a turn error sets
+#   status "error" + an assistant message carrying the error text — never a 500.
+#
+# ponytail: in-memory sessions; disk persistence is the upgrade.
+
+
+class _AgentSession:
+    """One card-scoped conversation: lazy client + status + message ledger."""
+
+    def __init__(self, session_id: str, name: str):
+        self.id = session_id
+        self.name = name
+        self.client: ClaudeSDKClient | None = None  # lazy: built on first message
+        self.lock = asyncio.Lock()
+        self.status = "idle"  # "idle" | "running" | "error"
+        self.messages: list[dict] = []  # {"role","text","ts"} append-only
+        self.last_used = next(_session_touch)
+
+
+_sessions: dict[str, _AgentSession] = {}
+_session_seq = itertools.count(1)    # 'Agent N' default names
+_session_touch = itertools.count(1)  # deterministic LRU clock (no wall-time ties)
+# Strong refs to in-flight turn tasks; asyncio only holds weak ones.
+_session_tasks: set = set()
+
+
+def _max_sessions() -> int:
+    """The session cap, read from env at call time so tests can tune it."""
+    try:
+        return max(1, int(os.getenv("ATELIER_MAX_SESSIONS", "6")))
+    except ValueError:
+        return 6
+
+
+def _touch_session(sess: _AgentSession) -> None:
+    sess.last_used = next(_session_touch)
+
+
+def _session_ts() -> str:
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+# Per-session ledger ceiling: session COUNT is capped by ATELIER_MAX_SESSIONS,
+# but each ledger is append-only in-memory, so it needs its own ceiling too.
+# Reject (never silently drop) — the poller's rendered-count cursor assumes the
+# list only ever grows. ponytail: 500 messages/session, deliberate; a card that
+# deep should be closed for a fresh one, and disk persistence is the upgrade.
+_MAX_SESSION_MESSAGES = 500
+
+
+def _append_session_message(sess: _AgentSession, role: str, text: str) -> None:
+    sess.messages.append({"role": role, "text": text, "ts": _session_ts()})
+
+
+def _unknown_session() -> JSONResponse:
+    return JSONResponse({"error": "unknown session"}, status_code=404)
+
+
+async def _close_session_client(sess: _AgentSession) -> None:
+    """Best-effort disconnect + drop of a session's client (may be None)."""
+    client, sess.client = sess.client, None
+    if client is not None:
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001 - teardown must never propagate
+            pass
+
+
+async def _spawn_session_turn(coro) -> None:
+    """Fire-and-forget one turn. Tests monkeypatch this to await inline."""
+    task = asyncio.create_task(coro)
+    _session_tasks.add(task)
+    task.add_done_callback(_session_tasks.discard)
+
+
+async def _run_session_turn(sess: _AgentSession, message: str) -> None:
+    """One fire-and-poll turn: query, drain via _collect_response, settle status.
+
+    The caller already appended the user message and set status "running";
+    this appends the assistant message (or the error-text assistant message)
+    and settles status to "idle"/"error". Reuses _collect_response so the
+    TextBlock/ResultMessage drain semantics can never drift from /chat.
+    """
+    async with sess.lock:
+        # A DELETE can land between spawn and here: the session is already out
+        # of _sessions and its client (if any) disconnected. Bail before
+        # building a NEW client — otherwise the turn would run at real token
+        # cost on a detached session nobody can reach, and its freshly
+        # connected client would leak (lifespan teardown only walks _sessions).
+        if _sessions.get(sess.id) is not sess:
+            sess.status = "idle"
+            await _close_session_client(sess)
+            return
+        try:
+            if sess.client is None:
+                client = ClaudeSDKClient(options=build_options())
+                await client.connect()
+                sess.client = client
+            await sess.client.query(message)
+            result = await _collect_response(sess.client)
+            _append_session_message(sess, "assistant", result["response"])
+            sess.status = "error" if result.get("error") else "idle"
+        except Exception as exc:  # noqa: BLE001 - surface in-band, never crash the task
+            _append_session_message(
+                sess,
+                "assistant",
+                f"Atelier hit an error and could not finish that turn: {exc}",
+            )
+            sess.status = "error"
+            # The transport may be wedged (dead CLI subprocess); drop the client
+            # so the next message reconnects fresh — mirrors _reset_chat_client.
+            await _close_session_client(sess)
+        finally:
+            _touch_session(sess)
+            # Deleted MID-turn: delete_session's disconnect may have raced our
+            # lazy connect above, leaving a live client on the detached object.
+            if _sessions.get(sess.id) is not sess:
+                await _close_session_client(sess)
+
+
+class SessionCreateRequest(BaseModel):
+    name: str | None = None
+
+
+class SessionMessageRequest(BaseModel):
+    # ponytail: 200k-char ceiling — far past any real prompt, small enough that
+    # a hostile local client cannot balloon resident memory one POST at a time.
+    message: str = Field(max_length=200_000)
+
+
+@app.post("/sessions")
+async def create_session(req: SessionCreateRequest | None = None):
+    # Cap with LRU eviction: evictable = any session NOT mid-turn ("idle" or
+    # "error" — an errored card is just as reclaimable). All running -> 409.
+    while len(_sessions) >= _max_sessions():
+        evictable = [s for s in _sessions.values() if s.status != "running"]
+        if not evictable:
+            return JSONResponse({"error": "session limit"}, status_code=409)
+        victim = min(evictable, key=lambda s: s.last_used)
+        _sessions.pop(victim.id, None)
+        await _close_session_client(victim)
+
+    name = ((req.name if req else None) or "").strip() or f"Agent {next(_session_seq)}"
+    sess = _AgentSession(uuid.uuid4().hex, name)
+    _sessions[sess.id] = sess
+    return {"id": sess.id, "name": sess.name}
+
+
+@app.get("/sessions")
+async def list_sessions():
+    return {
+        "sessions": [
+            {
+                "id": s.id,
+                "name": s.name,
+                "status": s.status,
+                "messages_len": len(s.messages),
+            }
+            for s in _sessions.values()
+        ]
+    }
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    sess = _sessions.get(session_id)
+    if sess is None:
+        return _unknown_session()
+    return {
+        "id": sess.id,
+        "name": sess.name,
+        "status": sess.status,
+        "messages": list(sess.messages),
+    }
+
+
+@app.post("/sessions/{session_id}/message")
+async def session_message(session_id: str, req: SessionMessageRequest):
+    sess = _sessions.get(session_id)
+    if sess is None:
+        return _unknown_session()
+    if sess.status == "running":
+        return JSONResponse({"error": "turn in progress"}, status_code=409)
+    # +1 leaves room for the assistant reply this turn will append.
+    if len(sess.messages) + 1 >= _MAX_SESSION_MESSAGES:
+        return JSONResponse({"error": "session ledger full"}, status_code=413)
+    _append_session_message(sess, "user", req.message)
+    sess.status = "running"
+    _touch_session(sess)
+    await _spawn_session_turn(_run_session_turn(sess, req.message))
+    return JSONResponse({"status": "running"}, status_code=202)
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    sess = _sessions.pop(session_id, None)
+    if sess is None:
+        return _unknown_session()
+    # ponytail: deleting a RUNNING session disconnects under the in-flight turn;
+    # the turn task lands on the detached object and is garbage-collected.
+    # Both race orderings are covered in _run_session_turn: a turn that has not
+    # started yet bails before connecting, and a turn that connected AFTER this
+    # disconnect drops its client in its finally block.
+    await _close_session_client(sess)
+    return {"ok": True}
 
 
 if __name__ == "__main__":
