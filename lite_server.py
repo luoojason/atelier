@@ -1822,6 +1822,27 @@ async def delete_session(session_id: str):
 _subagent_seq = itertools.count(1)  # 'Sub-agent N' default names
 _MAX_CHILDREN = 4  # live children per parent; keeps one card from eating the cap
 
+_MAX_DEPTH = 3  # deepest govern chain (A->B->C->D); bounds runaway delegation
+
+
+def _governs_cycle(parent_id: str, child_id: str) -> bool:
+    """Would setting ``child.parent_id = parent_id`` close a loop?
+
+    Walk parent_id's ancestor chain (parent_id -> its parent -> ...); if
+    child_id appears, linking child under parent would make child its own
+    ancestor. The ``seen`` set also stops a pre-existing corrupt cycle from
+    spinning forever.
+    """
+    seen: set[str] = set()
+    cur: str | None = parent_id
+    while cur is not None and cur not in seen:
+        if cur == child_id:
+            return True
+        seen.add(cur)
+        s = _sessions.get(cur)
+        cur = s.parent_id if s is not None else None
+    return False
+
 # Module-wide monotonic counter for browser_nav requests: the poller compares
 # seq against the last one it acted on, so repeats of the SAME url still fire.
 _browser_nav_seq = itertools.count(1)

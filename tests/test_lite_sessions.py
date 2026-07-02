@@ -494,3 +494,25 @@ def test_set_session_model_token_gated(monkeypatch, client):
     )
     assert r.status_code == 200
     assert lite_server._sessions[sid].model == "opus"
+
+
+# ── governance links: cycle helper + POST/DELETE /sessions/{id}/govern ────────
+
+def test_governs_cycle_helper_walks_parent_chain():
+    # _fresh_state (autouse) already reset _sessions to {}; build a chain A->B->C
+    a = lite_server._AgentSession("a" * 32, "A")
+    b = lite_server._AgentSession("b" * 32, "B", parent_id=a.id, depth=1)
+    c = lite_server._AgentSession("c" * 32, "C", parent_id=b.id, depth=2)
+    for s in (a, b, c):
+        lite_server._sessions[s.id] = s
+
+    # A is an ancestor of C, so governing A UNDER C would close A->B->C->A
+    assert lite_server._governs_cycle(c.id, a.id) is True
+    # governing C under A is a fresh downward link — no cycle
+    assert lite_server._governs_cycle(a.id, c.id) is False
+    # self trivially cycles (the walk starts at parent_id == child_id)
+    assert lite_server._governs_cycle(a.id, a.id) is True
+    # an unrelated node never cycles
+    d = lite_server._AgentSession("d" * 32, "D")
+    lite_server._sessions[d.id] = d
+    assert lite_server._governs_cycle(a.id, d.id) is False
