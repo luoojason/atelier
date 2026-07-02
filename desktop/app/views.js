@@ -75,8 +75,9 @@
       cards for Model provider (segmented "Claude Max subscription" /
       "Anthropic API key" control + API key save/validate/remove — controls
       disabled and "unavailable" shown if the backend is down), Backend
-      configuration (Model / Max turns / Scheduler / Jobs file / Auth mode
-      from GET /config — all "unavailable" if the backend is down),
+      configuration (Model segmented picker + Max turns / Scheduler /
+      Jobs file / Auth mode from GET /config — rows "unavailable" and the
+      picker disabled if the backend is down),
       Appearance (theme/accent/grid from customization), Connection (live
       backend status "online — on subscription" / "online — on API key"
       tracking the effective provider — stop lite_server and within ~4s it
@@ -90,6 +91,20 @@
       line disappears and the provider flips back to subscription. Every
       button disables while its request is in flight, and stays disabled
       even if the header ↻ lands a /config response mid-flight.
+   10. Backend configuration card: the Model row is a sonnet / opus / haiku
+      segmented control with the resolved model highlighted. Clicking the
+      active segment is a no-op (no request). Clicking another segment
+      disables the trio while POST /config/model is in flight, then the
+      highlight moves once /config reflects it (existing agent sessions
+      rebuild lazily; the next chat turn uses the new model). A 400 from an
+      out-of-allowlist POST or any failure surfaces inline under the row;
+      stop lite_server and click → "backend unreachable". With env
+      CLAUDE_CLI_MODEL set outside the trio (and no saved setting), a
+      fourth, DISABLED segment labeled with that value renders as the
+      active one; picking sonnet/opus/haiku persists a setting that beats
+      the env and the fourth segment disappears on the next /config load.
+      Like the provider card, a header ↻ /config response landing mid-POST
+      must not re-enable the segments.
    =========================================================================== */
 
 (function () {
@@ -444,9 +459,9 @@
    Settings view — the first consumer of Atelier.views (section 'foot').
    Reads GET /config (never the token value), the customization theme state,
    and the live backend status off the bus, and drives the dual-auth provider
-   routes (POST /config/provider, POST/DELETE /config/api-key, validate — all
-   token-gated). Registered from its own IIFE so it exercises exactly the
-   surface analytics.js will.
+   routes (POST /config/provider, POST/DELETE /config/api-key, validate) plus
+   the model picker (POST /config/model) — all token-gated. Registered from
+   its own IIFE so it exercises exactly the surface analytics.js will.
    =========================================================================== */
 (function () {
   const A = window.Atelier;
@@ -692,15 +707,117 @@
       }
     }));
 
+    // ── Model picker (Backend configuration card) ──────────────────────────
+    // r15: the read-only Model row becomes a segmented control, mirroring
+    // the provider-segment idiom above exactly (same .vw-seg styles, same
+    // in-flight discipline). POST /config/model persists settings["model"],
+    // which beats env CLAUDE_CLI_MODEL; the server resets the chat client so
+    // the next chat turn uses it (existing agent sessions rebuild lazily).
+    // A resolved model outside the trio (custom env) renders as a fourth,
+    // DISABLED segment labeled with that value — display only, never a POST.
+    const MODELS = ['sonnet', 'opus', 'haiku'];
+    const backendCard = card('Backend configuration', [
+      ['Max turns', 'max_turns', 'loading…'],
+      ['Scheduler', 'scheduler', 'loading…'],
+      ['Jobs file', 'jobs_file', 'loading…'],
+      ['Auth mode', 'auth_mode', 'loading…'],
+    ]);
+    const modelRow = document.createElement('div');
+    modelRow.className = 'vw-kv vw-ctl';
+    const modelLabel = document.createElement('span');
+    modelLabel.className = 'k';
+    modelLabel.textContent = 'Model';
+    const modelSeg = document.createElement('div');
+    modelSeg.className = 'vw-seg';
+    const modelBtns = {};                    // 'sonnet'|'opus'|'haiku' -> button
+    MODELS.forEach((m) => {
+      const b = btn(m);
+      modelBtns[m] = b;
+      modelSeg.appendChild(b);
+    });
+    const modelCustom = btn('');             // fourth segment: custom env value
+    modelCustom.disabled = true;             // display only — stays disabled
+    modelCustom.style.display = 'none';
+    modelSeg.appendChild(modelCustom);
+    modelRow.append(modelLabel, modelSeg);
+    const modelNote = noteLine();
+    const firstKv = backendCard.querySelector('.vw-kv');
+    backendCard.insertBefore(modelRow, firstKv);
+    backendCard.insertBefore(modelNote, firstKv);
+
+    function setModelEnabled(on) {           // modelCustom is never re-enabled
+      MODELS.forEach((m) => { modelBtns[m].disabled = !on; });
+    }
+    setModelEnabled(false);                  // until the first /config lands
+
+    let modelReachable = false;              // last GET /config outcome
+    let modelBusy = false;                   // a model POST in flight
+    function applyModelCfg(cfg) {
+      modelReachable = true;
+      const m = typeof cfg.model === 'string' ? cfg.model : '';
+      MODELS.forEach((k) => modelBtns[k].classList.toggle('active', k === m));
+      if (m && MODELS.indexOf(m) === -1) {   // custom env model
+        modelCustom.textContent = m;         // server string: textContent only
+        modelCustom.classList.add('active');
+        modelCustom.style.display = '';
+      } else {
+        modelCustom.classList.remove('active');
+        modelCustom.style.display = 'none';
+      }
+      // clear only the degrade text — action errors stay visible until acted on
+      if (modelNote.textContent === 'unavailable') setNote(modelNote, '');
+      // the header ↻ can land a /config response while a model POST is in
+      // flight — re-enabling under it would allow a concurrent second POST
+      if (!modelBusy) setModelEnabled(true);
+    }
+    function degradeModelCtl() {
+      modelReachable = false;
+      setModelEnabled(false);
+      MODELS.forEach((k) => modelBtns[k].classList.remove('active'));
+      modelCustom.classList.remove('active');
+      modelCustom.style.display = 'none';
+      setNote(modelNote, 'unavailable');
+    }
+
+    // One in-flight model request at a time — same discipline as provAction:
+    // the trio disables, then re-enables from the last-known reachability
+    // when it settles (the loadConfig kicked off inside re-affirms after).
+    async function modelAction(fn) {
+      modelBusy = true;
+      setModelEnabled(false);
+      try { await fn(); }
+      finally {
+        modelBusy = false;
+        if (!disposed) setModelEnabled(modelReachable);
+      }
+    }
+
+    function pickModel(m) {
+      // skip the no-op click: re-POSTing the active model would only cost
+      // the server a pointless chat-client reset
+      if (modelBtns[m].classList.contains('active')) return;
+      modelAction(async () => {
+        setNote(modelNote, '');
+        try {
+          const r = await api('/config/model', {
+            method: 'POST', body: JSON.stringify({ model: m }),
+          });
+          if (disposed) return;
+          if (r.ok) loadConfig();            // reflect the resolved model
+          else setNote(modelNote, (r.data && r.data.error) ||
+            ('model switch failed (HTTP ' + r.status + ')'), 'err');
+        } catch {
+          if (!disposed) setNote(modelNote, 'backend unreachable', 'err');
+        }
+      });
+    }
+    MODELS.forEach((m) => {
+      modelBtns[m].addEventListener('click', () => pickModel(m));
+    });
+
     wrap.append(
       provCard,
-      card('Backend configuration', [
-        ['Model', 'model', 'loading…'],
-        ['Max turns', 'max_turns', 'loading…'],
-        ['Scheduler', 'scheduler', 'loading…'],
-        ['Jobs file', 'jobs_file', 'loading…'],
-        ['Auth mode', 'auth_mode', 'loading…'],
-      ]),
+      backendCard,
       card('Appearance', [
         ['Theme', 'theme', '—'],
         ['Accent', 'accent', '—'],
@@ -776,7 +893,6 @@
         .then((r) => { if (!r.ok) throw new Error('config HTTP ' + r.status); return r.json(); })
         .then((cfg) => {
           if (disposed || !cfg || typeof cfg !== 'object') return;
-          val.model.textContent = fmt(cfg.model);
           val.max_turns.textContent = fmt(cfg.max_turns);
           const sch = cfg.scheduler;
           val.scheduler.textContent =
@@ -789,12 +905,14 @@
             ? 'minted — mutating routes protected'
             : 'not enforced (dev)';
           applyProviderCfg(cfg);
+          applyModelCfg(cfg);
         })
         .catch(() => {
           if (disposed) return;
-          ['model', 'max_turns', 'scheduler', 'jobs_file', 'auth_mode', 'token']
+          ['max_turns', 'scheduler', 'jobs_file', 'auth_mode', 'token']
             .forEach((k) => { val[k].textContent = 'unavailable'; });
           degradeProviderCard();
+          degradeModelCtl();
         });
     }
     loadConfig();

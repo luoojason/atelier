@@ -415,13 +415,40 @@ def _catalog_note(root: Path, folder: str, title: str, *, section=None,
         pass
 
 
+def _load_versions_store():
+    """The sibling versions_store module, imported at call time.
+
+    Lazy on purpose: versions_store lazily reads back this module's
+    vault_root for restore validation, so a top-level import in either
+    direction would be a cycle. Prefers the already-imported package module;
+    otherwise loads the sibling file directly, which keeps write_note's
+    capture hook working under the stdlib-only file-path test loading
+    (shared_tools/__init__ pulls in agency_swarm).
+    """
+    import importlib.util
+    import sys
+
+    mod = sys.modules.get("shared_tools.versions_store")
+    if mod is None:
+        name = "_vault_core_versions_store"
+        mod = sys.modules.get(name)
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(
+                name, Path(__file__).with_name("versions_store.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            sys.modules[name] = mod
+    return mod
+
+
 def write_note(folder: str, title: str, body: str, tags=None, *,
                catalog: bool = True, section=None, name=None, summary=None) -> str:
     """Write a note with proper frontmatter into a vault subfolder.
 
     Returns the absolute path of the written file. Refuses to write anywhere
     under Sources/ (immutable) or outside the vault. Creates the target folder
-    if needed.
+    if needed. Overwriting an existing note first captures its superseded
+    content into shared_tools.versions_store (best-effort, never blocking).
 
     When ``catalog`` is True (default) the vault convention is honored after the
     write: a dated bullet is appended to log.md and a table row is upserted into
@@ -438,6 +465,17 @@ def write_note(folder: str, title: str, body: str, tags=None, *,
     today = date.today().isoformat()
     frontmatter = _format_frontmatter(title, tags, today)
     content = f"{frontmatter}\n{body.rstrip()}\n" if body else f"{frontmatter}\n"
+    # Version-capture hook: an overwrite supersedes the note's current text,
+    # so that text is captured into the versions store BEFORE the new bytes
+    # land. Invariant: NO capture failure -- import error, store corruption,
+    # disk trouble, a raising capture() -- may ever block the note write.
+    try:
+        if path.exists():
+            _load_versions_store().capture(
+                str(path), path.read_text(encoding="utf-8", errors="replace"),
+                source="overwrite")
+    except Exception:
+        pass
     path.write_text(content, encoding="utf-8")
 
     if catalog:

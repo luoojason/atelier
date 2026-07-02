@@ -540,4 +540,9 @@ def _run():
 
 
 if __name__ == "__main__":
-    _run()
+    # Script mode has no conftest.py: point the write_note overwrite-capture
+    # hook at a throwaway store so a plain run never writes blobs into the
+    # user's real ~/.atelier/versions.
+    with tempfile.TemporaryDirectory() as _versions_dir:
+        os.environ["ATELIER_VERSIONS_DIR"] = _versions_dir
+        _run()

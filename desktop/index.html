@@ -144,6 +144,10 @@
     <!-- Analytics stack: vendored Chart.js, then the views overlay system,
          then the analytics views. Any of these missing at boot 404s
          harmlessly under defer and must not break the app. -->
+    <!-- link.js after arrows + sessions: the marquee-link gesture wires
+         browser cards to agent cards through both. -->
+    <script defer src="app/link.js"></script>
+    <script defer src="app/versions.js"></script>
     <script defer src="app/runlog.js"></script>
     <script defer src="vendor/chart.umd.min.js"></script>
     <script defer src="app/views.js"></script>

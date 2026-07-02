@@ -36,6 +36,18 @@
    plain fetch to http://127.0.0.1:8765 — no preload hop needed.
    XSS rule: every server-derived string enters the DOM via textContent.
 
+   Linked browser context (round 15): app/link.js (optional, loads after this
+   module) lets a shift-drag marquee link ONE browser card to an agent card
+   and publishes window.Atelier.links. When a link exists for this card,
+   send() prefixes the POSTED message with the browser's live page (title +
+   url, read via links.browserFor at send time). The prefix is transport-level
+   only: the optimistic bubble and the on-error composer refill stay the typed
+   text, and renderedCount already skips re-rendering the sent message, so the
+   prefix never renders. While linked, a small note under the composer says
+   'linked to browser — page context rides along' — it renders only when the
+   error note is empty (link status never clobbers an error). Every
+   Atelier.links access is guarded: without link.js nothing changes.
+
    Dock note: core.js's dock handler would spawn any registered type by
    lowercased button title, but apps.js CLONE-REPLACES every .dock-btn at load
    (stripping core's listeners) and its replacement handler only knows its own
@@ -103,7 +115,19 @@
       agent cards untouched, and so does a FAILED switch (fill localStorage
       until the "storage is full" toast fires → the board stays put and the
       agent conversations survive).
-  12. Console shows "[sessions] self-check passed" and no assert failures.
+  12. Linked browser (app/link.js + apps.js loaded): shift-drag a marquee
+      around exactly a Browser card and an Agent card → the link toast fires
+      and 'linked to browser — page context rides along' appears under the
+      Agent card's composer. Send "what page am I looking at?" → the bubble
+      shows ONLY the typed text, but the request body (Network tab, POST
+      /sessions/{id}/message) carries the '[Linked browser context — …]'
+      prefix with the live tab's title + url, and the transcript never shows
+      the prefix. Error notes win: stop the backend and send → the offline
+      note appears and the link note yields until the error clears. Marquee
+      the same pair again (unlink) → the link note vanishes. Without
+      app/link.js loaded everything behaves exactly as before (all
+      Atelier.links access is guarded).
+  13. Console shows "[sessions] self-check passed" and no assert failures.
    =========================================================================== */
 
 (function () {
@@ -150,6 +174,9 @@
       .atl-agent-note { font-size: 11.5px; color: var(--ink-dim);
         padding: 0 14px 6px; line-height: 1.4; }
       .atl-agent-note:empty { display: none; }
+      .atl-agent-linknote { font-size: 11px; color: var(--ink-dim);
+        padding: 4px 14px 8px; line-height: 1.4; font-style: italic; }
+      .atl-agent-linknote:empty { display: none; }
       .atl-agent-composer { display: flex; align-items: flex-end; gap: 8px;
         padding: 10px; border-top: 1px solid var(--border-soft); }
       .atl-agent-composer textarea { flex: 1; resize: none;
@@ -182,6 +209,23 @@
     let data = null;
     try { data = await res.json(); } catch { /* empty/non-JSON body */ }
     return { ok: res.ok, status: res.status, data };
+  }
+
+  // ── linked-context value hygiene ───────────────────────────────────────────
+  // The ride-along title/url are WEB-derived: a visited page fully controls
+  // its own <title> (apps.js mirrors page-title-updated verbatim), so a
+  // hostile page could craft a title that closes the bracketed context frame
+  // early and poses as top-level user instructions to a tool-capable agent.
+  // Neutralize the VALUES before interpolation — newlines collapse to
+  // spaces, ']' (the frame's closer) becomes ')', length is capped. The
+  // frame text itself stays exactly as contracted; only injected values are
+  // cleaned.
+  function cleanLinkValue(value, max) {
+    return String(value || '')
+      .replace(/[\r\n\u2028\u2029]+/g, ' ')
+      .replace(/\]/g, ')')
+      .slice(0, max)
+      .trim();
   }
 
   // ── sub-agent auto-reveal (module-level, one sweep for every card) ────────
@@ -309,7 +353,11 @@
     sendBtn.textContent = '➤';
     sendBtn.title = 'Send';
     composer.append(ta, sendBtn);
-    body.append(msgs, note, composer);
+    // link-status note sits UNDER the composer (dedicated element so it never
+    // fights the error note above — see refreshLinkNote)
+    const linkNote = document.createElement('div');
+    linkNote.className = 'atl-agent-linknote';
+    body.append(msgs, note, composer, linkNote);
     card.append(bar, body);
 
     // state
@@ -323,7 +371,29 @@
 
     if (attached) trackSession(sessionId, card); // fresh cards register in ensureSession
 
-    function setNote(text) { note.textContent = text || ''; }
+    function setNote(text) {
+      note.textContent = text || '';
+      refreshLinkNote(); // an error note wins the space; re-yield when it clears
+    }
+
+    // Guarded live read of the marquee-link (app/link.js may be absent, or
+    // its accessor may throw on a torn-down card — treat both as "no link").
+    function browserLinkInfo() {
+      const links = window.Atelier && window.Atelier.links;
+      if (!links || typeof links.browserFor !== 'function') return null;
+      let info = null;
+      try { info = links.browserFor(card); } catch { return null; }
+      return (info && typeof info.url === 'string') ? info : null;
+    }
+
+    // Persistent 'linked to browser' note under the composer. Link status
+    // must not clobber an error message, so it renders only while the error
+    // note is otherwise empty; setNote() re-runs this on every transition.
+    function refreshLinkNote() {
+      if (closed) return;
+      const show = !!browserLinkInfo() && !note.textContent;
+      linkNote.textContent = show ? 'linked to browser — page context rides along' : '';
+    }
 
     function addBubble(role, text) {
       const row = document.createElement('div');
@@ -440,12 +510,28 @@
       if (attached && expired) { setNote(CHILD_GONE_NOTE); return; }
       ta.value = '';
       setNote('');
+      // Linked browser context (app/link.js, optional — guarded read): when a
+      // browser card is marquee-linked to this agent, the POSTED message gets
+      // a transport-level prefix carrying the browser's live page. Only the
+      // wire copy changes: the optimistic bubble below and the on-error
+      // composer refill stay the TYPED text, and renderedCount += 1 after a
+      // 202 skips re-rendering the sent server message — the prefix never
+      // reaches the DOM. Title/url pass through cleanLinkValue first (see
+      // its comment): a hostile page must not break out of the frame.
+      let posted = text;
+      const linkInfo = browserLinkInfo();
+      if (linkInfo && linkInfo.url) {
+        posted = '[Linked browser context — the user has a browser card linked'
+          + ' to this conversation, currently showing: '
+          + cleanLinkValue(linkInfo.title, 300) + ' — '
+          + cleanLinkValue(linkInfo.url, 2000) + ']\n\n' + text;
+      }
       const optimistic = addBubble('user', text);
       running = true;
       sendBtn.disabled = true;
       try {
         await ensureSession();
-        const body = { method: 'POST', body: JSON.stringify({ message: text }) };
+        const body = { method: 'POST', body: JSON.stringify({ message: posted }) };
         let r = await apiJson('/sessions/' + sessionId + '/message', body);
         if (r.status === 404) {
           if (attached) {
@@ -511,6 +597,13 @@
     }
     const handle = A.canvas.addCard(card, { x: pos.x, y: pos.y, w: CARD_W, h: CARD_H });
 
+    // link.js toggles links inside ITS 'selection:changed' handler and drops
+    // entries on 'card:removed'; it loads after this module, so its handlers
+    // run after these — defer the read one tick so the note sees the settled
+    // state. Guarded like every links access (no-ops when link.js is absent).
+    const offLinkSel = A.bus.on('selection:changed', () => { setTimeout(refreshLinkNote, 0); });
+    const offLinkRem = A.bus.on('card:removed', () => { setTimeout(refreshLinkNote, 0); });
+
     // card closed (×, board switch's removeAllCards, or programmatically) →
     // stop polling + free the backend
     const off = A.bus.on('card:removed', ({ el }) => {
@@ -518,6 +611,8 @@
       closed = true;
       clearTimeout(pollTimer);
       off();
+      offLinkSel();
+      offLinkRem();
       if (sessionId) {
         untrackSession(sessionId);
         // dismissed BEFORE the async DELETE: a sweep response already in
@@ -590,9 +685,15 @@
     const sweepIdle = cardBySession.size === 0 && sweepTimer === null;
     console.assert(sweepIdle,
       '[sessions] child sweep must stay idle until a card owns a session');
-    if (registered && btn && sweepIdle) {
+    // link.js loads AFTER this module, so Atelier.links is normally absent
+    // here — that is the guarded path send() must survive. If some load-order
+    // change put it first, it must expose the accessor send() calls.
+    const linksOk = !A.links || typeof A.links.browserFor === 'function';
+    console.assert(linksOk,
+      '[sessions] Atelier.links present but missing browserFor()');
+    if (registered && btn && sweepIdle && linksOk) {
       console.log('[sessions] self-check passed — agent app registered, '
-        + 'dock wired, child sweep idle.');
+        + 'dock wired, child sweep idle, links access guarded.');
     }
   })();
 })();

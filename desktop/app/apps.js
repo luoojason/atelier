@@ -809,6 +809,21 @@
     ctl.onRemove(() => browserCards.delete(cardApi));
     const cardEl = body.closest('.card');
     if (cardEl) cardEl.addEventListener('mousedown', bumpInteraction);
+    // Marquee-link read surface (r15): window.AtelierApps.browserInfo(cardEl)
+    // resolves to this card via the registry and reads the ACTIVE tab live —
+    // current url (webview getURL when attached, else tab.url) + display
+    // title (titleEl text, falling back to the card title text).
+    cardApi.el = cardEl;
+    cardApi.info = () => {
+      const t = activeTab();
+      if (!t) return null;
+      let title = (t.titleEl && t.titleEl.textContent) || '';
+      if (!title && cardEl) {
+        const ct = cardEl.querySelector('.card-title');
+        title = (ct && ct.textContent) || '';
+      }
+      return { url: currentUrl(), title };
+    };
 
     // ── boot tabs (legacy configs carry a single `url`) ─────────────────────
     // Scheme allowlist, not just "non-empty string": boards.js import writes
@@ -1105,6 +1120,19 @@
       else makeApp('browser', { config: { tabs: [url], active: 0 } });
     });
   }
+
+  // ── public surface (r15): read accessor for link.js marquee-linking ───────
+  // browserInfo(cardEl) -> { url, title } when cardEl is a LIVE browser card
+  // (active tab's current url + display title), null for anything else —
+  // closed/removed cards leave browserCards via their card:removed cleanup.
+  function browserInfo(cardEl) {
+    if (!cardEl) return null;
+    for (const c of browserCards) {
+      if (c.el === cardEl) return typeof c.info === 'function' ? c.info() : null;
+    }
+    return null;
+  }
+  window.AtelierApps = { browserInfo };
 
   // ── self-check ────────────────────────────────────────────────────────────
   (function selfCheck() {

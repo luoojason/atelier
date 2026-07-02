@@ -56,6 +56,10 @@ from shared_tools import (
     ReadBrief,
 )
 from shared_tools.sdk_tools import build_atelier_server
+
+# Pure stdlib vault path helpers: the /versions* routes validate note paths
+# against the vault root without touching the heavier tool wrappers.
+from shared_tools import vault_core
 from campaign_agent.tools.StartCampaign import StartCampaign
 from campaign_agent.tools.RecordDeliverable import RecordDeliverable
 from campaign_agent.tools.CampaignStatus import CampaignStatus
@@ -104,15 +108,11 @@ LIGHT_TOOLS = [
 ATELIER_SERVER, ATELIER_ALLOWED_TOOLS = build_atelier_server(LIGHT_TOOLS)
 
 
-def _resolved_model() -> str:
-    """The SDK model string: CLAUDE_CLI_MODEL env else 'sonnet'."""
-    return os.getenv("CLAUDE_CLI_MODEL") or "sonnet"
-
-
-# --- Provider settings store (dual auth) ----------------------------------------
+# --- Provider + model settings store --------------------------------------------
 #
-# One tiny JSON file holds the user's provider choice + optional API key:
-#   {"provider": "subscription"|"api", "anthropic_api_key": "<str>"}
+# One tiny JSON file holds the user's provider choice, optional API key, and
+# optional model choice:
+#   {"provider": "subscription"|"api", "anthropic_api_key": "<str>", "model": "<str>"}
 # Read at CALL time (no caching) so a settings change is picked up by the very
 # next build_options() without a restart. Every failure mode — missing file,
 # corrupt JSON, wrong types, unknown provider — degrades to the safe default
@@ -139,6 +139,15 @@ def load_settings() -> dict:
     key = data.get("anthropic_api_key")
     if isinstance(key, str) and key:
         settings["anthropic_api_key"] = key
+    # "model" must ride along here: every mutating route merges via
+    # load_settings() -> save_settings(), so a model filtered out on load
+    # would be silently wiped by the very next provider/api-key write.
+    # Non-empty str only; the allowlist gate lives on POST /config/model
+    # (a hand-edited value still resolves, and the Settings UI renders it
+    # as a disabled custom segment).
+    model = data.get("model")
+    if isinstance(model, str) and model:
+        settings["model"] = model
     return settings
 
 
@@ -165,6 +174,20 @@ def _effective_provider(settings: dict | None = None) -> str:
     if s.get("provider") == "api" and s.get("anthropic_api_key"):
         return "api"
     return "subscription"
+
+
+def _resolved_model() -> str:
+    """The SDK model string: settings["model"] else CLAUDE_CLI_MODEL else "sonnet".
+
+    The persisted picker choice wins so the Settings UI is authoritative; the
+    env knob stays as the headless override; "sonnet" is the floor. Read at
+    CALL time like every other settings consumer (no restart needed).
+    """
+    return (
+        load_settings().get("model")
+        or os.getenv("CLAUDE_CLI_MODEL")
+        or "sonnet"
+    )
 
 
 def build_options(
@@ -678,6 +701,34 @@ async def set_provider(req: ProviderRequest):
     return {"ok": True, "provider": _effective_provider(settings)}
 
 
+# The model picker's allowlist: the three CLI aliases the SDK accepts today.
+# A custom CLAUDE_CLI_MODEL env value still resolves (see _resolved_model);
+# this route only ever PERSISTS one of these.
+_ALLOWED_MODELS = ("sonnet", "opus", "haiku")
+
+
+class ModelRequest(BaseModel):
+    model: str
+
+
+@app.post("/config/model")
+async def set_model(req: ModelRequest):
+    """Persist the model choice. POST -> token-gated by the middleware.
+
+    Same reset contract as set_provider: dropping the long-lived chat client
+    means the NEXT chat turn rebuilds on the new model; existing agent-card
+    sessions keep their transport and rebuild lazily (error teardown or
+    delete).
+    """
+    if req.model not in _ALLOWED_MODELS:
+        return JSONResponse({"error": "unknown model"}, status_code=400)
+    settings = load_settings()
+    settings["model"] = req.model
+    save_settings(settings)  # merge: provider + api key ride along untouched
+    await _reset_chat_client()
+    return {"ok": True, "model": _resolved_model()}
+
+
 @app.post("/config/api-key")
 async def set_api_key(req: ApiKeyRequest):
     """Store a (shape-validated) API key. Provider choice is left untouched."""
@@ -785,6 +836,123 @@ async def cc_heatmap():
         return await asyncio.to_thread(cc_usage.heatmap_summary)
     except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
         return cc_usage.empty_heatmap()
+
+
+# --- Output version history endpoints (/versions*) ------------------------------
+#
+# Read/restore views over shared_tools/versions_store — the content-addressed
+# captures vault_core.write_note takes of every note it overwrites. Same
+# conventions as the dashboard endpoints above: fixed shapes, degrade to
+# empty shapes on ANY failure, never 500. Restore is the one mutating route
+# (POST -> token-gated by the middleware); the store itself re-validates
+# vault containment + the Sources/ ban before touching the file.
+
+# Version ids are hex content digests (sha256 today; a shorter prefix
+# tomorrow). Anything outside 8..64 lowercase hex chars is rejected before it
+# can reach the store, so {id} can never traverse or probe. fullmatch (never
+# $): $ would also match before a trailing newline.
+_VERSION_ID_RE = re.compile(r"[a-f0-9]{8,64}")
+
+
+def _versions_store():
+    """The versions store module, imported at CALL time.
+
+    Kept out of the module-level imports so a missing or broken store can
+    never take the whole server down — every /versions* handler wraps its
+    store use in try/except and degrades to its empty shape instead.
+    """
+    from shared_tools import versions_store
+
+    return versions_store
+
+
+def _vault_note_path(raw: str) -> str | None:
+    """``raw`` unchanged when it resolves INSIDE the vault root, else None.
+
+    Resolution (symlinks + '..' collapsed) happens before the containment
+    check, so traversal tricks cannot slip a foreign path through — but the
+    ORIGINAL string is what gets returned and handed to the store, because
+    the store keys notes by the exact path string capture() saw and the
+    Versions card only ever echoes paths the store itself listed. Callers
+    treat None as "reject": empty shape, hostile path never echoed back.
+    """
+    if not raw:
+        return None
+    try:
+        root = vault_core.vault_root().resolve()
+        Path(raw).expanduser().resolve().relative_to(root)
+    except (ValueError, OSError):
+        return None
+    return raw
+
+
+@app.get("/versions")
+async def versions(limit: int = 50):
+    try:
+        notes = _versions_store().list_notes(_clamp_limit(limit))
+        root = vault_core.vault_root().resolve()
+        out = []
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            entry = dict(note)
+            path = Path(str(note.get("path") or ""))
+            try:
+                entry["display"] = str(path.resolve().relative_to(root))
+            except (ValueError, OSError):
+                entry["display"] = path.name  # outside the vault: basename only
+            out.append(entry)
+        return {"notes": out}
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        return {"notes": []}
+
+
+@app.get("/versions/list")
+async def versions_list(path: str = ""):
+    try:
+        note_path = _vault_note_path(path)
+        if note_path is None:
+            return {"path": "", "versions": []}
+        return {
+            "path": note_path,
+            "versions": _versions_store().list_versions(note_path),
+        }
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        return {"path": "", "versions": []}
+
+
+@app.get("/versions/content")
+async def versions_content(path: str = "", id: str = ""):
+    try:
+        note_path = _vault_note_path(path)
+        if note_path is None or not _VERSION_ID_RE.fullmatch(id):
+            return {"content": None}
+        return {"content": _versions_store().read_version(note_path, id)}
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        return {"content": None}
+
+
+class VersionsRestoreRequest(BaseModel):
+    path: str = ""
+    id: str = ""
+
+
+@app.post("/versions/restore")
+async def versions_restore(req: VersionsRestoreRequest):
+    """Write a captured version back over its note. Token-gated (POST).
+
+    {"ok": bool} on every outcome, never a 500. The pre-checks here refuse
+    obvious junk without touching the store; restore() itself re-validates
+    containment + Sources/ and captures the current content first, so a
+    restore is always itself undoable.
+    """
+    try:
+        note_path = _vault_note_path(req.path)
+        if note_path is None or not _VERSION_ID_RE.fullmatch(req.id):
+            return {"ok": False}
+        return {"ok": bool(_versions_store().restore(note_path, req.id))}
+    except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
+        return {"ok": False}
 
 
 @app.post("/chat")
