@@ -241,6 +241,13 @@
       .atl-agent-send:disabled { opacity: 0.5; }
       .atl-agent-subdot { background: #fff; border: 2px solid var(--accent);
         box-sizing: border-box; }
+      /* orchestration event line — a delegation the transcript would otherwise
+         hide (backend "note" role). Centered, muted, framed by hairlines. */
+      .atl-agent-eventline { text-align: center; font-size: 11px;
+        color: var(--ink-dim); font-style: italic; margin: 8px 6px;
+        padding: 4px 10px; border-top: 1px dashed var(--border-soft);
+        border-bottom: 1px dashed var(--border-soft); white-space: pre-wrap;
+        word-wrap: break-word; line-height: 1.4; }
       .atl-agent-reveal { animation: atl-agent-reveal-flash 1s ease-out; }
       @keyframes atl-agent-reveal-flash {
         0%, 55% { outline: 3px solid var(--accent); outline-offset: 3px; }
@@ -488,11 +495,25 @@
     }
 
     function addBubble(role, text) {
+      // "note" role: an orchestration event (a delegation, on either the
+      // orchestrator's card as "→ Delegated …" or a sub-agent's card as
+      // "Task from orchestrator …"). A full-width centered line, no avatar —
+      // it poses as neither side of the conversation.
+      if (role === 'note') {
+        const line = document.createElement('div');
+        line.className = 'atl-agent-eventline';
+        line.textContent = text; // XSS rule: server text only ever lands here
+        line.title = text;
+        msgs.appendChild(line);
+        msgs.scrollTop = msgs.scrollHeight;
+        return line;
+      }
+      const isUser = role === 'user';
       const row = document.createElement('div');
-      row.className = 'atl-agent-row ' + (role === 'user' ? 'user' : 'assistant');
+      row.className = 'atl-agent-row ' + (isUser ? 'user' : 'assistant');
       const av = document.createElement('div');
       av.className = 'atl-agent-avatar';
-      av.textContent = role === 'user' ? 'You' : 'A';
+      av.textContent = isUser ? 'You' : 'A';
       const b = document.createElement('div');
       b.className = 'atl-agent-bubble';
       b.textContent = text; // XSS rule: server text only ever lands here
@@ -514,7 +535,7 @@
     function renderNew(messages) {
       for (let i = renderedCount; i < messages.length; i++) {
         const m = messages[i] || {};
-        addBubble(m.role === 'user' ? 'user' : 'assistant', String(m.text || ''));
+        addBubble(m.role, String(m.text || ''));
       }
       if (messages.length > renderedCount) renderedCount = messages.length;
     }

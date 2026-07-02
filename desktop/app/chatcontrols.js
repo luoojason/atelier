@@ -202,7 +202,8 @@
     btn.type = 'button';
     btn.className = 'atl-govern-btn';
     btn.textContent = '◎';
-    btn.title = 'Govern mode — click agent cards to delegate to them';
+    btn.title = 'Govern mode — click another agent card to delegate to it '
+      + '(drag still moves cards; Esc exits)';
     controlsBar.appendChild(btn);
 
     // chip strip: one chip per governed child, ✕ to ungovern. Sits just ABOVE
@@ -234,20 +235,51 @@
       });
     }
 
-    // capture-phase mousedown: catch a click on ANOTHER agent card BEFORE
-    // core's drag/bringToFront sees it, and toggle govern for that child.
-    function onPick(e) {
-      if (!active) return;
+    // Click-vs-drag pick. An earlier version swallowed mousedown in the capture
+    // phase, which ALSO killed core's bar-drag — so a governed card could not be
+    // moved while any chat stayed armed (and govern mode is sticky). Instead:
+    // record the mousedown but let it flow to core (so a drag still moves the
+    // card), and treat only a near-still release over the SAME agent card as a
+    // govern toggle. A real drag (pointer moved past the slop) is left alone.
+    let armDown = null;          // { x, y, target } for the in-progress press
+    const ARM_SLOP = 5;          // px of travel that still counts as a click
+    function onArmDown(e) {
+      // isTrusted guard: ignore synthetic mousedowns (e.g. AtelierSessions.
+      // reveal dispatches one to raise a card) so they can't arm a phantom
+      // pick. A resize-handle grab is a resize, never a govern pick.
+      if (!active || !e.isTrusted
+          || (e.target.closest && e.target.closest('.resize-handle'))) {
+        armDown = null;
+        return;
+      }
       const target = e.target.closest ? e.target.closest('.atl-agent-card') : null;
-      if (!target || target === cardEl) return;
-      if (!target.dataset.atlSession) return; // unstamped -> not a govern target
-      e.preventDefault();
-      e.stopPropagation();
+      armDown = (target && target !== cardEl && target.dataset.atlSession)
+        ? { x: e.clientX, y: e.clientY, target }
+        : null;
+      // no preventDefault/stopPropagation on purpose: core must still see this
+      // mousedown so dragging a connected card keeps working while armed.
+    }
+    function onArmUp(e) {
+      if (!active || !armDown) { armDown = null; return; }
+      const start = armDown;
+      armDown = null;
+      const moved = Math.abs(e.clientX - start.x) > ARM_SLOP
+        || Math.abs(e.clientY - start.y) > ARM_SLOP;
+      if (moved) return; // it was a drag — leave the card where the user put it
+      const target = e.target.closest ? e.target.closest('.atl-agent-card') : null;
+      if (target !== start.target) return; // released over something else
       const g = govAPI();
       if (!g) return;
       const governed = g.childrenOf(cardEl).indexOf(target) !== -1;
-      if (governed) g.unlink(cardEl, target);      // sync: chips repaint below
-      else g.govern(cardEl, target);               // async: repaints on govern:changed
+      if (governed) {
+        g.unlink(cardEl, target);                  // sync: chips repaint below
+      } else {
+        g.govern(cardEl, target);                  // async: repaints on govern:changed
+        // Connect-then-arrange is the dominant flow: disarm right after a
+        // connect so a later plain click on the just-linked card can't
+        // silently ungovern it (re-arm via ◎ to link another).
+        exit();
+      }
     }
 
     function enter() {
@@ -256,7 +288,8 @@
       btn.classList.add('active');
       document.body.classList.add('atl-governing');
       if (cardEl) cardEl.classList.add('atl-govern-source');
-      document.addEventListener('mousedown', onPick, true);
+      document.addEventListener('mousedown', onArmDown, true);
+      document.addEventListener('mouseup', onArmUp, true);
       A.bus.emit('govern:mode', { on: true, cardEl }); // only one chat arms at a time
     }
     function exit() {
@@ -265,7 +298,9 @@
       btn.classList.remove('active');
       document.body.classList.remove('atl-governing');
       if (cardEl) cardEl.classList.remove('atl-govern-source');
-      document.removeEventListener('mousedown', onPick, true);
+      document.removeEventListener('mousedown', onArmDown, true);
+      document.removeEventListener('mouseup', onArmUp, true);
+      armDown = null;
     }
     btn.addEventListener('click', () => { active ? exit() : enter(); });
 

@@ -88,9 +88,10 @@
       .atl-arrow-layer { position: absolute; left: 0; top: 0;
         width: 1px; height: 1px; overflow: visible;
         pointer-events: none; z-index: 5; }
-      .atl-arrow-layer .atl-arrow { stroke: var(--accent); stroke-width: 2;
-        fill: none; opacity: .55; stroke-dasharray: 6 6;
-        animation: atl-arrow-flow 1.6s linear infinite; }
+      .atl-arrow-layer .atl-arrow { stroke: var(--accent); stroke-width: 2.5;
+        fill: none; opacity: .82; stroke-dasharray: 7 5; stroke-linecap: round;
+        filter: drop-shadow(0 1px 2px rgba(179, 74, 38, .35));
+        animation: atl-arrow-flow 1.4s linear infinite; }
       @keyframes atl-arrow-flow { to { stroke-dashoffset: -12; } }
     `;
     document.head.appendChild(style);

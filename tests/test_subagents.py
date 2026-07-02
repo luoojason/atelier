@@ -179,12 +179,14 @@ def test_list_and_detail_carry_parent_id_and_depth(client, captured):
     assert by_id[child_id]["parent_id"] == parent_id
     assert by_id[child_id]["depth"] == 1
     assert by_id[child_id]["status"] == "running"
-    assert by_id[child_id]["messages_len"] == 1
+    # a leading "note" labels the delegated task, then the task itself
+    assert by_id[child_id]["messages_len"] == 2
 
     detail = client.get(f"/sessions/{child_id}").json()
     assert detail["parent_id"] == parent_id
     assert detail["depth"] == 1
     assert [(m["role"], m["text"]) for m in detail["messages"]] == [
+        ("note", 'Task from orchestrator "Card"'),
         ("user", "dig into X"),
     ]
 
@@ -204,6 +206,7 @@ def test_spawn_creates_running_child_with_task_as_first_message(captured):
     assert child.depth == 1
     assert child.status == "running"
     assert [(m["role"], m["text"]) for m in child.messages] == [
+        ("note", 'Task from orchestrator "Card"'),
         ("user", "summarize the vault"),
     ]
     assert len(captured) == 1  # exactly one turn task fired for the child
@@ -311,7 +314,7 @@ def test_check_running_child(captured):
     child_id = _SPAWNED_RE.match(reply).group("id")
 
     assert _text(_call(check, {"agent_id": child_id})) == (
-        f'Sub-agent "Scout" ({child_id}) is still working (1 messages so far).'
+        f'Sub-agent "Scout" ({child_id}) is still working (2 messages so far).'
     )
 
 
@@ -615,6 +618,7 @@ def test_delegate_runs_a_turn_on_the_governed_child_and_returns_its_reply(
     assert reply == 'Sub-agent "Scout" replied: scripted reply'
     assert child.status == "idle"
     assert [(m["role"], m["text"]) for m in child.messages] == [
+        ("note", 'Task from orchestrator "Card"'),
         ("user", "summarize the vault"),
         ("assistant", "scripted reply"),
     ]
@@ -677,6 +681,49 @@ def test_delegate_rejects_a_busy_child(monkeypatch):
     )
     # nothing appended: the turn was refused before it ran
     assert child.messages == []
+
+
+# ── delegation visibility on the orchestrator's own card (round 18) ───────────
+# The hand-off is a tool call the parent's TextBlock transcript never shows, so
+# spawn/delegate append a display-only "note" event to the parent session. It
+# is render-only (never replayed to the model), so it makes the delegation
+# visible on the card without touching the orchestrator's own context.
+
+def test_spawn_records_a_delegation_note_on_the_parent(captured):
+    parent = _register_parent()
+    spawn, _, _ = _handlers(parent.id)
+    _call(spawn, {"task": "summarize the vault", "name": "Scout"})
+    assert [(m["role"], m["text"]) for m in parent.messages] == [
+        ("note", '→ Delegated to sub-agent "Scout": summarize the vault'),
+    ]
+
+
+def test_spawn_note_truncates_a_long_task(captured):
+    parent = _register_parent()
+    spawn, _, _ = _handlers(parent.id)
+    _call(spawn, {"task": "x" * 900, "name": "Scout"})
+    (note,) = parent.messages
+    assert note["role"] == "note"
+    assert note["text"].endswith("…") and len(note["text"]) < 320
+
+
+def test_delegate_records_delegation_and_reply_notes_on_the_parent(monkeypatch):
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory()
+    )
+    parent = _register_parent()
+    child = _govern(parent, "Scout")
+    delegate = _delegate_handler(parent.id)
+    _call(delegate, {"subagent": child.id, "task": "summarize the vault"})
+    assert [(m["role"], m["text"]) for m in parent.messages] == [
+        ("note", '→ Delegated to sub-agent "Scout": summarize the vault'),
+        ('note', '← "Scout" replied: scripted reply'),
+    ]
+    # the CheckAgent last-assistant-reply scan must ignore the new "note" role
+    _, check, _ = _handlers(parent.id)
+    assert 'Last reply: scripted reply' in _text(
+        _call(check, {"agent_id": child.id})
+    )
 
 
 def test_delegate_with_parent_gone():

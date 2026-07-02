@@ -2149,6 +2149,23 @@ def _tool_text(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}]}
 
 
+def _short(text: str, limit: int = 280) -> str:
+    """Trim a task/reply for a one-line display note (never the model's copy)."""
+    s = " ".join(str(text or "").split())
+    return s if len(s) <= limit else s[: limit - 1].rstrip() + "…"
+
+
+def _note_parent(parent_id: str, text: str) -> None:
+    """Append a display-only orchestration event ("note" role) to a session so
+    its card transcript shows delegations it makes. `_sessions[*].messages` is
+    render-only — never replayed to the model — so a note never leaks into the
+    orchestrator's own context; it only makes the hand-off visible on the card.
+    A missing session (evicted/deleted mid-turn) is a silent no-op."""
+    parent = _sessions.get(parent_id)
+    if parent is not None:
+        _append_session_message(parent, "note", text)
+
+
 def _orchestra_tools(parent_id: str) -> list:
     """The SpawnAgent/CheckAgent/NavigateBrowser SdkMcpTools, closed over the
     spawner's id.
@@ -2209,7 +2226,18 @@ def _orchestra_tools(parent_id: str) -> list:
             uuid.uuid4().hex, name, parent_id=parent_id, depth=1
         )
         _sessions[child.id] = child
+        # Label the delegated task on the sub-agent's OWN card so it never
+        # reads as something the user typed (a leading display-only "note").
+        _append_session_message(
+            child, "note", f'Task from orchestrator "{_sessions[parent_id].name}"'
+        )
         await _start_turn(child, args["task"])
+        # Make the hand-off visible on the orchestrator's own card too (the
+        # delegation is otherwise a tool call the transcript never shows).
+        _note_parent(
+            parent_id,
+            f'→ Delegated to sub-agent "{child.name}": {_short(args["task"])}',
+        )
         return _tool_text(
             f'Spawned sub-agent "{child.name}" (id: {child.id}). It is working'
             " now; call CheckAgent with this id to collect its result."
@@ -2361,9 +2389,18 @@ def _orchestra_tools(parent_id: str) -> list:
         # and we hand the reply straight back to the delegating model. Mirror
         # _start_turn's pre-run bookkeeping (append user msg, mark running,
         # touch LRU) since _run_session_turn assumes the caller did it.
+        # Same leading "note" the spawn path uses, so a delegated task on a
+        # governed card is also labeled as coming from the orchestrator.
+        _append_session_message(
+            child, "note", f'Task from orchestrator "{parent.name}"'
+        )
         _append_session_message(child, "user", args["task"])
         child.status = "running"
         _touch_session(child)
+        _note_parent(
+            parent_id,
+            f'→ Delegated to sub-agent "{child.name}": {_short(args["task"])}',
+        )
         await _run_session_turn(child, args["task"])
         last_reply = next(
             (
@@ -2372,6 +2409,10 @@ def _orchestra_tools(parent_id: str) -> list:
                 if m["role"] == "assistant"
             ),
             "(no reply)",
+        )
+        _note_parent(
+            parent_id,
+            f'← "{child.name}" replied: {_short(last_reply)}',
         )
         return _tool_text(
             f'Sub-agent "{child.name}" replied: {last_reply}'
