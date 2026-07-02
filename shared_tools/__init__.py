@@ -10,5 +10,6 @@ from shared_tools.RememberFact import RememberFact
 from shared_tools.RecallMemory import RecallMemory
 from shared_tools.CaptureBrief import CaptureBrief
 from shared_tools.ReadBrief import ReadBrief
+from shared_tools.web_tools import WebSearch, WebFetch
 
-__all__ = ["CopyFile", "ExecuteTool", "FindTools", "ManageConnections", "SearchTools", "VaultSearch", "VaultRead", "VaultWrite", "RememberFact", "RecallMemory", "CaptureBrief", "ReadBrief"]
+__all__ = ["CopyFile", "ExecuteTool", "FindTools", "ManageConnections", "SearchTools", "VaultSearch", "VaultRead", "VaultWrite", "RememberFact", "RecallMemory", "CaptureBrief", "ReadBrief", "WebSearch", "WebFetch"]

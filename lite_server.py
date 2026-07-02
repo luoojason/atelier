@@ -55,6 +55,8 @@ from shared_tools import (
     RecallMemory,
     CaptureBrief,
     ReadBrief,
+    WebSearch,
+    WebFetch,
 )
 from shared_tools import sdk_tools
 from shared_tools.sdk_tools import build_atelier_server
@@ -103,6 +105,8 @@ LIGHT_TOOLS = [
     StartCampaign,
     RecordDeliverable,
     CampaignStatus,
+    WebSearch,
+    WebFetch,
 ]
 
 # One in-process MCP server ("atelier") wrapping all 10 BaseTool subclasses as
