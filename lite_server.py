@@ -1575,6 +1575,11 @@ class _AgentSession:
         self.parent_id = parent_id
         self.depth = depth
         self.model: str | None = None  # per-session model override; None -> _resolved_model()
+        # A model change POSTed while this session is mid-turn cannot touch the
+        # client the running turn is already using; this flag tells the turn's
+        # finally block to drop that client once it settles, so the NEXT turn
+        # rebuilds fresh and actually picks up the new model.
+        self.pending_model_reset: bool = False
         self.client: ClaudeSDKClient | None = None  # lazy: built on first message
         self.lock = asyncio.Lock()
         self.status = "idle"  # "idle" | "running" | "error"
@@ -1721,6 +1726,13 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
             await _close_session_client(sess)
         finally:
             _touch_session(sess)
+            # A model change landed mid-turn (set_session_model's running
+            # branch): the client this turn just used is now stale, so drop it
+            # here — the next turn's `sess.client is None` check rebuilds on
+            # the new model instead of silently reusing the old one.
+            if sess.pending_model_reset:
+                sess.pending_model_reset = False
+                await _close_session_client(sess)
             # Deleted MID-turn: delete_session's disconnect may have raced our
             # lazy connect above, leaving a live client on the detached object.
             if _sessions.get(sess.id) is not sess:
@@ -1796,8 +1808,11 @@ async def set_session_model(session_id: str, req: ModelRequest):
 
     Resolution at turn time is (session.model or _resolved_model()). Dropping
     the lazily-built client while idle makes the change take effect on the next
-    turn; a fresh card has no client yet (no-op), and a running turn keeps its
-    client (it picks the new model up on its next rebuild).
+    turn; a fresh card has no client yet (no-op). A RUNNING turn cannot have
+    its in-flight client swapped out from under it, so instead this sets
+    sess.pending_model_reset — _run_session_turn's finally block drops the
+    client once the current turn settles, so the NEXT turn rebuilds on the
+    new model rather than silently reusing the old one.
     """
     sess = _sessions.get(session_id)
     if sess is None:
@@ -1807,6 +1822,8 @@ async def set_session_model(session_id: str, req: ModelRequest):
     sess.model = req.model
     if sess.status != "running":
         await _close_session_client(sess)
+    else:
+        sess.pending_model_reset = True
     return {"ok": True, "model": sess.model}
 
 

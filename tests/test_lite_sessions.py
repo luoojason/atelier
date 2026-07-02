@@ -496,6 +496,101 @@ def test_set_session_model_token_gated(monkeypatch, client):
     assert lite_server._sessions[sid].model == "opus"
 
 
+# ── mid-turn model change (pending_model_reset) ───────────────────────────────
+
+def test_set_session_model_while_running_defers_reset(client):
+    """A model change POSTed while status=='running' must NOT touch the
+    client the in-flight turn is already using — it defers the drop via
+    pending_model_reset so the CURRENT turn finishes on its original client
+    and only the NEXT turn picks up the new model."""
+    sid = _create(client)["id"]
+    sess = lite_server._sessions[sid]
+
+    class _FakeClient:
+        def __init__(self):
+            self.disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    fake = _FakeClient()
+    sess.client = fake
+    sess.status = "running"
+
+    r = client.post(f"/sessions/{sid}/model", json={"model": "haiku"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "model": "haiku"}
+    assert sess.model == "haiku"
+    assert sess.pending_model_reset is True
+    assert sess.client is fake  # untouched — the running turn keeps using it
+    assert fake.disconnected is False
+
+
+def test_set_session_model_while_idle_keeps_resetting_immediately(client):
+    """Regression guard: the idle path must stay exactly as before — the
+    client drops right away and pending_model_reset never gets set."""
+    sid = _create(client)["id"]
+    sess = lite_server._sessions[sid]
+
+    class _FakeClient:
+        def __init__(self):
+            self.disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    fake = _FakeClient()
+    sess.client = fake
+    assert sess.status == "idle"
+
+    r = client.post(f"/sessions/{sid}/model", json={"model": "haiku"})
+    assert r.status_code == 200
+    assert sess.pending_model_reset is False
+    assert sess.client is None
+    assert fake.disconnected is True
+
+
+def test_pending_model_reset_drops_client_after_turn_settles(monkeypatch, client):
+    """End-to-end: a pending_model_reset raised mid-turn (simulating the
+    concurrent POST /sessions/{id}/model from test above) is honored by
+    _run_session_turn's finally block — the stale client is dropped and the
+    flag clears, so the NEXT turn rebuilds a fresh client (the model change
+    actually takes effect one turn later, per the fix)."""
+    built = []
+    sid_holder = {}
+
+    def _raise_pending_mid_turn(message):
+        # Runs INSIDE the turn (sess.status is genuinely "running" here, same
+        # idiom as test_message_202_then_poll_shows_reply_and_idle's _probe).
+        lite_server._sessions[sid_holder["sid"]].pending_model_reset = True
+
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient",
+        _scripted_client_factory(built=built, on_query=_raise_pending_mid_turn),
+    )
+    _inline_turns(monkeypatch)
+
+    sid = _create(client)["id"]
+    sid_holder["sid"] = sid
+
+    assert client.post(
+        f"/sessions/{sid}/message", json={"message": "hello"}
+    ).status_code == 202
+
+    polled = client.get(f"/sessions/{sid}").json()
+    assert polled["status"] == "idle"
+    assert lite_server._sessions[sid].pending_model_reset is False
+    assert lite_server._sessions[sid].client is None
+    assert built[0].disconnected is True
+
+    # the next turn rebuilds a brand-new client — proof the change takes
+    assert client.post(
+        f"/sessions/{sid}/message", json={"message": "again"}
+    ).status_code == 202
+    assert len(built) == 2
+    assert built[1] is not built[0]
+
+
 # ── governance links: cycle helper + POST/DELETE /sessions/{id}/govern ────────
 
 def test_governs_cycle_helper_walks_parent_chain():
