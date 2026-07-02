@@ -614,3 +614,31 @@ def test_govern_max_depth_reached_is_400(client):
     resp = client.post(f"/sessions/{ids[-1]}/govern", json={"child_id": extra})
     assert resp.status_code == 400
     assert resp.json() == {"error": "max depth reached"}
+
+
+def test_ungovern_clears_parent_id_and_depth(client):
+    parent = _create(client, name="A")["id"]
+    child = _create(client, name="B")["id"]
+    assert client.post(
+        f"/sessions/{parent}/govern", json={"child_id": child}
+    ).status_code == 200
+
+    resp = client.delete(f"/sessions/{parent}/govern/{child}")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+    detail = client.get(f"/sessions/{child}").json()
+    assert detail["parent_id"] is None
+    assert detail["depth"] == 0
+
+    # idempotent: a second ungovern still succeeds
+    assert client.delete(
+        f"/sessions/{parent}/govern/{child}"
+    ).json() == {"ok": True}
+
+
+def test_ungovern_unknown_child_is_404(client):
+    parent = _create(client, name="A")["id"]
+    resp = client.delete(f"/sessions/{parent}/govern/nope")
+    assert resp.status_code == 404
+    assert resp.json() == {"error": "unknown session"}

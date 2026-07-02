@@ -1852,6 +1852,22 @@ async def govern_session(session_id: str, req: SessionGovernRequest):
     return {"ok": True}
 
 
+@app.delete("/sessions/{session_id}/govern/{child_id}")
+async def ungovern_session(session_id: str, child_id: str):
+    """Clear a governed child's parent_id/depth (idempotent).
+
+    session_id is the orchestrator the arrow was drawn from, but the clear is
+    unconditional so a stale link always tears down. Unknown child -> 404
+    {"error": "unknown session"} (the existing /sessions idiom).
+    """
+    child = _sessions.get(child_id)
+    if child is None:
+        return _unknown_session()
+    child.parent_id = None
+    child.depth = 0
+    return {"ok": True}
+
+
 # --- Sub-agent orchestration (the "orchestra" MCP server) -----------------------
 #
 # Each depth-0 session's client gets its OWN in-process orchestra server whose
