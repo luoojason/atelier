@@ -161,6 +161,11 @@
     <script defer src="app/versions.js"></script>
     <script defer src="app/runlog.js"></script>
     <script defer src="app/miniapp.js"></script>
+    <!-- document.js: the ported docs_agent deliverable — a Document card that
+         generates a print-ready HTML document and exports it to PDF (Electron
+         printToPDF via the preload bridge) or HTML. Guards window.Atelier so a
+         404 stays harmless under defer. -->
+    <script defer src="app/document.js"></script>
     <script defer src="app/toolinspector.js"></script>
     <script defer src="app/tour.js"></script>
     <!-- Phase B living widgets (each registers one type; widgets.js machinery

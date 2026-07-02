@@ -1706,6 +1706,81 @@ async def miniapp(req: MiniappRequest):
     return {"html": html}
 
 
+# --- Document deliverable (POST /document) ---------------------------------------
+#
+# The docs_agent capability ported into Atelier's zero-key idiom (OpenSwarm's
+# docs_agent authors HTML as the source of truth, then exports). Same one-shot
+# generator shape as /miniapp: a purpose-built system prompt, no tools, a tight
+# turn cap. The reply is a print-optimized, self-contained HTML document; the
+# desktop card previews it and exports to PDF (Electron's bundled printToPDF —
+# no weasyprint/Chromium to bundle) and HTML. DOCX/Markdown export is a
+# fast-follow (pure-python python-docx + an html→md pass).
+
+DOCUMENT_INSTRUCTIONS = """You are a document engineer. Produce exactly ONE complete, self-contained, print-ready HTML document for what the user asks for (report, brief, letter, memo, spec, one-pager, etc.).
+
+Rules:
+- Inline CSS only. No external resources of any kind: no http(s) fetches, no script/link/img src pointing at the network, no CDN imports, no JavaScript.
+- Design it as a PRINTED PAGE, not an app: white page background, dark readable body text, a clear typographic hierarchy (title, section headings, body, captions), and generous margins. Use `@page { margin: ... }` and `@media print` rules, and add `page-break-inside: avoid` on headings/tables so it paginates cleanly when exported to PDF.
+- Prefer clean system fonts (e.g. Georgia/Times for body serif, or a system sans). Real document structure: headings, paragraphs, lists, tables, blockquotes, a title block with the document title and date.
+- Write genuinely useful, well-organized CONTENT for the request — this is a real deliverable, not a placeholder.
+- Reply with ONLY the HTML document, nothing before or after it."""
+
+
+def _document_options() -> ClaudeAgentOptions:
+    """build_options() variant for the document generator (see /miniapp)."""
+    return dataclasses.replace(
+        build_options(),
+        system_prompt=DOCUMENT_INSTRUCTIONS,
+        max_turns=6,
+        allowed_tools=[],
+        mcp_servers={},
+    )
+
+
+class DocumentRequest(BaseModel):
+    description: str = Field(min_length=3, max_length=4000)
+    title: str | None = Field(default=None, max_length=200)
+
+
+@app.post("/document")
+async def document(req: DocumentRequest):
+    """Generate one print-ready HTML document. Token-gated (POST).
+
+    {"html": str, "title": str} on success, {"error": str} on any failure — a
+    failed run never 500s the card. `title` echoes a caller hint or falls back
+    to the document's own <title>/<h1>, for naming the exported file.
+    """
+    prompt = req.description
+    if req.title:
+        prompt = f'Document title: "{req.title}"\n\n{req.description}'
+    try:
+        async with ClaudeSDKClient(options=_document_options()) as client:
+            await client.query(prompt)
+            result = await _collect_response(client)
+    except Exception as exc:  # noqa: BLE001 - never 500 the card
+        return {"error": f"document generation failed: {exc}"}
+    if result.get("error"):
+        return {"error": result["response"]}
+    html = _extract_miniapp_html(result["response"])
+    if html is None:
+        return {"error": "the model did not return a usable HTML document"}
+    if len(html) > _MINIAPP_MAX_CHARS:
+        return {"error": "generated document too large"}
+    return {"html": html, "title": (req.title or _document_title(html))}
+
+
+def _document_title(html: str) -> str:
+    """A filename-friendly title from the document's <title> or first <h1>."""
+    for pat in (r"<title[^>]*>(.*?)</title>", r"<h1[^>]*>(.*?)</h1>"):
+        m = re.search(pat, html, re.DOTALL | re.IGNORECASE)
+        if m:
+            text = re.sub(r"<[^>]+>", "", m.group(1))
+            text = " ".join(text.split()).strip()
+            if text:
+                return text[:120]
+    return "document"
+
+
 # --- Multi-card agent sessions ------------------------------------------------
 #
 # Each Agent card in the desktop app owns ONE of these sessions: a fresh

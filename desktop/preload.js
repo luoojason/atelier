@@ -48,4 +48,14 @@ contextBridge.exposeInMainWorld('atelier', {
   // them here as { url }; apps.js opens each as a tab in a browser card.
   onWebviewNewWindow: (cb) =>
     ipcRenderer.on('atelier:webview-new-window', (_e, data) => cb(data)),
+  // Document card export: render self-contained document HTML to a PDF the
+  // user picks a path for (Electron printToPDF, main process). Resolves
+  // { saved } | { canceled } | { error } and never rejects.
+  savePDF: (html, name) =>
+    ipcRenderer.invoke('atelier:save-pdf', { html, name })
+      .catch((e) => ({ error: String((e && e.message) || e) })),
+  // Save arbitrary text (HTML/Markdown) to a user-chosen path.
+  saveText: (text, name, ext) =>
+    ipcRenderer.invoke('atelier:save-text', { text, name, ext })
+      .catch((e) => ({ error: String((e && e.message) || e) })),
 });

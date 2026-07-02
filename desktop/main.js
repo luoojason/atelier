@@ -385,6 +385,62 @@ ipcMain.handle('atelier:scheduler-status', () => ({
   pid: schedulerProc ? schedulerProc.pid : null,
 }));
 
+// atelier:save-pdf — render a self-contained document HTML to a PDF the user
+// picks a path for. Used by the Document card's export. The HTML is fully
+// self-contained (the generator emits no network refs and no JS); we load it
+// into an OFFSCREEN, node-less, JAVASCRIPT-DISABLED BrowserWindow, printToPDF,
+// then write the chosen path. Returns { saved } | { canceled } | { error };
+// never throws to the renderer.
+ipcMain.handle('atelier:save-pdf', async (event, payload) => {
+  const html = payload && typeof payload.html === 'string' ? payload.html : '';
+  const suggested = (payload && payload.name) ? String(payload.name) : 'document';
+  if (!html) return { error: 'no document to export' };
+  const safe = suggested.replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'document';
+  let win = null;
+  try {
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const { filePath, canceled } = await dialog.showSaveDialog(parent, {
+      title: 'Export PDF',
+      defaultPath: safe + '.pdf',
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    });
+    if (canceled || !filePath) return { canceled: true };
+    win = new BrowserWindow({
+      show: false,
+      webPreferences: { javascript: false, sandbox: true, contextIsolation: true, nodeIntegration: false },
+    });
+    await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+    const pdf = await win.webContents.printToPDF({ printBackground: true, preferCSSPageSize: true });
+    fs.writeFileSync(filePath, pdf);
+    return { saved: filePath };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  } finally {
+    if (win && !win.isDestroyed()) win.destroy();
+  }
+});
+
+// atelier:save-text — write text (HTML/Markdown) to a user-chosen path.
+ipcMain.handle('atelier:save-text', async (event, payload) => {
+  const text = payload && typeof payload.text === 'string' ? payload.text : '';
+  const suggested = (payload && payload.name) ? String(payload.name) : 'document';
+  const ext = (payload && payload.ext) ? String(payload.ext).replace(/[^\w]/g, '').slice(0, 8) : 'txt';
+  const safe = suggested.replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'document';
+  try {
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const { filePath, canceled } = await dialog.showSaveDialog(parent, {
+      title: 'Save file',
+      defaultPath: safe + '.' + (ext || 'txt'),
+      filters: [{ name: (ext || 'txt').toUpperCase(), extensions: [ext || 'txt'] }],
+    });
+    if (canceled || !filePath) return { canceled: true };
+    fs.writeFileSync(filePath, text, 'utf8');
+    return { saved: filePath };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
+
 // ── boot ────────────────────────────────────────────────────────────────────
 
 // Single-instance lock: a second launch must not spawn a second backend that
