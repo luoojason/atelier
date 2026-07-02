@@ -412,6 +412,9 @@ def test_config_shape_defaults(monkeypatch, tmp_path, client):
         "provider": "subscription",
         "api_key_present": False,
         "api_key_hint": "",
+        "notion_connected": False,
+        "notion_token_hint": "",
+        "obsidian_vault": "",
     }
 
 

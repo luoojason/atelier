@@ -1033,6 +1033,24 @@ def _api_key_hint(key: str) -> str:
     return "…" + key[-4:] if key else ""
 
 
+def _notion_token_hint(token: str) -> str:
+    """Last-4 hint for a Notion token; never the full value."""
+    token = token or ""
+    return ("…" + token[-4:]) if len(token) >= 4 else ("…" if token else "")
+
+
+class NotionTokenRequest(BaseModel):
+    token: str
+
+
+class NotionTokenValidateRequest(BaseModel):
+    token: str | None = None
+
+
+class VaultPathRequest(BaseModel):
+    path: str
+
+
 @app.get("/config")
 async def config():
     """Effective backend configuration for the Settings view.
@@ -1061,6 +1079,9 @@ async def config():
         "provider": _effective_provider(settings),
         "api_key_present": bool(key),
         "api_key_hint": _api_key_hint(key),
+        "notion_connected": bool(settings.get("notion_token")),
+        "notion_token_hint": _notion_token_hint(settings.get("notion_token") or ""),
+        "obsidian_vault": settings.get("obsidian_vault") or "",
     }
 
 
@@ -1190,6 +1211,76 @@ async def validate_api_key(req: ApiKeyValidateRequest | None = None):
     if resp.status_code in (401, 403):
         return {"valid": False, "detail": "key rejected by Anthropic"}
     return {"valid": False, "detail": f"unexpected response {resp.status_code}"}
+
+
+@app.post("/config/notion-token")
+async def set_notion_token(req: NotionTokenRequest):
+    """Store the Notion integration token (0600, merge-preserving). Token-gated."""
+    token = req.token.strip()
+    if not token:
+        return JSONResponse({"error": "empty token"}, status_code=400)
+    settings = load_settings()
+    settings["notion_token"] = token
+    save_settings(settings)
+    await _reset_chat_client()  # next turn rebuilds with the Notion tools + prompt
+    return {"ok": True, "notion_connected": True,
+            "notion_token_hint": _notion_token_hint(token)}
+
+
+@app.delete("/config/notion-token")
+async def delete_notion_token():
+    """Clear the Notion token; the tools + prompt drop on the next chat rebuild."""
+    settings = load_settings()
+    settings.pop("notion_token", None)
+    save_settings(settings)
+    await _reset_chat_client()
+    return {"ok": True, "notion_connected": False}
+
+
+@app.post("/config/notion-token/validate")
+async def validate_notion_token(req: NotionTokenValidateRequest | None = None):
+    """Live-check a token (supplied, else stored) against GET /v1/users/me.
+
+    Never 500 and never echoes the token: the token appears only in the
+    outbound Authorization header.
+    """
+    supplied = (req.token if req else None) or ""
+    token = supplied.strip() or (load_settings().get("notion_token") or "")
+    if not token:
+        return {"valid": False, "detail": "no token to validate"}
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as hc:
+            resp = await hc.get(
+                "https://api.notion.com/v1/users/me",
+                headers={"Authorization": f"Bearer {token}",
+                         "Notion-Version": "2022-06-28"},
+            )
+    except Exception:  # noqa: BLE001
+        return {"valid": False, "detail": "could not reach api.notion.com"}
+    if resp.status_code == 200:
+        workspace = ""
+        try:
+            workspace = (resp.json().get("bot") or {}).get("workspace_name") or ""
+        except Exception:  # noqa: BLE001
+            workspace = ""
+        return {"valid": True, "detail": "token accepted", "workspace": workspace}
+    if resp.status_code in (401, 403):
+        return {"valid": False, "detail": "token rejected by Notion"}
+    return {"valid": False, "detail": f"unexpected response {resp.status_code}"}
+
+
+@app.post("/config/vault")
+async def set_vault_path(req: VaultPathRequest):
+    """Validate + store the Obsidian vault path (must be an existing directory)."""
+    path = os.path.expanduser((req.path or "").strip())
+    if not path or not os.path.isdir(path):
+        return JSONResponse({"error": "not a directory"}, status_code=400)
+    settings = load_settings()
+    settings["obsidian_vault"] = path
+    save_settings(settings)
+    return {"ok": True, "obsidian_vault": path}
 
 
 @app.get("/cc/status")
