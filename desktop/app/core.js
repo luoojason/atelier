@@ -82,6 +82,13 @@
 
   function applyTransform() {
     content.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    // The dotted grid is a CSS background on the (static) .canvas, so it must be
+    // panned/zoomed by hand to track #content's transform — otherwise the dots
+    // sit still while the cards move. background-position follows the pan and
+    // background-size scales the 22px world spacing by zoom, so the dots stay
+    // locked to world coordinates.
+    canvas.style.backgroundPosition = `${panX}px ${panY}px`;
+    canvas.style.backgroundSize = `${22 * zoom}px ${22 * zoom}px`;
     zoomLabel.textContent = Math.round(zoom * 100) + '%';
     scheduleMinimap(); // hoisted; throttled ~250ms, so per-mousemove calls are cheap
   }
@@ -100,8 +107,23 @@
   document.getElementById('zoom-in').onclick = () => zoomCenter(zoom * 1.15);
   document.getElementById('zoom-out').onclick = () => zoomCenter(zoom / 1.15);
 
+  // Wheel zooms the board — UNLESS the pointer is over a scrollable region
+  // inside a card (a chat transcript, a note, a list, a textarea, …), in which
+  // case that region scrolls and the board does not zoom. Walk from the wheel
+  // target up to the card and bail if any ancestor can actually scroll.
+  function overScrollableCard(el) {
+    if (!el || !el.closest || !el.closest('.card')) return false;
+    let n = el;
+    while (n && n !== canvas && n.nodeType === 1) {
+      if (n.tagName === 'TEXTAREA') return true;
+      const oy = getComputedStyle(n).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 1) return true;
+      n = n.parentElement;
+    }
+    return false;
+  }
   canvas.addEventListener('wheel', (e) => {
-    if (e.target.closest('.chat-body') || e.target.closest('textarea')) return; // let cards scroll
+    if (overScrollableCard(e.target)) return; // let the card region scroll
     e.preventDefault();
     const r = canvas.getBoundingClientRect();
     const factor = e.ctrlKey ? (1 - e.deltaY * 0.01) : (e.deltaY < 0 ? 1.1 : 1 / 1.1);

@@ -382,6 +382,9 @@
           // itself (else removeAllCards DELETEs them and aborts the delegation).
           keepAlive: !!(parentEl && parentEl.dataset
             && parentEl.dataset.atlKeepAlive === '1'),
+          // this is the child's FIRST (and only) card, so process its own fresh
+          // canvas ops — a sub-agent told to OpenBrowser must spawn the browser.
+          noBaseline: true,
         });
         if (!childEl) continue;
         childEl.dataset.atlParentSession = String(item.parent_id);
@@ -415,6 +418,13 @@
     // transcript. keepAlive suppresses the close-time DELETE; LRU still reclaims
     // the session once the job finishes.
     const keepAlive = !!(attach && attach.keepAlive);
+    // r24 fix: a FIRST card for a session (a sweep-revealed sub-agent, or a job
+    // card) must PROCESS its session's own fresh canvas ops — e.g. a sub-agent
+    // that called OpenBrowser must spawn the browser. The r22 attach-baseline
+    // (adopt-seqs-without-acting) only exists to stop a RE-reveal of a session a
+    // previous card already acted on from replaying those ops; noBaseline turns
+    // it off for the first-card cases.
+    const noBaseline = !!(attach && attach.noBaseline);
     let name;
     if (attached) {
       name = attach.name || 'Sub-agent';
@@ -812,14 +822,18 @@
       // for them.)
       if (attached && !attachBaselined) {
         attachBaselined = true;
-        const bn = r.data.browser_nav;
-        if (bn && typeof bn.seq === 'number') lastNavSeq = bn.seq;
-        // adopt the highest existing canvas-op seq so a revealed depth-0
-        // session does not replay a queue of stale ops into spurious spawns
-        const ops = Array.isArray(r.data.canvas_ops) ? r.data.canvas_ops : [];
-        for (const op of ops) {
-          if (op && typeof op.seq === 'number' && op.seq > lastCanvasOpSeq) {
-            lastCanvasOpSeq = op.seq;
+        // Skip the baseline for a FIRST card (sub-agent / job — noBaseline): it
+        // must PROCESS its session's own fresh ops. Otherwise adopt the highest
+        // existing seqs WITHOUT acting, so a RE-reveal of a session a previous
+        // card already handled does not replay a queue of stale ops.
+        if (!noBaseline) {
+          const bn = r.data.browser_nav;
+          if (bn && typeof bn.seq === 'number') lastNavSeq = bn.seq;
+          const ops = Array.isArray(r.data.canvas_ops) ? r.data.canvas_ops : [];
+          for (const op of ops) {
+            if (op && typeof op.seq === 'number' && op.seq > lastCanvasOpSeq) {
+              lastCanvasOpSeq = op.seq;
+            }
           }
         }
       }
@@ -1060,6 +1074,11 @@
         name: String(name || 'Agent'),
         parentEl: null,
         keepAlive: !!(opts && opts.keepAlive),
+        // a job card (keepAlive) is the FIRST card for its session — process
+        // its own fresh ops (a job that calls OpenBrowser/CreateCard shows it).
+        // An orb-click / manual reveal of an existing session keeps the baseline
+        // (it may be a re-reveal), unless the caller opts out.
+        noBaseline: !!(opts && (opts.noBaseline || opts.keepAlive)),
       });
       if (el) flashReveal(el);
       return el;

@@ -294,29 +294,36 @@ def build_options(
         allowed_tools += NOTION_TOOL_NAMES
         system_prompt += _NOTION_PROMPT
 
-    # A depth-0 spawner gets the full orchestra (Spawn/Check/Nav). SEPARATELY,
-    # ANY session that already governs >=1 child (a back-reference by
-    # parent_id) gains DelegateToSubagent + a system-prompt line naming those
-    # children — so a depth-1+ orchestrator (chained A->B->C) can delegate to
-    # its existing cards without being able to spawn new ones. Both bind their
-    # orchestra tools to the SAME session id, so one server serves both.
+    # Orchestra tools split into two tiers, bound to the calling session's id:
+    #  • CANVAS tools (NavigateBrowser / OpenBrowser / CreateCard) — operating a
+    #    card on the canvas is NOT spawning, so EVERY agent session gets them,
+    #    including a depth-1 sub-agent (its card is on the canvas too, so it can
+    #    open a browser or create a card that appears connected to it). This is
+    #    why an orchestrator can delegate "open a browser and search X" to a
+    #    sub-agent and the sub-agent can actually do it.
+    #  • SPAWN tools (SpawnAgent / CheckAgent) — depth-0 ONLY, the structural cap
+    #    that stops A->B->C->... runaway delegation.
+    #  • DelegateToSubagent — added to ANY session that already governs >=1 child
+    #    (a back-reference by parent_id) + a system-prompt line naming them.
+    # Every session turn passes delegator_session_id=sess.id, so orchestra_id is
+    # the session's own id; the chat/compat callers pass neither and get none.
     children = (
         [s for s in _sessions.values() if s.parent_id == delegator_session_id]
         if delegator_session_id is not None
         else []
     )
-    orchestra_id = spawner_session_id or (
-        delegator_session_id if children else None
-    )
+    orchestra_id = spawner_session_id or delegator_session_id
     if orchestra_id is not None:
         mcp_servers["orchestra"] = _build_orchestra_server(orchestra_id)
+        allowed_tools += [
+            "mcp__orchestra__NavigateBrowser",
+            "mcp__orchestra__OpenBrowser",
+            "mcp__orchestra__CreateCard",
+        ]
         if spawner_session_id is not None:
             allowed_tools += [
                 "mcp__orchestra__SpawnAgent",
                 "mcp__orchestra__CheckAgent",
-                "mcp__orchestra__NavigateBrowser",
-                "mcp__orchestra__OpenBrowser",
-                "mcp__orchestra__CreateCard",
             ]
         if children:
             allowed_tools.append("mcp__orchestra__DelegateToSubagent")
@@ -3086,17 +3093,25 @@ async def tools_registry():
             for cls in LIGHT_TOOLS
         ]
         # Bound to a probe id: only the declared metadata is read here; the
-        # handler closures are never invoked.
-        entries += [
-            {
+        # handler closures are never invoked. Availability mirrors build_options'
+        # two tiers: the SPAWN tools are depth-0 only; the CANVAS tools reach
+        # every agent session (incl. sub-agents); Delegate needs governed
+        # children.
+        _spawn_only = {"SpawnAgent", "CheckAgent"}
+        for t in _orchestra_tools("__tools_probe__"):
+            if t.name in _spawn_only:
+                avail = "agent cards (depth 0)"
+            elif t.name == "DelegateToSubagent":
+                avail = "sessions governing sub-agents"
+            else:
+                avail = "all agent sessions"
+            entries.append({
                 "name": t.name,
                 "description": t.description,
                 "input_schema": t.input_schema,
                 "server": "orchestra",
-                "availability": "agent cards (depth 0)",
-            }
-            for t in _orchestra_tools("__tools_probe__")
-        ]
+                "availability": avail,
+            })
         return {"tools": entries}
     except Exception:  # noqa: BLE001 - never 500; degrade to the empty shape
         return {"tools": []}

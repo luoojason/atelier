@@ -735,7 +735,7 @@ def test_build_options_with_spawner_gains_orchestra():
     ) <= set(opts.allowed_tools)
 
 
-def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
+def test_depth0_gets_spawn_tools_depth1_gets_canvas_tools_only(
     monkeypatch, client
 ):
     built = []
@@ -744,7 +744,7 @@ def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
     )
     _inline_turns(monkeypatch)
 
-    # depth-0 card session: its lazy client is built WITH the orchestra
+    # depth-0 card session: full orchestra incl. the SPAWN tools
     sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
     assert client.post(
         f"/sessions/{sid}/message", json={"message": "hi"}
@@ -752,7 +752,9 @@ def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
     assert "orchestra" in built[0].options.mcp_servers
     assert "mcp__orchestra__SpawnAgent" in built[0].options.allowed_tools
 
-    # depth-1 sub-agent session: NO orchestra, so it cannot spawn further
+    # depth-1 sub-agent: gets the orchestra with the CANVAS tools (so it can
+    # OpenBrowser / CreateCard on its own card) but NOT the spawn tools (the
+    # depth cap still stops it spawning further sub-agents).
     child = lite_server._AgentSession(
         "c" * 32, "Scout", parent_id=sid, depth=1
     )
@@ -761,10 +763,13 @@ def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
         f"/sessions/{child.id}/message", json={"message": "task"}
     ).status_code == 202
     assert child.status == "idle"  # the scripted turn ran to completion
-    assert "orchestra" not in built[1].options.mcp_servers
-    assert not any(
-        t.startswith("mcp__orchestra__") for t in built[1].options.allowed_tools
-    )
+    tools = built[1].options.allowed_tools
+    assert "orchestra" in built[1].options.mcp_servers
+    assert "mcp__orchestra__OpenBrowser" in tools
+    assert "mcp__orchestra__NavigateBrowser" in tools
+    assert "mcp__orchestra__CreateCard" in tools
+    assert "mcp__orchestra__SpawnAgent" not in tools
+    assert "mcp__orchestra__CheckAgent" not in tools
 
 
 def test_build_options_attaches_delegate_when_session_has_children():

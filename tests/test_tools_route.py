@@ -90,8 +90,14 @@ def test_orchestra_entries_present(client):
         t["name"]: t for t in _tools(client) if t["server"] == "orchestra"
     }
     assert set(orchestra) == ORCHESTRA_NAMES
-    for entry in orchestra.values():
-        assert entry["availability"] == "agent cards (depth 0)"
+    # two tiers: spawn tools are depth-0 only; canvas tools reach every session
+    # (so a sub-agent can open a browser / create a card); delegate needs children
+    assert orchestra["SpawnAgent"]["availability"] == "agent cards (depth 0)"
+    assert orchestra["CheckAgent"]["availability"] == "agent cards (depth 0)"
+    assert orchestra["OpenBrowser"]["availability"] == "all agent sessions"
+    assert orchestra["NavigateBrowser"]["availability"] == "all agent sessions"
+    assert orchestra["CreateCard"]["availability"] == "all agent sessions"
+    assert orchestra["DelegateToSubagent"]["availability"] == "sessions governing sub-agents"
     assert orchestra["SpawnAgent"]["input_schema"]["required"] == ["task"]
     assert orchestra["CheckAgent"]["input_schema"]["required"] == ["agent_id"]
     assert orchestra["NavigateBrowser"]["input_schema"]["required"] == ["url"]
