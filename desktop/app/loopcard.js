@@ -369,8 +369,11 @@
     saveBtn.addEventListener('click', () => save(inst));
     delBtn.addEventListener('click', () => remove(inst));
 
+    const layerHint = el('div', 'atl-loop-lbl',
+      'Tip: marquee this Loop + an orchestrator chat to run that whole layer on schedule.');
+    layerHint.style.opacity = '0.8';
     wrap.append(nameRow, seg, intRow, wkRow, timeWrap, preview,
-      el('span', 'atl-loop-lbl', 'Task'), prompt, statusRow, note, actions);
+      el('span', 'atl-loop-lbl', 'Task'), prompt, layerHint, statusRow, note, actions);
     body.appendChild(wrap);
     showMode();
     if (inst.saved) startPolling(inst);
@@ -543,12 +546,91 @@
   });
   A.bus.on('cards:rearranged', () => persist());
 
+  // ── bind a loop to an existing orchestration LAYER ─────────────────────────
+  // Marquee a Loop card together with the ENTRY chat of a layer (its
+  // orchestrator Agent card) to link them: the loop copies that chat's kickoff
+  // instruction (its first user message) into its Task and draws an arrow, so
+  // saving the loop re-runs the WHOLE layer on schedule — the fired job (r24)
+  // runs the kickoff fresh and its orchestrator re-spawns the sub-agents/tools
+  // exactly as the original did. Marquee the same pair again to unlink. The
+  // COPIED task is what persists; the arrow is page-session-scoped like link.js.
+  function agentTitle(el) {
+    const t = el.querySelector('.card-title');
+    const s = t && t.textContent ? t.textContent.trim() : '';
+    return s || 'chat';
+  }
+  function firstUserMessage(el) {
+    const b = el.querySelector('.atl-agent-row.user .atl-agent-bubble');
+    return b && b.textContent ? b.textContent.trim() : '';
+  }
+  function unbindLayer(inst) {
+    if (inst.layerUnlink) { try { inst.layerUnlink(); } catch { /* idempotent */ } inst.layerUnlink = null; }
+    // Belt-and-braces: clear any lingering 'content' arrow FROM this loop card,
+    // even if the stored handle went stale — arrows.js auto-unlinks a link when
+    // a card briefly disconnects (drag/re-mount), which can orphan our handle.
+    const arrows = A.arrows;
+    if (arrows && typeof arrows.unlinkTouching === 'function' && inst.handle && inst.handle.el) {
+      try { arrows.unlinkTouching(inst.handle.el, 'from', 'content'); } catch { /* no-op */ }
+    }
+    inst.layerEl = null;
+  }
+  function bindLayer(inst, agentEl) {
+    if (inst.saved) {
+      setNote(inst, 'Delete this loop first to re-point it — its job is already scheduled.', true);
+      return;
+    }
+    if (inst.layerEl === agentEl) { // marquee the same pair again = unlink
+      unbindLayer(inst);
+      setNote(inst, 'Unlinked from that layer.', false);
+      A.ui.toast('Loop unlinked from ' + agentTitle(agentEl));
+      return;
+    }
+    unbindLayer(inst);
+    const title = agentTitle(agentEl);
+    const kickoff = firstUserMessage(agentEl);
+    inst.layerEl = agentEl;
+    if (kickoff) {
+      inst.state.prompt = kickoff;
+      if (inst.promptEl) inst.promptEl.value = kickoff;
+      persist();
+    }
+    const arrows = A.arrows;
+    inst.layerUnlink = (arrows && typeof arrows.link === 'function')
+      ? arrows.link(inst.handle.el, agentEl, { kind: 'content' }) // not 'parent': govern must not wipe it
+      : null;
+    setNote(inst, kickoff
+      ? 'Linked to "' + title + '" — its task was copied below. Set a schedule and Save to re-run this layer.'
+      : 'Linked to "' + title + '", but that chat has no task yet — send it a message, then paste the task below.', false);
+    A.ui.toast('Loop linked to ' + title);
+  }
+
+  if (A.selection && typeof A.selection.get === 'function') {
+    A.bus.on('selection:changed', () => {
+      const sel = A.selection.get();
+      if (sel.length !== 2) return;
+      const isLoop = (el) => el && el.dataset && el.dataset.loopInstance && instances.has(el.dataset.loopInstance);
+      const isAgent = (el) => el && el.classList && el.classList.contains('atl-agent-card');
+      const [a, b] = sel;
+      let loopEl = null, agentEl = null;
+      if (isLoop(a) && isAgent(b)) { loopEl = a; agentEl = b; }
+      else if (isLoop(b) && isAgent(a)) { loopEl = b; agentEl = a; }
+      else return; // not exactly one loop + one agent card — not our gesture
+      const inst = instances.get(loopEl.dataset.loopInstance);
+      if (inst) { bindLayer(inst, agentEl); A.selection.clear(); }
+    });
+  }
+
   A.bus.on('card:removed', (d) => {
     const node = d && d.el;
-    const rid = node && node.dataset && node.dataset.loopInstance;
+    if (!node) return;
+    // a linked layer's chat closed -> drop the loop's arrow to it (the loop and
+    // its copied task remain; it just no longer points at a live card)
+    instances.forEach((inst) => { if (inst.layerEl === node) unbindLayer(inst); });
+    const rid = node.dataset && node.dataset.loopInstance;
     if (!rid || !instances.has(rid)) return;
     const inst = instances.get(rid);
     stopPolling(inst);
+    unbindLayer(inst);
     instances.delete(rid);
     persist();
   });
@@ -598,7 +680,18 @@
     },
   });
 
-  window.AtelierLoops = { spawn: spawnLoop, instances, STORE_KEY };
+  window.AtelierLoops = {
+    spawn: spawnLoop, instances, STORE_KEY,
+    // programmatic version of the marquee "link a loop to a layer" gesture (the
+    // selection handler's toggle-on path), mirroring A.links.link. Binds the
+    // loop id to an orchestrator card element: copies its kickoff task + draws
+    // the arrow. Returns true when the loop id resolves.
+    link(loopId, agentEl) {
+      const inst = instances.get(loopId);
+      if (inst && agentEl) bindLayer(inst, agentEl);
+      return !!inst;
+    },
+  };
 
   (function selfCheck() {
     const registered = A.apps && A.apps.has && A.apps.has('loop');
