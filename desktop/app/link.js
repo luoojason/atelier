@@ -137,8 +137,8 @@
     if (existing) dropLink(agentEl);
     const arrows = A.arrows;
     const unlink = (arrows && typeof arrows.link === 'function')
-      ? arrows.link(browserEl, agentEl)
-      : function () {}; // arrows.js absent (plain-browser test) — link still works
+      ? arrows.link(browserEl, agentEl, { kind: 'browser' }) // not a 'parent' arrow:
+      : function () {}; // govern must not wipe it. arrows.js absent -> link still works
     links.set(agentEl, { browserEl, unlink });
     return true;
   }

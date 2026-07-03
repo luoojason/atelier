@@ -392,7 +392,7 @@
         // it auto-unlinks on card:removed, so the unlink handle can be dropped
         const arrows = window.Atelier && window.Atelier.arrows;
         if (arrows && typeof arrows.link === 'function') {
-          arrows.link(parentEl, childEl);
+          arrows.link(parentEl, childEl, { kind: 'parent' });
         }
       }
     } catch {
@@ -636,7 +636,7 @@
         return;
       }
       const arrows = window.Atelier && window.Atelier.arrows;
-      if (arrows && typeof arrows.link === 'function') arrows.link(card, cardEl);
+      if (arrows && typeof arrows.link === 'function') arrows.link(card, cardEl, { kind: 'content' });
       setNote('Agent created a ' + type + ' card on the dashboard'
         + (op.title ? ' — ' + String(op.title) : '') + '.');
     }

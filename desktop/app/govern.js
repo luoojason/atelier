@@ -149,8 +149,11 @@
     // Unconditional (not gated on `old`): a still-sweep-owned child has NO
     // entry in `govs` yet may already have a sweep-drawn arrow into it —
     // clear any arrow this registry never tracked so a fresh govern() below
-    // never draws a stale duplicate.
-    if (A.arrows && typeof A.arrows.unlinkTouching === 'function') A.arrows.unlinkTouching(childEl);
+    // never draws a stale duplicate. Directional 'to': clear only arrows
+    // POINTING AT childEl (its incoming parent arrow), NEVER the child's OWN
+    // outgoing arrows to its sub-agents — else re-parenting the middle of a
+    // chain (A3 governs A1 while A1 governs A2) would wipe the A1->A2 arrow.
+    if (A.arrows && typeof A.arrows.unlinkTouching === 'function') A.arrows.unlinkTouching(childEl, 'to', 'parent');
     return old;
   }
 
@@ -173,7 +176,7 @@
     detachChild(childEl);
     const arrows = A.arrows;
     const unlink = (arrows && typeof arrows.link === 'function')
-      ? arrows.link(parentEl, childEl)   // orchestrator -> subagent
+      ? arrows.link(parentEl, childEl, { kind: 'parent' })  // orchestrator -> subagent
       : function () {};                  // arrows.js absent (plain-browser test)
     let m = govs.get(parentEl);
     if (!m) { m = new Map(); govs.set(parentEl, m); }
@@ -191,7 +194,9 @@
       // tracked (e.g. a sweep-drawn arrow) so ungoverning leaves no stale
       // line behind. Gated on `removed` so an unlink() called for a pair
       // that isn't actually governed can't wipe a DIFFERENT parent's arrow.
-      if (A.arrows && typeof A.arrows.unlinkTouching === 'function') A.arrows.unlinkTouching(childEl);
+      // Directional 'to': clear only the child's INCOMING arrow, never its
+      // own outgoing arrows to its sub-agents.
+      if (A.arrows && typeof A.arrows.unlinkTouching === 'function') A.arrows.unlinkTouching(childEl, 'to', 'parent');
     }
     if (removed && pid && cid) {
       apiJson('/sessions/' + pid + '/govern/' + cid, { method: 'DELETE' }).catch(() => {});
