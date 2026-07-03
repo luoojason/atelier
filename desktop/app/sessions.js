@@ -345,6 +345,61 @@
   function trackSession(id, cardEl) { cardBySession.set(id, cardEl); syncSweep(); }
   function untrackSession(id) { cardBySession.delete(id); syncSweep(); }
 
+  // ── session restore across app restart (r37, frontend half) ────────────────
+  // The backend now persists sessions to disk; this remembers WHICH depth-0
+  // agent cards were open on each board (a board-scoped 'atelier.agentcards' key
+  // = [{id,name}]) and re-reveals them on load, so a closed-and-reopened app
+  // redraws the orchestrator card and — via the child-discovery sweep — its
+  // sub-agent layer. A card is "owned" when it created its own session
+  // (ensureSession); an explicit close prunes it. App QUIT never fires the close
+  // handler, so the key survives and drives the restore. Attached sub-agent
+  // cards are NOT owned (they re-reveal from the sweep once the parent is back).
+  const OWNED_KEY = 'atelier.agentcards';
+  function readOwned() {
+    const v = A.store.get(OWNED_KEY, []);
+    return Array.isArray(v) ? v.filter((r) => r && r.id) : [];
+  }
+  function ownCard(id, name) {
+    if (!id) return;
+    const list = readOwned().filter((r) => r.id !== id);
+    list.push({ id: String(id), name: String(name || 'Agent') });
+    A.store.set(OWNED_KEY, list);
+  }
+  function unownCard(id) {
+    if (!id) return;
+    const list = readOwned().filter((r) => r.id !== id);
+    if (list.length !== readOwned().length) A.store.set(OWNED_KEY, list);
+  }
+  // Re-reveal the persisted depth-0 cards whose backend session still exists,
+  // pruning any that are gone. Retries while the backend is still cold-starting.
+  async function restoreOwnedCards(attempt) {
+    attempt = attempt || 0;
+    const list = readOwned();
+    if (!list.length) return;
+    let sessions;
+    try {
+      const r = await apiJson('/sessions', { method: 'GET' });
+      if (!r.ok || !r.data || !Array.isArray(r.data.sessions)) throw new Error('unavailable');
+      sessions = r.data.sessions;
+    } catch {
+      if (attempt < 12) setTimeout(() => restoreOwnedCards(attempt + 1), 2500);
+      return;
+    }
+    const aliveDepth0 = new Set(
+      sessions.filter((s) => s && s.parent_id == null && !s.job_name).map((s) => s.id)
+    );
+    const surviving = [];
+    const sessApi = window.AtelierSessions;
+    for (const rec of list) {
+      if (!aliveDepth0.has(rec.id)) continue;         // gone -> pruned
+      surviving.push(rec);
+      if (!cardBySession.has(rec.id) && sessApi && typeof sessApi.reveal === 'function') {
+        try { sessApi.reveal(rec.id, rec.name); } catch { /* card system absent */ }
+      }
+    }
+    if (surviving.length !== list.length) A.store.set(OWNED_KEY, surviving);
+  }
+
   // k in the reveal-position formula: children of this parent already on
   // canvas (the sweep stamps data-atl-parent-session on each revealed card,
   // and card:removed drops the map entry, so the count is self-maintaining).
@@ -869,6 +924,7 @@
       lastReadSeq = 0;     // r32: same reset rationale for the browser_read counter
       lastActSeq = 0;      // r33: same reset rationale for the browser_act counter
       if (!closed) trackSession(sessionId, card); // card:removed cleans this up
+      if (!closed) ownCard(sessionId, name);      // r37: remember for restore
       return sessionId;
     }
 
@@ -1083,6 +1139,12 @@
       offLinkRem();
       if (sessionId) {
         untrackSession(sessionId);
+        // r37: an explicit close removes this card from the restore list. A
+        // board switch / app quit does NOT reach here as a user-intended
+        // delete of the CONVERSATION — but board switch does fire card:removed,
+        // and the outgoing board's snapshot was already taken before it, so the
+        // key it saved still lists the card; app quit never fires this at all.
+        unownCard(sessionId);
         // dismissed BEFORE the async DELETE: a sweep response already in
         // flight can still list this child, and without the set it would be
         // re-revealed as a dead card mid-deletion.
@@ -1206,15 +1268,22 @@
   // handler lives in this module anymore.
 
   // ── board switch ───────────────────────────────────────────────────────────
-  // Nothing to do here on purpose. Agent cards are ordinary addCard cards, so
-  // boards' in-place switch closes them at its canvas.removeAllCards() step
-  // (AFTER the snapshot quota gate) and each card's card:removed handler above
-  // does the full teardown: stop poll, untrack, mark dismissed, best-effort
-  // DELETE, arrows unlink. An earlier 'boards:will-switch' close was removed —
-  // it fired BEFORE the quota gate, so a switch that aborted on the "storage
-  // is full" toast (board unchanged) had already destroyed every agent
-  // conversation on both sides. Nothing to flush either: this module never
-  // writes board-scoped store keys.
+  // Agent cards are ordinary addCard cards, so boards' in-place switch closes
+  // them at its canvas.removeAllCards() step (AFTER the snapshot quota gate) and
+  // each card's card:removed handler above does the full teardown: stop poll,
+  // untrack, mark dismissed, best-effort DELETE, arrows unlink. An earlier
+  // 'boards:will-switch' close was removed — it fired BEFORE the quota gate, so
+  // a switch that aborted on the "storage is full" toast had already destroyed
+  // every agent conversation. The one board-scoped key this module writes
+  // (r37 'atelier.agentcards') is snapshotted by boards BEFORE removeAllCards, so
+  // the outgoing board's saved state still lists its cards.
+
+  // r37: restore persisted depth-0 agent cards for the CURRENT board. boot()
+  // does not emit 'boards:switched' (the active board's state IS the live keys),
+  // so kick a restore on load — it retries until the backend is reachable — and
+  // re-run it after every board switch (the newly-mounted board's key is live).
+  A.bus.on('boards:switched', () => { restoreOwnedCards(); });
+  restoreOwnedCards();
 
   // ── self-check ─────────────────────────────────────────────────────────────
   (function selfCheck() {
