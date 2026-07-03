@@ -37,6 +37,7 @@
         "filter": [
           "lite_server.py",
           "cc_usage.py",
+          "external_agents.py",
           "config.py",
           "claude_subscription_model.py",
           "helpers.py",
