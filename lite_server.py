@@ -80,6 +80,7 @@ from scheduler import notify as swarm_notify
 
 # Pure stdlib Claude Code transcript readers backing /config + /cc/*.
 import cc_usage
+import external_agents
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -469,8 +470,11 @@ _MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
 # whole Obsidian vault's link graph and note contents, so a hostile "null"
 # origin page (CORS-allowed for the Electron renderer) could exfiltrate it
 # cross-origin. Every other GET stays ungated per the accepted-risk note
-# above; these two get the same token gate the mutating methods use.
-_TOKEN_GATED_GET_PATHS = ("/vault/graph", "/vault/note")
+# above; these get the same token gate the mutating methods use.
+# /external/agents joins them: it lists each configured agent's base_url
+# (internal/LAN endpoints = recon) plus the api_key's last-4 hint, which is the
+# same "semi-sensitive, don't hand to a null-origin page" class as the vault.
+_TOKEN_GATED_GET_PATHS = ("/vault/graph", "/vault/note", "/external/agents")
 
 app.add_middleware(
     CORSMiddleware,
@@ -2479,6 +2483,60 @@ async def delete_session(session_id: str):
     # disconnect drops its client in its finally block.
     await _close_session_client(sess)
     return {"ok": True}
+
+
+# --- External agents (Iris / Hermes / OpenClaw / OpenAI-compatible) --------------
+# A user-configured remote agent shown on the canvas as a first-class chat card
+# while it actually runs on its own service. Config + forwarding live in
+# external_agents.py; these routes are the thin HTTP surface. All mutating routes
+# are token-gated by the middleware; forwarding is user-initiated (no orchestra
+# tool exposes it to an agent), so it is not in the agent-SSRF class.
+
+
+class ExternalAgentRequest(BaseModel):
+    id: str | None = None
+    name: str = Field(max_length=200)
+    base_url: str = Field(max_length=2000)
+    api_key: str | None = Field(default=None, max_length=4000)
+    model: str | None = Field(default=None, max_length=200)
+    adapter: str | None = None
+
+
+class ExternalMessageRequest(BaseModel):
+    message: str = Field(max_length=200_000)
+    # trailing conversation for a stateless endpoint; the server sanitizes +
+    # caps it (external_agents._build_messages), so a loose shape is harmless.
+    history: list[dict] | None = None
+
+
+@app.get("/external/agents")
+async def external_agents_list():
+    """Configured external agents — sanitized (never the raw api_key)."""
+    return {"agents": external_agents.list_public()}
+
+
+@app.post("/external/agents")
+async def external_agents_upsert(req: ExternalAgentRequest):
+    """Create or update one external agent. Token-gated (POST). 400 on invalid."""
+    ok, result = external_agents.upsert(req.model_dump())
+    if not ok:
+        return JSONResponse({"error": result}, status_code=400)
+    return {"ok": True, "agent": result}
+
+
+@app.delete("/external/agents/{agent_id}")
+async def external_agents_delete(agent_id: str):
+    return {"ok": external_agents.remove(agent_id)}
+
+
+@app.post("/external/agents/{agent_id}/message")
+async def external_agents_message(agent_id: str, req: ExternalMessageRequest):
+    """Forward one turn to the external agent. Token-gated (POST). Never 500s and
+    never echoes the key — a failure is 502 {"error": reason}."""
+    ok, text = await external_agents.forward(agent_id, req.message, req.history)
+    if not ok:
+        return JSONResponse({"error": text}, status_code=502)
+    return {"response": text}
 
 
 class SessionGovernRequest(BaseModel):
