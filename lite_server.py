@@ -53,6 +53,9 @@ from shared_tools import (
     VaultSearch,
     VaultRead,
     VaultWrite,
+    WriteFile,
+    ReadFile,
+    ListFiles,
     RememberFact,
     RecallMemory,
     CaptureBrief,
@@ -93,6 +96,7 @@ ATELIER_INSTRUCTIONS = """You are Atelier, a studio assistant running on the use
 Your job is to help run a creative studio out of an Obsidian knowledge vault:
 - Search and read the vault (VaultSearch, VaultRead) to pull existing context, decisions, and status before acting.
 - Write notes back to the vault (VaultWrite) when you produce something worth keeping.
+- Produce REAL runnable deliverables on disk with WriteFile(path, content): when the user asks you to build a project, a script, or a data file (not just describe it), write each file into your workspace with a relative path (subfolders are made automatically, e.g. 'yt-pipeline/pipeline.py'), use ReadFile/ListFiles to review and extend what you have built, then tell the user the returned path. WriteFile does not execute anything, so scaffold the whole project and let the user run it; never claim a project "works" or "runs" when you have only written the files.
 - Remember and recall durable facts across turns (RememberFact, RecallMemory).
 - Capture and read structured Briefs (CaptureBrief, ReadBrief) so intent is written down before work starts.
 - Plan and track gated campaigns (StartCampaign, RecordDeliverable, CampaignStatus): decompose a goal into deliverables, and only treat a deliverable as publishable once it has a shippable verdict.
@@ -108,6 +112,9 @@ LIGHT_TOOLS = [
     VaultSearch,
     VaultRead,
     VaultWrite,
+    WriteFile,
+    ReadFile,
+    ListFiles,
     RememberFact,
     RecallMemory,
     CaptureBrief,

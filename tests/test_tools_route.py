@@ -70,7 +70,9 @@ def test_shape(client):
 # ── the atelier tools ────────────────────────────────────────────────────────
 
 def test_all_atelier_tools_present(client):
-    assert len(lite_server.LIGHT_TOOLS) == 16  # the card counts on all 16 (incl. 4 Notion)
+    assert len(lite_server.LIGHT_TOOLS) == 19  # incl. 4 Notion + 3 workspace file tools
+    names = {cls.__name__ for cls in lite_server.LIGHT_TOOLS}
+    assert {"WriteFile", "ReadFile", "ListFiles"} <= names  # the workspace file tools
     atelier = [t for t in _tools(client) if t["server"] == "atelier"]
     assert {t["name"] for t in atelier} == {
         cls.__name__ for cls in lite_server.LIGHT_TOOLS
