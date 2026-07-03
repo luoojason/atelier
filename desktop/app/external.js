@@ -369,8 +369,15 @@
   // hand the failed message back ONLY if the composer is still empty — the user
   // may have started typing the next message while this turn was in flight, and
   // clobbering that would lose their text.
+  // size the composer to its content (capped 120px): collapses to one row when
+  // cleared, re-fits when the value is restored.
+  function growComposer(ta) {
+    if (!ta.value) { ta.style.height = ''; return; } // empty -> exact CSS one-row height
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
+  }
   function refillOnFailure(inst, text) {
-    if (!inst.ta.value.trim()) inst.ta.value = text;
+    if (!inst.ta.value.trim()) { inst.ta.value = text; growComposer(inst.ta); }
   }
 
   async function send(inst) {
@@ -379,6 +386,7 @@
     if (!inst.agentId) { setNote(inst, 'Pick an agent to connect to first.', true); return; }
     const boundAgent = inst.agentId; // pin the target for this whole turn
     inst.ta.value = '';
+    growComposer(inst.ta); // collapse back to one row after sending
     setNote(inst, '');
     addBubble(inst, 'user', text);
     inst.history.push({ role: 'user', content: text });
@@ -452,10 +460,7 @@
     ta.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(inst); }
     });
-    ta.addEventListener('input', () => {
-      ta.style.height = 'auto';
-      ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
-    });
+    ta.addEventListener('input', () => growComposer(ta));
 
     populatePicker(inst);
   }

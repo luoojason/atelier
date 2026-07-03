@@ -931,7 +931,7 @@
       sending = false; sendEl.disabled = false; scrollBottom(); inputEl.focus();
     }
   }
-  function grow() { inputEl.style.height = 'auto'; inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px'; }
+  function grow() { if (!inputEl.value) { inputEl.style.height = ''; return; } inputEl.style.height = 'auto'; inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px'; }
   inputEl.addEventListener('input', grow);
   inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
   sendEl.addEventListener('click', send);

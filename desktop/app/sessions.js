@@ -858,6 +858,7 @@
       if (!text || running || closed) return;
       if (attached && expired) { setNote(keepAlive ? JOB_GONE_NOTE : CHILD_GONE_NOTE); return; }
       ta.value = '';
+      autoGrow(); // collapse the composer back to one row after sending
       setNote('');
       // Linked browser context (app/link.js, optional — guarded read): when a
       // browser card is marquee-linked to this agent, the POSTED message gets
@@ -914,6 +915,7 @@
       } catch (err) {
         optimistic.remove();
         ta.value = text; // hand the message back so a retry is one keystroke
+        autoGrow();      // re-fit the composer to the restored text
         settle();
         setNote(err && err.busy
           ? 'Atelier is still on the previous turn — try again in a moment.'
@@ -931,10 +933,12 @@
     ta.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
-    ta.addEventListener('input', () => {
+    function autoGrow() { // size the composer to its content (capped 120px)
+      if (!ta.value) { ta.style.height = ''; return; } // empty -> exact CSS one-row height
       ta.style.height = 'auto';
       ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
-    });
+    }
+    ta.addEventListener('input', autoGrow);
 
     // place the card (spawnApp passes a world pos; fall back to canvas center).
     // r24: cascade successive center-spawned cards (jobs firing in a burst, or
