@@ -1123,7 +1123,19 @@ async def config():
         "notion_connected": bool(settings.get("notion_token")),
         "notion_token_hint": _notion_token_hint(settings.get("notion_token") or ""),
         "obsidian_vault": settings.get("obsidian_vault") or "",
+        "workspace_dir": _workspace_dir_str(),
     }
+
+
+def _workspace_dir_str() -> str:
+    """The agent's file-write workspace path, for the Settings 'Reveal in
+    Finder' affordance. Best-effort: never fail /config on a resolution hiccup."""
+    try:
+        from shared_tools.workspace_core import workspace_root
+
+        return str(workspace_root())
+    except Exception:  # noqa: BLE001 - config must never 500
+        return ""
 
 
 class ProviderRequest(BaseModel):

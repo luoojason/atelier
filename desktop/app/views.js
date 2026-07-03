@@ -196,6 +196,9 @@
       .vw-btn:hover:not(:disabled) { background: var(--active); color: var(--ink); }
       .vw-btn:disabled { opacity: .5; cursor: default; }
       .vw-note { font-size: 12.5px; color: var(--ink-mid); padding: 6px 0 2px; }
+      .vw-help { font-size: 11.5px; color: var(--ink-dim); padding: 0 0 8px; line-height: 1.4; }
+      .vw-ws-path { flex: 1; min-width: 0; font-size: 11.5px; color: var(--ink-dim);
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
       .vw-note.ok { color: var(--ok); }
       .vw-note.err { color: var(--accent); }
     `;
@@ -1063,9 +1066,64 @@
       jobBtn.textContent = next ? 'On' : 'Off';
     });
 
+    // ── Workspace card: where agents write real files (WriteFile) + a
+    // one-click reveal in the OS file manager. Path comes from GET /config
+    // (workspace_dir, resolved by the backend); the reveal goes through the
+    // main-process IPC (window.atelier.revealFolder), guarded to the home dir.
+    const wsCard = document.createElement('div');
+    wsCard.className = 'vw-card';
+    const wsTitle = document.createElement('div');
+    wsTitle.className = 'vw-card-title';
+    wsTitle.textContent = 'Workspace';
+    const wsHelp = document.createElement('div');
+    wsHelp.className = 'vw-help';
+    wsHelp.textContent = 'Files your agents create with WriteFile land here.';
+    const wsRow = document.createElement('div');
+    wsRow.className = 'vw-kv vw-ctl';
+    const wsLabel = document.createElement('span');
+    wsLabel.className = 'k';
+    wsLabel.textContent = 'Folder';
+    const wsCtl = document.createElement('span');
+    wsCtl.className = 'vw-key-ctl';
+    const wsPath = document.createElement('span');
+    wsPath.className = 'vw-ws-path';
+    wsPath.textContent = '—';
+    const wsRevealBtn = btn('Reveal in Finder', 'vw-btn');
+    wsRevealBtn.disabled = true;
+    wsCtl.append(wsPath, wsRevealBtn);
+    wsRow.append(wsLabel, wsCtl);
+    const wsNote = noteLine();
+    wsCard.append(wsTitle, wsHelp, wsRow, wsNote);
+
+    let wsDir = '';
+    wsRevealBtn.addEventListener('click', async () => {
+      if (!wsDir) return;
+      const api = window.atelier;
+      if (!api || typeof api.revealFolder !== 'function') {
+        setNote(wsNote, 'not available here', 'err');
+        return;
+      }
+      setNote(wsNote, 'opening…');
+      const r = await api.revealFolder(wsDir);
+      const ok = !!(r && r.ok);
+      setNote(wsNote, ok ? 'opened in Finder' : ((r && r.error) || 'could not open'), ok ? 'ok' : 'err');
+    });
+    function applyWorkspaceCfg(cfg) {
+      wsDir = (typeof cfg.workspace_dir === 'string') ? cfg.workspace_dir : '';
+      wsPath.textContent = wsDir || '(default)';
+      wsPath.title = wsDir;
+      wsRevealBtn.disabled = !wsDir;
+      if (wsNote.textContent === 'unavailable') setNote(wsNote, '');
+    }
+    function degradeWorkspaceCard() {
+      wsRevealBtn.disabled = true;
+      setNote(wsNote, 'unavailable');
+    }
+
     wrap.append(
       provCard,
       kbCard,
+      wsCard,
       backendCard,
       appearCard,
       card('Connection', [
@@ -1152,6 +1210,7 @@
           applyProviderCfg(cfg);
           applyModelCfg(cfg);
           applyKbCfg(cfg);
+          applyWorkspaceCfg(cfg);
         })
         .catch(() => {
           if (disposed) return;
@@ -1160,6 +1219,7 @@
           degradeProviderCard();
           degradeModelCtl();
           degradeKbCard();
+          degradeWorkspaceCard();
         });
     }
     loadConfig();

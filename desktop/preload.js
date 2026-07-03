@@ -62,4 +62,10 @@ contextBridge.exposeInMainWorld('atelier', {
   saveBinary: (b64, name, ext, filterName) =>
     ipcRenderer.invoke('atelier:save-binary', { b64, name, ext, filterName })
       .catch((e) => ({ error: String((e && e.message) || e) })),
+  // Open the agent's file-write workspace folder in the OS file manager.
+  // Resolves { ok } | { error }; never rejects. Path is guarded to the home
+  // folder in the main process.
+  revealFolder: (dirPath) =>
+    ipcRenderer.invoke('atelier:reveal-folder', dirPath)
+      .catch((e) => ({ error: String((e && e.message) || e) })),
 });

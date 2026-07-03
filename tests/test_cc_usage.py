@@ -402,6 +402,10 @@ def test_config_shape_defaults(monkeypatch, tmp_path, client):
     # missing settings file -> the subscription/no-key defaults
     monkeypatch.setenv("ATELIER_SETTINGS_PATH", str(tmp_path / "settings.json"))
     body = client.get("/config").json()
+    # workspace_dir resolves to a home-dependent path (the Reveal-in-Finder
+    # target) — assert it is present + a non-empty string, then check the rest.
+    assert isinstance(body.get("workspace_dir"), str) and body["workspace_dir"]
+    body.pop("workspace_dir")
     assert body == {
         "model": lite_server._resolved_model(),
         "max_turns": 40,

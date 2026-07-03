@@ -509,6 +509,29 @@ ipcMain.handle('atelier:save-binary', async (event, payload) => {
   }
 });
 
+// atelier:reveal-folder — open a folder (the agent's file-write workspace) in
+// the OS file manager. Guarded to a directory UNDER the user's home so a
+// compromised renderer cannot point it at an arbitrary system path; the folder
+// is created if missing so a never-yet-used workspace still opens. Returns
+// { ok } | { error }, never rejects.
+ipcMain.handle('atelier:reveal-folder', async (event, dirPath) => {
+  try {
+    if (typeof dirPath !== 'string' || !dirPath.trim()) return { error: 'no path' };
+    const home = fs.realpathSync(os.homedir());
+    const target = path.resolve(dirPath);
+    // Must be the home dir itself or strictly inside it (compare with a trailing
+    // separator so '/Users/xevil' cannot pass as inside '/Users/x').
+    if (target !== home && !target.startsWith(home + path.sep)) {
+      return { error: 'refusing to reveal a path outside your home folder' };
+    }
+    fs.mkdirSync(target, { recursive: true });
+    const err = await shell.openPath(target); // '' on success
+    return err ? { error: err } : { ok: true };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
+
 // ── boot ────────────────────────────────────────────────────────────────────
 
 // Single-instance lock: a second launch must not spawn a second backend that
