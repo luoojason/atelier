@@ -290,6 +290,41 @@ function createWindow() {
 
 // ── webview hardening + renderer IPC ────────────────────────────────────────
 
+// A clean Chrome UA (Electron + the app's own product token stripped), derived
+// from Electron's default so the Chrome major/build always matches this runtime.
+function cleanChromeUA() {
+  return String(app.userAgentFallback || '')
+    .replace(/\s*Electron\/\S+/i, '')
+    .replace(/\s*Atelier\/\S+/i, '');
+}
+
+// Rewrite the User-Agent Client Hints on a browser partition session so sites
+// see plain Chrome (not Electron). Registered once per session (WeakSet guard);
+// only ever called with a webview's partition session, never the default one.
+const _chPatched = new WeakSet();
+function patchClientHints(sess) {
+  if (!sess || _chPatched.has(sess)) return;
+  _chPatched.add(sess);
+  const ua = cleanChromeUA();
+  const major = (ua.match(/Chrome\/(\d+)/i) || [, '130'])[1];
+  const full = (ua.match(/Chrome\/([\d.]+)/i) || [, '130.0.0.0'])[1];
+  const brandList = `"Chromium";v="${major}", "Google Chrome";v="${major}", "Not?A_Brand";v="99"`;
+  const fullList = `"Chromium";v="${full}", "Google Chrome";v="${full}", "Not?A_Brand";v="99.0.0.0"`;
+  try {
+    sess.webRequest.onBeforeSendHeaders((details, cb) => {
+      const h = details.requestHeaders;
+      for (const k of Object.keys(h)) {
+        const lk = k.toLowerCase();
+        if (lk === 'sec-ch-ua') h[k] = brandList;
+        else if (lk === 'sec-ch-ua-full-version-list') h[k] = fullList;
+        else if (lk === 'sec-ch-ua-platform') h[k] = '"macOS"';
+        else if (lk === 'sec-ch-ua-mobile') h[k] = '?0';
+      }
+      cb({ requestHeaders: h });
+    });
+  } catch { /* leave the apps.js UA-string tweak in place */ }
+}
+
 app.on('web-contents-created', (_event, contents) => {
   // No webview preload in v1: strip any preload a <webview> tag (or a
   // compromised page) tries to attach. The effective key lives on the
@@ -307,6 +342,15 @@ app.on('web-contents-created', (_event, contents) => {
     webPreferences.contextIsolation = true;
   });
   if (contents.getType() === 'webview') {
+    // Make the Chrome disguise CONSISTENT: the UA string is stripped to Chrome
+    // in apps.js, but the User-Agent Client Hints (Sec-CH-UA* request headers)
+    // still carry the embedded/Electron brand, and a UA/Client-Hints mismatch is
+    // itself a fingerprint. Rewrite the headers to match, on the browser
+    // partition session only (the default session — app + backend — is never
+    // touched). NOTE: this alone does NOT guarantee Google account sign-in works
+    // — Google deliberately blocks embedded browsers via deeper signals too;
+    // this just removes the easy tells.
+    patchClientHints(contents.session);
     // Tab dispositions (target=_blank links, cmd-click) are routed to the
     // renderer over 'atelier:webview-new-window' — apps.js opens them as tabs
     // in a browser card. Everything else (a real window.open popup, i.e. an
