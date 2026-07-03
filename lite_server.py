@@ -2200,6 +2200,81 @@ _session_touch = itertools.count(1)  # deterministic LRU clock (no wall-time tie
 _session_tasks: set = set()
 
 
+# ── session disk persistence ─────────────────────────────────────────────────
+# Sessions are in-memory, so a chat card + its whole sub-agent orchestration
+# layer used to vanish when the app closed. Persist each ledger
+# (id/name/parent_id/depth/model/job_name/messages) to a JSON file after every
+# mutation and reload it on startup, so a card reconnects to its restored
+# session and — with the r34 replay on the next turn — remembers the whole
+# conversation. The live ClaudeSDKClient is NOT persisted (it is rebuilt lazily
+# and re-seeded from the replayed messages); a session mid-turn at shutdown
+# reloads as "idle". Best-effort throughout: persistence must never break a
+# request, and a corrupt/missing file just yields no restored sessions.
+
+def _sessions_file() -> str:
+    return os.path.expanduser(
+        os.getenv("ATELIER_SESSIONS_PATH") or "~/.atelier/sessions.json"
+    )
+
+
+def _session_to_dict(sess: "_AgentSession") -> dict:
+    return {
+        "id": sess.id,
+        "name": sess.name,
+        "parent_id": sess.parent_id,
+        "depth": sess.depth,
+        "job_name": sess.job_name,
+        "model": sess.model,
+        # a session caught mid-turn reloads idle: there is no live client to resume
+        "status": "error" if sess.status == "error" else "idle",
+        "messages": list(sess.messages),
+    }
+
+
+def _persist_sessions() -> None:
+    """Atomic best-effort write of every session ledger. Never raises."""
+    try:
+        path = _sessions_file()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {"v": 1, "sessions": [_session_to_dict(s) for s in _sessions.values()]}
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 - persistence must never break a request
+        pass
+
+
+def _load_sessions() -> None:
+    """Load persisted sessions into _sessions at startup (best-effort)."""
+    try:
+        with open(_sessions_file(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    for rec in data.get("sessions") or []:
+        if not isinstance(rec, dict) or not rec.get("id"):
+            continue
+        try:
+            sess = _AgentSession(
+                str(rec["id"]),
+                str(rec.get("name") or "Agent"),
+                parent_id=rec.get("parent_id"),
+                depth=int(rec.get("depth") or 0),
+            )
+            sess.job_name = rec.get("job_name")
+            sess.model = rec.get("model")
+            sess.status = "error" if rec.get("status") == "error" else "idle"
+            msgs = rec.get("messages")
+            if isinstance(msgs, list):
+                sess.messages = [m for m in msgs if isinstance(m, dict)][-_MAX_SESSION_MESSAGES:]
+            _sessions[sess.id] = sess
+        except Exception:  # noqa: BLE001 - skip a corrupt record, keep the rest
+            continue
+
+
 def _max_sessions() -> int:
     """The session cap, read from env at call time so tests can tune it.
 
@@ -2400,6 +2475,10 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
             # lazy connect above, leaving a live client on the detached object.
             if _sessions.get(sess.id) is not sess:
                 await _close_session_client(sess)
+            # A turn just changed this session's messages/status (and any
+            # sub-agents it spawned); snapshot the ledger so it survives a
+            # restart. Cheap + bounded; best-effort (never raises).
+            _persist_sessions()
 
 
 async def _make_room_for_job() -> bool:
@@ -2496,6 +2575,7 @@ async def create_session(req: SessionCreateRequest | None = None):
     sess = _AgentSession(uuid.uuid4().hex, name)
     sess.model = model
     _sessions[sess.id] = sess
+    _persist_sessions()
     return {"id": sess.id, "name": sess.name}
 
 
@@ -2609,6 +2689,7 @@ async def delete_session(session_id: str):
     # started yet bails before connecting, and a turn that connected AFTER this
     # disconnect drops its client in its finally block.
     await _close_session_client(sess)
+    _persist_sessions()  # a deleted card must not reappear on the next restart
     return {"ok": True}
 
 
@@ -2710,6 +2791,7 @@ async def govern_session(session_id: str, req: SessionGovernRequest):
         return _govern_error("max depth reached")
     child.parent_id = session_id
     child.depth = parent.depth + 1
+    _persist_sessions()  # the orchestration structure changed
     return {"ok": True}
 
 
@@ -2733,6 +2815,7 @@ async def ungovern_session(session_id: str, child_id: str):
     if child.parent_id == session_id:
         child.parent_id = None
         child.depth = 0
+        _persist_sessions()  # the orchestration structure changed
     return {"ok": True}
 
 
@@ -3551,6 +3634,12 @@ async def tools_registry():
 
 if __name__ == "__main__":
     import uvicorn
+
+    # Restore persisted sessions before serving so a chat card + its orchestration
+    # layer survive an app restart. Only on the real server run (main.js spawns
+    # `python lite_server.py`); tests import the module and never trigger this,
+    # so their in-memory _sessions stay isolated.
+    _load_sessions()
 
     uvicorn.run(
         app,
