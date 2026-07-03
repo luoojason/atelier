@@ -131,8 +131,16 @@ User priority #3 of 3 — the last of the "agent connects to canvas cards" famil
 - Review folded in: 6 findings (1 MEDIUM = keepAlive not reaching sub-agent cards; 5 LOW = lingering CLI subprocess, running-job-at-load baselined-away, reclaimed-job wrong note, + 2 accepted). Accepted (documented): a board switch mid-job HIDES the running job (grow-only `seen` respects a manual close; the job keeps running server-side); jobs get the orchestra INTENTIONALLY (the ask is "with the same delegation notes + arrows").
 - Gates: **642 backend tests** (+8: job_name plumbing; tracked-vs-untracked compat; job note/transcript; error-preserves-ledger; `_make_room_for_job` spares user cards; client dropped after completion), `node --check` clean. **Live Electron verify** on a fresh board: firing a job (POST /open-swarm/get_response {job_name}) revealed a chat card titled "demo-brief" showing the `Scheduled job "demo-brief" fired` note + the prompt + Thinking + reply (screenshot confirms). Rebuilt + reinstalled `/Applications/Atelier.app`.
 
+### Live bug fixes (2026-07-02, commit `97b70ff`)
+Three issues Jason hit in use, all fixed + live-verified: (1) a delegated sub-agent could not OpenBrowser/CreateCard — the orchestra's CANVAS tools were depth-0-gated alongside the SPAWN tools; split into two tiers so every session gets the canvas tools (sub-agents included) while SpawnAgent/CheckAgent stay depth-0-only, and a first card (sub-agent/job) now PROCESSES its own fresh canvas ops (noBaseline) instead of baselining them away; (2) the dotted grid stopped panning — `applyTransform` now pans `background-position` + scales `background-size` with zoom; (3) wheel over a chat zoomed the board — the wheel handler now bails for any scrollable region inside a card (was `.chat-body`/textarea only, missing agent cards' `.atl-agent-msgs`). 642 tests.
+
+### Jason's new feature backlog (2026-07-02) — logged, not built (see wiki Projects/OpenSwarm.md)
+1. **Customizable slash commands + loops** (e.g. `/goal`, user-defined commands, a loop primitive) inside the Atelier chat.
+2. **Connect external agents** (Hermes/Iris, OpenClaw, etc.) as first-class canvas agents that run on their own + guide their own sub-agents (a connector/bridge).
+3. **Paid AI workflow-builder, PAYWALLED** (far future; deferred monetization idea; pairs with the key-gated add-on pattern).
+
 ### Roadmap remaining
-**User's current top-3 (from the goal prompt) — ALL DONE:** (1) agent-driven browser — **DONE r22**; (2) agents connect to ANY dashboard card generally — **DONE r23**; (3) workflows surface in dashboard chats — **DONE r24**. Then the older parity roadmap:
+**User's current top-3 (from the goal prompt) — ALL DONE:** (1) agent-driven browser — **DONE r22**; (2) agents connect to ANY dashboard card generally — **DONE r23**; (3) workflows surface in dashboard chats — **DONE r24**. Then Jason's new backlog above, then the older parity roadmap:
 4. **Narrated short videos** — reuse Jason's reddit-shorts pipeline (`~/Content/reddit-shorts`, edge-tts + local whisper + ffmpeg); a heavy bundling round (ffmpeg + the media stack). Next major.
 5. **Key-gated add-ons** — image/video generation + Composio VA, served-but-gated on a Settings key (user chose this).
 6. **Live activity dashboard** — watch an agent drive the linked browser in realtime + orchestrator↔subagent messages, via widgets.
