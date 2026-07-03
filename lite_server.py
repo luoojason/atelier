@@ -2208,9 +2208,53 @@ def _session_ts() -> str:
 # deep should be closed for a fresh one, and disk persistence is the upgrade.
 _MAX_SESSION_MESSAGES = 500
 
+# Char budget for the transcript replayed to a REBUILT client (see
+# _conversation_preamble). A card's conversation lives only in its live
+# ClaudeSDKClient; sess.messages is a render ledger never fed to the model, so a
+# dropped client (turn error, model change, job completion) wipes the model's
+# memory even though the card still shows the whole exchange. When we rebuild the
+# client we replay the most recent turns, up to this many chars, so context
+# survives. Bounded so a long card cannot balloon a single rebuild's prompt.
+_REPLAY_CHAR_BUDGET = 16_000
+
 
 def _append_session_message(sess: _AgentSession, role: str, text: str) -> None:
     sess.messages.append({"role": role, "text": text, "ts": _session_ts()})
+
+
+def _conversation_preamble(sess: _AgentSession) -> str:
+    """A compact transcript of the card's prior turns, to re-seed a client that
+    was dropped and rebuilt so the conversation does not lose its memory.
+
+    Uses sess.messages EXCEPT its last entry (the current user message, which
+    _start_turn appended just before this turn and which is sent on its own) and
+    skips internal 'note' events (orchestration labels, not conversation). Keeps
+    the most recent user/assistant turns within _REPLAY_CHAR_BUDGET and frames
+    them clearly as restored context so the model continues naturally. Returns ""
+    when there is nothing prior to replay (a fresh card's first turn).
+    """
+    prior = [
+        m for m in sess.messages[:-1] if m["role"] in ("user", "assistant")
+    ]
+    if not prior:
+        return ""
+    kept: list[str] = []
+    budget = _REPLAY_CHAR_BUDGET
+    for m in reversed(prior):
+        label = "User" if m["role"] == "user" else "Assistant"
+        line = f"{label}: {m['text']}"
+        if kept and budget - len(line) < 0:
+            break
+        kept.append(line)
+        budget -= len(line)
+    kept.reverse()
+    return (
+        "[Conversation so far in this session, restored after a reconnection —"
+        " use it as the context for what follows and continue naturally; do not"
+        " mention this notice.]\n\n"
+        + "\n\n".join(kept)
+        + "\n\n[End of restored context. The user's next message follows.]\n\n"
+    )
 
 
 def _unknown_session() -> JSONResponse:
@@ -2280,6 +2324,14 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
             await _close_session_client(sess)
             return {"response": "", "error": True}
         try:
+            # A REBUILD (client is None) means a prior client was dropped (turn
+            # error, model change, job completion) OR this is the card's first
+            # turn. Since the model's memory lived only in that dropped client,
+            # replay the card's transcript so the conversation does not start
+            # over blank — the exact bug where a card still SHOWS the history but
+            # the model has forgotten it. A fresh card has no prior turns, so the
+            # preamble is empty and the first message is sent as-is.
+            outgoing = message
             if sess.client is None:
                 # ONLY depth-0 (card-level) sessions get the spawn orchestra
                 # (Spawn/Check/Nav), so the spawn depth cap is structural rather
@@ -2296,7 +2348,10 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
                 )
                 await client.connect()
                 sess.client = client
-            await sess.client.query(message)
+                preamble = _conversation_preamble(sess)
+                if preamble:
+                    outgoing = preamble + message
+            await sess.client.query(outgoing)
             result = await _collect_response(sess.client)
             _append_session_message(sess, "assistant", result["response"])
             sess.status = "error" if result.get("error") else "idle"

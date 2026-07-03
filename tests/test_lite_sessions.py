@@ -605,6 +605,91 @@ def test_pending_model_reset_drops_client_after_turn_settles(monkeypatch, client
     assert built[1] is not built[0]
 
 
+# ── conversation memory survives a dropped client (the amnesia fix) ───────────
+# A card's history lives ONLY in its live ClaudeSDKClient; sess.messages is a
+# render ledger never fed to the model. Any drop (turn error, model change, job
+# completion) nulls the client, so the next turn used to start blank even though
+# the card still showed the whole exchange. On rebuild we now replay the ledger.
+
+def test_rebuilt_client_replays_conversation_history(monkeypatch, client):
+    built = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory(built=built))
+    _inline_turns(monkeypatch)
+
+    sid = _create(client)["id"]
+    # turn 1: establish a fact
+    client.post(f"/sessions/{sid}/message",
+                json={"message": "my favorite fruit is dragonfruit"})
+    # simulate a dropped client (what a turn error / model change / job
+    # completion all leave behind: sess.client is None, session still alive)
+    lite_server._sessions[sid].client = None
+    # turn 2: a follow-up that only makes sense WITH the prior context
+    client.post(f"/sessions/{sid}/message",
+                json={"message": "what is my favorite fruit?"})
+
+    assert len(built) == 2 and built[1] is not built[0]  # a fresh client
+    sent = built[1].queried[0]
+    assert "dragonfruit" in sent                  # turn-1 history was replayed
+    assert "what is my favorite fruit?" in sent   # plus the new message
+    assert "restored after a reconnection" in sent  # framed as restored context
+
+
+def test_first_turn_sends_raw_message_without_a_preamble(monkeypatch, client):
+    built = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory(built=built))
+    _inline_turns(monkeypatch)
+    sid = _create(client)["id"]
+    client.post(f"/sessions/{sid}/message", json={"message": "hello"})
+    # a fresh card has no prior turns to replay: the message is sent verbatim
+    assert built[0].queried == ["hello"]
+
+
+def test_live_client_is_reused_without_replaying(monkeypatch, client):
+    built = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory(built=built))
+    _inline_turns(monkeypatch)
+    sid = _create(client)["id"]
+    client.post(f"/sessions/{sid}/message", json={"message": "first"})
+    client.post(f"/sessions/{sid}/message", json={"message": "second"})
+    # the live client carries context itself, so no rebuild and no replay:
+    # one client, both messages sent raw (no preamble double-counting history)
+    assert len(built) == 1
+    assert built[0].queried == ["first", "second"]
+
+
+def test_conversation_preamble_excludes_current_message_and_notes():
+    sess = lite_server._AgentSession("s0", "Card")
+    lite_server._append_session_message(sess, "user", "u1")
+    lite_server._append_session_message(sess, "assistant", "a1")
+    lite_server._append_session_message(sess, "note", "-> Delegated to sub-agent")
+    lite_server._append_session_message(sess, "user", "the current message")
+    pre = lite_server._conversation_preamble(sess)
+    assert "u1" in pre and "a1" in pre
+    assert "-> Delegated to sub-agent" not in pre  # internal notes are skipped
+    assert "the current message" not in pre        # the current turn is excluded
+    assert pre.startswith("[Conversation so far")
+
+
+def test_conversation_preamble_empty_for_a_fresh_session():
+    sess = lite_server._AgentSession("s0", "Card")
+    lite_server._append_session_message(sess, "user", "only message")
+    assert lite_server._conversation_preamble(sess) == ""
+
+
+def test_conversation_preamble_respects_the_char_budget(monkeypatch):
+    monkeypatch.setattr(lite_server, "_REPLAY_CHAR_BUDGET", 60)
+    sess = lite_server._AgentSession("s0", "Card")
+    for i in range(20):
+        lite_server._append_session_message(sess, "assistant", f"reply-{i}-" + "x" * 20)
+    lite_server._append_session_message(sess, "user", "current")
+    pre = lite_server._conversation_preamble(sess)
+    assert "reply-19" in pre     # the most recent turn is kept
+    assert "reply-0-" not in pre  # older turns fall outside the budget
+
+
 # ── governance links: cycle helper + POST/DELETE /sessions/{id}/govern ────────
 
 def test_governs_cycle_helper_walks_parent_chain():
