@@ -12,18 +12,19 @@ Atelier is the **glass cockpit for a personal AI workforce** — the one spatial
 
 ## STATE (rewrite each round)
 
-- Last live-verified commit: `8e61d55` (composer collapse fix), branch `swarm-extensions`, HEAD pushed to `origin/swarm-extensions`.
-- Backend tests: **662 passing** (only ratchets up). Frontend gated by `node --check` + live Electron screenshot-verify.
-- Installed app: `/Applications/Atelier.app`, healthy on the Claude Max subscription (`/health` 200).
-- **Hero-workflow completion today (rough): ~55%.** research ✅ (agent-driven browser: OpenBrowser/NavigateBrowser + Deep Research + WebSearch) · make ✅ (Documents/decks/notes/mini-apps, all keyless) · **publish ❌ (the agent can OPEN/NAVIGATE a browser but cannot OPERATE it — no click/type/upload/read — so nothing actually gets posted)** · watch-and-steer 🟡 (sub-agent arrows + live job cards + six widgets exist, but no first-class real-time activity view).
-- **Weakest link right now: the publish step** (computer-use in the webview). Second weakest: the deep OpenSwarm workforce (8 specialist agents + Campaign meta-agent in `server.py`/`swarm.py`) does NOT run in `lite_server` — present but dark.
+- Last live-verified commit: r32 ReadPage (round-trip computer-use read), branch `swarm-extensions`, pushed to `origin/swarm-extensions`.
+- Backend tests: **675 passing** (only ratchets up; +13 for ReadPage round-trip + SSRF-read gate). Frontend gated by `node --check` + live Electron screenshot-verify.
+- Installed app: `/Applications/Atelier.app`, healthy on the Claude Max subscription (`/health` 200); `/tools` lists `ReadPage` (all agent sessions).
+- **Hero-workflow completion today (rough): ~60%.** research ✅ (agent-driven browser: OpenBrowser/NavigateBrowser + **ReadPage** reads the live page text back into context + Deep Research + WebSearch) · make ✅ (Documents/decks/notes/mini-apps, all keyless) · **publish 🟡 (the agent can now OPEN/NAVIGATE and READ a page, but still cannot OPERATE it — no click/type/upload — so nothing gets posted yet)** · watch-and-steer 🟡 (sub-agent arrows + live job cards + six widgets, but no first-class real-time activity view).
+- **r32 shipped the round-trip result channel** (`sess.browser_read` + `POST /sessions/{id}/browser_result` + a req-keyed awaitable future): the first agent tool that gets a RESULT back from the card, not fire-and-forget. Click/Type/UploadFile reuse this exact channel.
+- **Weakest link right now: the last-mile publish** (Click/Type/UploadFile in the webview — now UNBLOCKED by the r32 round-trip channel; ReadPage is the model's eyes, these are its hands). Second weakest: the deep OpenSwarm workforce (8 specialist agents + Campaign meta-agent in `server.py`/`swarm.py`) does NOT run in `lite_server` — present but dark.
 
 ## NOW / NEXT / LATER (by theme)
 
 ### Theme: Deliver-and-Publish spine (the hero workflow) — PRIMARY
+- **NOW** · Close the computer-use loop, hands next: give agents `Click` / `Type` (+ `Screenshot`, then `UploadFile`) inside the embedded webview so they OPERATE a page, not just read it. ReadPage (r32) is the read half + the round-trip channel — reuse `sess.browser_read`/`POST browser_result`/the req-keyed future pattern for these (a `browser_act` op carrying a selector-or-coords + the same result future). This is the load-bearing unblock for publish.
 - **NOW** · Activate the real OpenSwarm workforce: wire the 8 specialist deliverable agents + the Campaign meta-agent (`server.py`/`swarm.py`) into the app's `lite_server` runtime so the deepest capability actually runs in the app. *Activation beats invention — grep before building.*
-- **NOW** · Close the computer-use loop: give agents `ReadPage` / `Click` / `Type` / `UploadFile` (+ `Screenshot`) inside the embedded webview so they OPERATE a page, not just open it. This is the load-bearing unblock for publish.
-- **NEXT** · First real publish: drive a logged-in browser card to post/submit to one real destination end to end (start with something forgiving), with a real artifact captured. Reuse per-card browser profiles (already shipped).
+- **NEXT** · First real publish: with Click/Type in hand, drive a logged-in browser card to post/submit to one real destination end to end (start with something forgiving), with a real artifact captured. Reuse per-card browser profiles (already shipped).
 - **NEXT** · Hybrid publish connectors where APIs are sane (per RESUME backlog item 4): a per-platform token in Settings (reuse the external-agents/Notion settings pattern).
 
 ### Theme: Watch-and-steer (live activity)
@@ -45,6 +46,8 @@ Atelier is the **glass cockpit for a personal AI workforce** — the one spatial
 - Per-card browser profiles (isolated partitions). Google embedded account sign-in is blocked by Google policy — not a bug; use "Sign in with Google" OAuth popups / cookie-import later, or the platform API. The CDP-debugger-attach Client-Hints hack is REJECTED (breaks the card's DevTools + hang risk).
 - The premium/paywall path is a visual scaffold only — no product, pricing, or payment. Do not build monetization until Jason decides.
 - The 54 UI-BACKLOG rows are DONE (Phase A/B complete) — do not re-skin or re-litigate them.
+- ReadPage (r32) gates its RETURNED CONTENT on the page's real loaded host (`_agent_open_host_blocked`): it refuses to feed a loopback / private / link-local page's body to the model, closing the OpenBrowser→NavigateBrowser→ReadPage internal-read exfil chain. NavigateBrowser itself stays host-unrestricted on purpose (a user may drive their own localhost in a card they linked) — the gate lives on the read side so driving still works but the agent cannot slurp internal content. Click/Type/UploadFile, when built, MUST carry the same read/act-side host gate.
+- ReadPage returns page text as clearly-framed UNTRUSTED data (prompt-injection surface, same class as the pre-existing linked-browser-context ride-along); the agent's tool blast radius is bounded (vault-write / web / canvas / token-gated Notion — no shell/fs). `sess.browser_read` is a single slot: a rare parallel double-ReadPage strands one call to its 25s timeout (safe, no corruption); a queue is the upgrade if it ever bites.
 
 ## SUPERSEDED / REJECTED (don't re-propose)
 
@@ -53,6 +56,7 @@ Atelier is the **glass cockpit for a personal AI workforce** — the one spatial
 
 ## Round log (last ~8; archive older to CHANGELOG.md)
 
+- r32 ReadPage: the agent reads the linked browser's LIVE page text back into its context (Golden Task 5 done end-to-end). The first ROUND-TRIP orchestra tool — `sess.browser_read`={req,seq} + `POST /sessions/{id}/browser_result` + a req-keyed awaitable future (25s timeout); the card reads the webview via `executeJavaScript` innerText and posts it back. Frontend: `AtelierApps.browserReadPage` + `sessions.js handleBrowserRead` (seq-gated, waits past about:blank/attach). Adversarial review caught + fixed an SSRF-read chain (OpenBrowser public → NavigateBrowser to loopback/LAN → ReadPage exfil): ReadPage now gates returned content on the page's real host via `_agent_open_host_blocked`. 675 tests. Live-verified: agent quoted example.com's live first sentence verbatim through the full loop.
 - r31 (`1b39a23`) loop → orchestration layer (marquee a Loop + orchestrator chat to re-run a whole layer on schedule).
 - r30 (`a321af4`) per-card browser profiles + clean Chrome UA; Google embedded sign-in confirmed blocked by policy.
 - browser Client-Hints consistency (`fe52b51`); posting design noted for future (`3827d5a`).

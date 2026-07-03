@@ -356,6 +356,21 @@
     } catch { return undefined; }
   }
 
+  // r32 (agent ReadPage): pull {url,title,text} out of a live webview guest.
+  // innerText (not innerHTML) so the return carries no markup — the guest runs
+  // this in its OWN world and hands back a serialized plain object. Any throw
+  // (guest detached, navigation in flight) resolves null so the caller retries.
+  const READ_JS = '(function(){try{'
+    + 'var t=(document.body&&document.body.innerText)||"";'
+    + 'return{url:location.href,title:document.title||"",text:String(t)};'
+    + '}catch(e){return{url:location.href,title:document.title||"",text:""};}})()';
+  async function wvExtract(frame) {
+    try {
+      const out = await frame.executeJavaScript(READ_JS, false);
+      return (out && typeof out === 'object') ? out : null;
+    } catch { return null; }
+  }
+
   // ── tiny safe markdown (createElement/textContent ONLY — never innerHTML) ──
   // Subset: # ## ### headings, - bullets, ``` fences, **bold**, *italic*,
   // `code`, [text](http/https url), [[wikilinks]] (accent chips, no nav).
@@ -842,6 +857,34 @@
     // through the exact normalize/load path the URL bar submit uses above.
     cardApi.navigate = (u) => { loadInTab(activeTab(), normalizeUrl(u)); };
 
+    // r32 (agent ReadPage): read THIS card's ACTIVE tab live page text.
+    // Resolves {url,title,text} or null (iframe-mode / no attached webview /
+    // never loaded). Waits, bounded, for the guest to attach AND stop loading,
+    // so a read issued right after OpenBrowser lands on the loaded DOM rather
+    // than a blank in-flight page. innerText only — no markup, so nothing the
+    // page renders can inject into the app (sessions.js posts it back as data).
+    cardApi.readPage = () => readActiveTab();
+    async function readActiveTab() {
+      const deadline = Date.now() + 15000;
+      for (;;) {
+        const t = activeTab();
+        if (t && t.kind === 'webview' && t.attached && t.frame) {
+          let loading = true;
+          try { loading = t.frame.isLoading(); } catch { loading = false; }
+          if (!loading) {
+            const out = await wvExtract(t.frame);
+            // about:blank is the webview's bootstrap page BEFORE the queued real
+            // URL starts loading (createWebview loads it on the first dom-ready);
+            // skip it so a read right after OpenBrowser waits for the actual
+            // page instead of returning a blank read from that narrow window.
+            if (out && out.url && out.url !== 'about:blank') return out;
+          }
+        }
+        if (Date.now() >= deadline) return null;
+        await new Promise((res) => setTimeout(res, 400));
+      }
+    }
+
     // ── boot tabs (legacy configs carry a single `url`) ─────────────────────
     // Scheme allowlist, not just "non-empty string": boards.js import writes
     // attacker-editable JSON into this config, so a crafted board file could
@@ -1185,7 +1228,19 @@
     const h = makeApp('note', { config: { text: String(text || '') }, pos: worldPos });
     return h ? h.el : null;
   }
-  window.AtelierApps = { browserInfo, browserNavigate, spawnNote };
+  // browserReadPage(cardEl) -> Promise<{url,title,text}|null> (r32): read the
+  // live page text of a browser card's ACTIVE tab. Resolves null for a
+  // non-browser/removed card or a tab with no readable webview (iframe mode).
+  // sessions.js calls this for a ReadPage browser_read request and POSTs the
+  // result back to the awaiting agent tool.
+  function browserReadPage(cardEl) {
+    if (!cardEl) return Promise.resolve(null);
+    for (const c of browserCards) {
+      if (c.el === cardEl && typeof c.readPage === 'function') return c.readPage();
+    }
+    return Promise.resolve(null);
+  }
+  window.AtelierApps = { browserInfo, browserNavigate, browserReadPage, spawnNote };
 
   // ── self-check ────────────────────────────────────────────────────────────
   (function selfCheck() {
@@ -1209,6 +1264,12 @@
     console.assert(md.querySelector('h1') && md.querySelector('ul li') && md.querySelector('strong')
       && md.querySelector('em') && md.querySelector('code') && md.querySelector('.atl-md-wikilink'),
       '[apps] markdown subset failed');
+    // r32: the agent ReadPage surface is exposed and returns a Promise even for
+    // a bogus card (so sessions.js can always await + post a result).
+    console.assert(typeof window.AtelierApps.browserReadPage === 'function',
+      '[apps] browserReadPage (ReadPage surface) missing');
+    console.assert(typeof browserReadPage(null).then === 'function',
+      '[apps] browserReadPage must return a Promise');
     if (!missing.length && Array.isArray(stored) && dock.length >= 6) {
       console.log('[apps] self-check passed — 5 app types registered, dock wired, store ok.');
     }

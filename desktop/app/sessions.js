@@ -490,6 +490,7 @@
     let thinkingRow = null;
     let lastNavSeq = 0;     // r16: highest agent-requested browser_nav.seq handled
     let lastCanvasOpSeq = 0; // r22: highest agent-requested canvas_op.seq handled
+    let lastReadSeq = 0;    // r32: highest agent-requested browser_read.seq handled
     let attachBaselined = false; // r22: attached cards adopt existing seqs once
     let spawnedBelow = 0;   // r23: cascade counter for cards spawned below this one
 
@@ -580,6 +581,55 @@
       else if (op.kind === 'note' || op.kind === 'document') openLinkedCard(op.kind, op);
       // unknown kinds are consumed silently — a forward-compat no-op so an
       // older card never chokes on a newer backend op it does not understand.
+    }
+
+    // Agent-driven page read (round 32). The backend's ReadPage tool sets
+    // browser_read = {req, seq} on the session AND blocks awaiting the result —
+    // unlike browser_nav/canvas_op (fire-and-forget), this is a ROUND TRIP: the
+    // agent needs the page text back. The detail poll re-delivers it every
+    // cycle, so the monotonic lastReadSeq gate reads exactly once even while the
+    // async read is still in flight across several polls. We read THIS card's
+    // LINKED browser (the same one NavigateBrowser drives, incl. a browser the
+    // agent just OpenBrowser'd this turn) and POST the result to
+    // /sessions/{id}/browser_result keyed by req, which resolves the waiting
+    // tool. Atelier.links + AtelierApps are optional/guarded: with no linked
+    // browser (or those modules absent) we post ok:false so the tool returns a
+    // clear "no page" note instead of hanging to its 25s timeout.
+    function handleBrowserRead(read) {
+      if (closed || !read || typeof read.seq !== 'number') return;
+      if (read.seq <= lastReadSeq) return; // already handled (polls repeat it)
+      lastReadSeq = read.seq;
+      const req = read.req;
+      if (typeof req !== 'number' || !sessionId) return;
+      const post = (body) => {
+        apiJson('/sessions/' + sessionId + '/browser_result', {
+          method: 'POST',
+          body: JSON.stringify(Object.assign({ req: req }, body)),
+        }).catch(() => { /* the tool times out on its own if this never lands */ });
+      };
+      const links = window.Atelier && window.Atelier.links;
+      const browserEl = (links && typeof links.browserElFor === 'function')
+        ? links.browserElFor(card) : null;
+      const api = window.AtelierApps;
+      if (!browserEl || !api || typeof api.browserReadPage !== 'function') {
+        setNote('Agent tried to read a page but no browser card is linked — '
+          + 'shift-drag a box around a browser card and this card, or ask it to '
+          + 'open one first.');
+        post({ ok: false, error: 'no browser card is linked to this agent' });
+        return;
+      }
+      setNote('Agent is reading the linked browser page…');
+      let p = null;
+      try { p = api.browserReadPage(browserEl); } catch { p = null; }
+      Promise.resolve(p).then((out) => {
+        if (out && typeof out === 'object' && typeof out.text === 'string') {
+          post({ ok: true, url: String(out.url || ''), title: String(out.title || ''), text: out.text });
+          setNote('Agent read the linked browser page (' + out.text.length + ' chars).');
+        } else {
+          post({ ok: false, error: 'the linked browser had no readable page loaded' });
+          setNote('Agent tried to read the linked browser but no page was loaded yet.');
+        }
+      }).catch(() => { post({ ok: false, error: 'the page read failed' }); });
     }
 
     // Position for a card the agent spawns below this one. The right lane (used
@@ -765,6 +815,7 @@
       // counter climbed past it.
       lastNavSeq = 0;
       lastCanvasOpSeq = 0; // r22: same reset rationale for the canvas_op counter
+      lastReadSeq = 0;     // r32: same reset rationale for the browser_read counter
       if (!closed) trackSession(sessionId, card); // card:removed cleans this up
       return sessionId;
     }
@@ -829,6 +880,8 @@
         if (!noBaseline) {
           const bn = r.data.browser_nav;
           if (bn && typeof bn.seq === 'number') lastNavSeq = bn.seq;
+          const br = r.data.browser_read; // r32: adopt without acting on re-reveal
+          if (br && typeof br.seq === 'number') lastReadSeq = br.seq;
           const ops = Array.isArray(r.data.canvas_ops) ? r.data.canvas_ops : [];
           for (const op of ops) {
             if (op && typeof op.seq === 'number' && op.seq > lastCanvasOpSeq) {
@@ -845,6 +898,9 @@
       // CreateCard). A LIST so several ops from one turn all fire (see
       // handleCanvasOps); runs after handleBrowserNav so a spawn note wins.
       handleCanvasOps(r.data.canvas_ops);
+      // r32: AFTER handleCanvasOps so an OpenBrowser+ReadPage burst in one turn
+      // spawns/links the browser first, then reads it in the same cycle.
+      handleBrowserRead(r.data.browser_read);
       if (r.data.status === 'running') {
         showThinking();
         schedulePoll();

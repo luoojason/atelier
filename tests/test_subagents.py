@@ -709,6 +709,192 @@ def test_detail_carries_canvas_ops_list_and_list_route_omits_it(client, captured
         assert "canvas_ops" not in s  # list route never carries the queue
 
 
+# ── ReadPage: the round-trip computer-use tool (r32) ─────────────────────────
+# Unlike every other orchestra tool, ReadPage BLOCKS awaiting a result the card
+# posts back. It stamps sess.browser_read = {req, seq}, registers a future keyed
+# by req, and awaits it; the card reads its linked browser and POSTs to
+# /sessions/{id}/browser_result, which resolves the future.
+
+def _read_page_handler(parent_id):
+    """The ReadPage handler coroutine (the 7th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[6].handler
+
+
+async def _drive_read(parent, result):
+    """Fire ReadPage, wait for it to stamp browser_read + register its waiter,
+    resolve that waiter with `result` (the card's answer), and return the tool
+    text. Runs the whole exchange on ONE loop, as production does."""
+    read = _read_page_handler(parent.id)
+    task = asyncio.create_task(read({}))
+    for _ in range(1000):  # yield until the tool has stamped + registered
+        if parent.browser_read is not None and (
+            parent.browser_read["req"] in lite_server._browser_read_waiters
+        ):
+            break
+        await asyncio.sleep(0)
+    assert parent.browser_read is not None
+    req = parent.browser_read["req"]
+    fut = lite_server._browser_read_waiters[req]
+    fut.set_result(result)
+    return _text(await task)
+
+
+def test_read_page_round_trip_returns_page_text(captured):
+    parent = _register_parent()
+    text = asyncio.run(_drive_read(parent, {
+        "ok": True, "url": "https://example.com/", "title": "Example Domain",
+        "text": "This domain is for use in illustrative examples.",
+    }))
+    assert "This domain is for use in illustrative examples." in text
+    assert "https://example.com/" in text
+    assert "Example Domain" in text
+    # the page text is framed as untrusted data, not instructions
+    assert "untrusted" in text.lower()
+    # the waiter map does not leak an entry per read
+    assert lite_server._browser_read_waiters == {}
+
+
+def test_read_page_stamps_browser_read_seq(captured):
+    parent = _register_parent()
+    assert parent.browser_read is None
+    asyncio.run(_drive_read(parent, {"ok": True, "text": "hi", "url": "https://example.com/", "title": "t"}))
+    assert parent.browser_read is not None
+    assert set(parent.browser_read) == {"req", "seq"}
+    assert isinstance(parent.browser_read["seq"], int)
+    assert parent.browser_read["seq"] >= 1
+
+
+def test_read_page_detail_route_carries_browser_read(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["browser_read"] is None
+    parent = lite_server._sessions[sid]
+
+    async def scenario():
+        read = _read_page_handler(sid)
+        task = asyncio.create_task(read({}))
+        for _ in range(1000):
+            if parent.browser_read is not None:
+                break
+            await asyncio.sleep(0)
+        req = parent.browser_read["req"]
+        lite_server._browser_read_waiters[req].set_result({"ok": True, "text": "x"})
+        await task
+
+    asyncio.run(scenario())
+    # after the round trip the stamp persists on the detail route (seq-gated poll)
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["browser_read"] is not None
+    assert detail["browser_read"]["seq"] >= 1
+    # the list route never carries it
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "browser_read" not in s
+
+
+def test_read_page_reports_an_unreadable_page(captured):
+    parent = _register_parent()
+    text = asyncio.run(_drive_read(parent, {"ok": False, "error": "no page loaded yet"}))
+    assert "Could not read" in text
+    assert "no page loaded yet" in text
+    assert lite_server._browser_read_waiters == {}
+
+
+def test_read_page_reports_empty_text(captured):
+    parent = _register_parent()
+    text = asyncio.run(_drive_read(parent, {"ok": True, "text": "   ", "url": "https://example.com/", "title": "t"}))
+    assert "no readable text" in text
+
+
+def test_read_page_truncates_a_huge_page(captured):
+    parent = _register_parent()
+    huge = "A" * (lite_server._READ_PAGE_MAX + 5000)
+    text = asyncio.run(_drive_read(parent, {"ok": True, "text": huge, "url": "https://example.com/", "title": "t"}))
+    assert "page text truncated" in text
+    # far shorter than the raw page (framed + capped at _READ_PAGE_MAX)
+    assert len(text) < lite_server._READ_PAGE_MAX + 500
+
+
+def test_read_page_refuses_internal_page_content(captured):
+    # SSRF-read guard: OpenBrowser is public-host-gated, but NavigateBrowser can
+    # drive a linked card to loopback/LAN (a user's own localhost). ReadPage must
+    # not pipe that internal page's body into the model even so — it gates the
+    # RETURNED CONTENT on the page's real loaded URL.
+    for bad in (
+        "http://127.0.0.1:8765/config",
+        "http://localhost/admin",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://192.168.1.1/",
+        "http://10.0.0.5/secrets",
+    ):
+        parent = _register_parent()
+        text = asyncio.run(_drive_read(parent, {
+            "ok": True, "url": bad, "title": "Internal", "text": "SECRET INTERNAL BODY",
+        }))
+        assert "SECRET INTERNAL BODY" not in text, bad
+        assert "private, loopback, or link-local" in text, bad
+        # cleanup for the next loop iteration (single fixed parent id)
+        lite_server._sessions.clear()
+
+
+def test_read_page_allows_public_page_content(captured):
+    # The gate must not block ordinary public pages (regression guard).
+    parent = _register_parent()
+    text = asyncio.run(_drive_read(parent, {
+        "ok": True, "url": "https://en.wikipedia.org/wiki/Ohio",
+        "title": "Ohio", "text": "Ohio is a state.",
+    }))
+    assert "Ohio is a state." in text
+
+
+def test_read_page_times_out_without_a_result(captured, monkeypatch):
+    monkeypatch.setattr(lite_server, "_READ_PAGE_TIMEOUT", 0.05)
+    parent = _register_parent()
+    read = _read_page_handler(parent.id)
+    text = _text(_call(read, {}))
+    assert "No linked browser" in text
+    # the waiter is cleaned up even on timeout (no leak)
+    assert lite_server._browser_read_waiters == {}
+
+
+def test_read_page_with_parent_gone(captured):
+    read = _read_page_handler("ghostsession00000000000000000000")
+    text = _text(_call(read, {}))
+    assert "session is gone" in text
+
+
+def test_browser_result_endpoint_resolves_the_waiter(captured):
+    async def scenario():
+        fut = asyncio.get_running_loop().create_future()
+        lite_server._browser_read_waiters[424242] = fut
+        req = lite_server.BrowserResultRequest(
+            req=424242, ok=True, url="u", title="t", text="body text",
+        )
+        resp = await lite_server.browser_result("sess", req)
+        assert resp == {"ok": True}
+        assert fut.done()
+        return fut.result()
+
+    result = asyncio.run(scenario())
+    assert result["ok"] is True and result["text"] == "body text"
+    lite_server._browser_read_waiters.pop(424242, None)
+
+
+def test_browser_result_unknown_req_is_a_noop(client, captured):
+    # A repeat poll or a timed-out tool posts a req nobody is awaiting: 200 no-op.
+    resp = client.post(
+        "/sessions/whatever/browser_result",
+        json={"req": 999999, "ok": True, "text": "orphan"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+def test_read_page_tool_description_and_schema():
+    read = lite_server._orchestra_tools("p")[6]
+    assert read.name == "ReadPage"
+    assert read.input_schema.get("required", []) == []
+    assert "untrusted" in read.description
+
+
 # ── the structural depth cap ─────────────────────────────────────────────────
 
 def test_build_options_without_spawner_has_no_orchestra():
