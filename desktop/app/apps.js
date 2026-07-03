@@ -371,6 +371,46 @@
     } catch { return null; }
   }
 
+  // r33 (agent Click/Type): scripts that OPERATE the guest page and return a
+  // small {ok, text|error} ack (never page HTML). The selector/text are
+  // JSON.stringify'd into the source so an arbitrary value cannot break out of
+  // its string literal (the guest runs this in its own world). Click scrolls
+  // the match into view and clicks it; Type sets the value through the native
+  // setter (so React/Vue controlled inputs notice) then fires input+change.
+  function clickJs(selector) {
+    return '(function(sel){try{'
+      + 'var el=document.querySelector(sel);'
+      + 'if(!el)return{ok:false,error:"no element matches "+sel};'
+      + 'if(el.scrollIntoView)el.scrollIntoView({block:"center"});'
+      + 'if(typeof el.click==="function")el.click();'
+      + 'else el.dispatchEvent(new MouseEvent("click",{bubbles:true,cancelable:true}));'
+      + 'var t=(el.tagName||"").toLowerCase();'
+      // url rides a SEPARATE field (not baked into text) so the backend can
+      // host-gate it before handing it to the model — a click may navigate to an
+      // internal page whose URL should be withheld (mirrors the ReadPage gate).
+      + 'return{ok:true,url:location.href,text:"Clicked <"+t+">"+(el.id?" #"+el.id:"")+"."};'
+      + '}catch(e){return{ok:false,error:String((e&&e.message)||e)};}})(' + JSON.stringify(selector) + ')';
+  }
+  function typeJs(selector, text) {
+    return '(function(sel,txt){try{'
+      + 'var el=document.querySelector(sel);'
+      + 'if(!el)return{ok:false,error:"no element matches "+sel};'
+      + 'var tag=(el.tagName||"").toUpperCase();'
+      + 'if(el.focus)el.focus();'
+      + 'if(tag==="INPUT"||tag==="TEXTAREA"){'
+      + 'var proto=tag==="TEXTAREA"?window.HTMLTextAreaElement.prototype:window.HTMLInputElement.prototype;'
+      + 'var d=Object.getOwnPropertyDescriptor(proto,"value");'
+      + 'if(d&&d.set)d.set.call(el,txt);else el.value=txt;'
+      + '}else if(el.isContentEditable){el.textContent=txt;}'
+      + 'else return{ok:false,error:"<"+tag.toLowerCase()+"> is not a text field"};'
+      + 'el.dispatchEvent(new Event("input",{bubbles:true}));'
+      + 'el.dispatchEvent(new Event("change",{bubbles:true}));'
+      + 'var now=("value" in el)?el.value:(el.textContent||"");'
+      + 'return{ok:true,text:"Typed into <"+tag.toLowerCase()+">"+(el.id?" #"+el.id:"")+"; value is now: "+String(now).slice(0,140)};'
+      + '}catch(e){return{ok:false,error:String((e&&e.message)||e)};}})('
+      + JSON.stringify(selector) + ',' + JSON.stringify(text) + ')';
+  }
+
   // ── tiny safe markdown (createElement/textContent ONLY — never innerHTML) ──
   // Subset: # ## ### headings, - bullets, ``` fences, **bold**, *italic*,
   // `code`, [text](http/https url), [[wikilinks]] (accent chips, no nav).
@@ -865,6 +905,37 @@
     // page renders can inject into the app (sessions.js posts it back as data).
     cardApi.readPage = () => readActiveTab();
     async function readActiveTab() {
+      return withReadyWebview(async (frame) => {
+        const out = await wvExtract(frame);
+        // about:blank is the webview's bootstrap page BEFORE the queued real URL
+        // starts loading (createWebview loads it on the first dom-ready); return
+        // null so withReadyWebview keeps waiting for the actual page instead of
+        // returning a blank read from that narrow window.
+        return (out && out.url && out.url !== 'about:blank') ? out : null;
+      });
+    }
+
+    // r33 (agent Click/Type): OPERATE this card's ACTIVE tab. Runs fn(frame)
+    // once the guest is attached AND not loading (bounded wait, shared with
+    // readPage), clicks/types via executeJavaScript, and resolves the page's
+    // {ok, text|error} ack (or null / {ok:false} on no webview). The selector
+    // and text are JSON-encoded into the injected script, so a hostile value
+    // cannot break out of the string it lands in.
+    cardApi.act = (action, selector, text) =>
+      withReadyWebview(async (frame) => {
+        const js = action === 'type' ? typeJs(selector, text) : clickJs(selector);
+        try {
+          // userGesture:true — some click handlers require a user activation.
+          const out = await frame.executeJavaScript(js, true);
+          return (out && typeof out === 'object') ? out : { ok: false, error: 'the page returned no result' };
+        } catch { return { ok: false, error: 'the page rejected the action' }; }
+      });
+
+    // Wait (bounded 15s < the backend's 25s tool timeout) for the active tab to
+    // be a live, attached, not-loading webview, then run fn(frame). fn returns a
+    // truthy result to finish or null to keep waiting (readActiveTab uses null to
+    // wait past about:blank). Returns null if no webview becomes ready in time.
+    async function withReadyWebview(fn) {
       const deadline = Date.now() + 15000;
       for (;;) {
         const t = activeTab();
@@ -872,12 +943,8 @@
           let loading = true;
           try { loading = t.frame.isLoading(); } catch { loading = false; }
           if (!loading) {
-            const out = await wvExtract(t.frame);
-            // about:blank is the webview's bootstrap page BEFORE the queued real
-            // URL starts loading (createWebview loads it on the first dom-ready);
-            // skip it so a read right after OpenBrowser waits for the actual
-            // page instead of returning a blank read from that narrow window.
-            if (out && out.url && out.url !== 'about:blank') return out;
+            const out = await fn(t.frame);
+            if (out) return out;
           }
         }
         if (Date.now() >= deadline) return null;
@@ -1240,7 +1307,21 @@
     }
     return Promise.resolve(null);
   }
-  window.AtelierApps = { browserInfo, browserNavigate, browserReadPage, spawnNote };
+  // browserAct(cardEl, action, selector, text) -> Promise<{ok,text|error}|null>
+  // (r33): operate a browser card's active tab. action is 'click' or 'type';
+  // resolves the page's ack, null for a non-browser/removed card or no webview.
+  // sessions.js calls this for a Click/Type browser_act request and POSTs the
+  // ack back to the awaiting agent tool.
+  function browserAct(cardEl, action, selector, text) {
+    if (!cardEl) return Promise.resolve(null);
+    for (const c of browserCards) {
+      if (c.el === cardEl && typeof c.act === 'function') {
+        return c.act(action, String(selector || ''), String(text || ''));
+      }
+    }
+    return Promise.resolve(null);
+  }
+  window.AtelierApps = { browserInfo, browserNavigate, browserReadPage, browserAct, spawnNote };
 
   // ── self-check ────────────────────────────────────────────────────────────
   (function selfCheck() {
@@ -1270,6 +1351,16 @@
       '[apps] browserReadPage (ReadPage surface) missing');
     console.assert(typeof browserReadPage(null).then === 'function',
       '[apps] browserReadPage must return a Promise');
+    // r33: the Click/Type surface is exposed, returns a Promise for a bogus
+    // card, and the injected scripts JSON-encode their args (no string breakout).
+    console.assert(typeof window.AtelierApps.browserAct === 'function',
+      '[apps] browserAct (Click/Type surface) missing');
+    console.assert(typeof browserAct(null, 'click', 'a').then === 'function',
+      '[apps] browserAct must return a Promise');
+    console.assert(clickJs('a"]') .indexOf('"a\\"]"') !== -1,
+      '[apps] clickJs must JSON-encode the selector');
+    console.assert(typeJs('#x', 'he"llo').indexOf('"he\\"llo"') !== -1,
+      '[apps] typeJs must JSON-encode the text');
     if (!missing.length && Array.isArray(stored) && dock.length >= 6) {
       console.log('[apps] self-check passed — 5 app types registered, dock wired, store ok.');
     }

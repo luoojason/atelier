@@ -895,6 +895,166 @@ def test_read_page_tool_description_and_schema():
     assert "untrusted" in read.description
 
 
+# ── Click / Type: operate the linked page (r33) ──────────────────────────────
+# Same round-trip channel as ReadPage (browser_act instead of browser_read), but
+# the tool needs only an ACK back, and the returned summary is app-authored (no
+# page HTML), so there is no read-side host gate.
+
+def _click_handler(parent_id):
+    """The Click handler coroutine (the 8th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[7].handler
+
+
+def _type_handler(parent_id):
+    """The Type handler coroutine (the 9th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[8].handler
+
+
+async def _drive_act(handler, parent, args, result):
+    """Fire a Click/Type handler, wait for it to stamp browser_act + register its
+    waiter, resolve that waiter with the card's ack, and return the tool text."""
+    task = asyncio.create_task(handler(args))
+    for _ in range(1000):
+        if parent.browser_act is not None and (
+            parent.browser_act["req"] in lite_server._browser_read_waiters
+        ):
+            break
+        await asyncio.sleep(0)
+    assert parent.browser_act is not None
+    req = parent.browser_act["req"]
+    lite_server._browser_read_waiters[req].set_result(result)
+    return _text(await task)
+
+
+def test_click_round_trip_reports_the_click_and_public_url(captured):
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    text = asyncio.run(_drive_act(
+        click, parent, {"selector": "button#go"},
+        {"ok": True, "text": "Clicked <button> #go.", "url": "https://example.com/next"},
+    ))
+    assert "Clicked <button>" in text
+    assert "https://example.com/next" in text  # a public post-click URL is reported
+    assert lite_server._browser_read_waiters == {}
+
+
+def test_click_withholds_internal_url(captured):
+    # A click can navigate to an internal page; its URL (which can carry session
+    # tokens) must be host-gated like ReadPage's content, not handed to the model.
+    for bad in ("http://192.168.1.1/admin?session=secret", "http://127.0.0.1:8765/config"):
+        lite_server._sessions.clear()
+        parent = _register_parent()
+        click = _click_handler(parent.id)
+        text = asyncio.run(_drive_act(
+            click, parent, {"selector": "a"},
+            {"ok": True, "text": "Clicked <a>.", "url": bad},
+        ))
+        assert bad not in text, bad
+        assert "secret" not in text
+        assert "withheld" in text
+
+
+def test_click_stamps_browser_act(captured):
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    asyncio.run(_drive_act(click, parent, {"selector": "a.more"}, {"ok": True, "text": "Clicked <a>"}))
+    assert parent.browser_act is not None
+    assert set(parent.browser_act) == {"req", "seq", "action", "selector", "text"}
+    assert parent.browser_act["action"] == "click"
+    assert parent.browser_act["selector"] == "a.more"
+    assert isinstance(parent.browser_act["seq"], int)
+
+
+def test_type_round_trip_passes_selector_and_text(captured):
+    parent = _register_parent()
+    type_ = _type_handler(parent.id)
+    text = asyncio.run(_drive_act(
+        type_, parent, {"selector": "input[name=q]", "text": "hello world"},
+        {"ok": True, "text": "Typed into <input>; value is now: hello world"},
+    ))
+    assert "Typed into <input>" in text
+    assert parent.browser_act["action"] == "type"
+    assert parent.browser_act["selector"] == "input[name=q]"
+    assert parent.browser_act["text"] == "hello world"
+
+
+def test_act_reports_no_match(captured):
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    text = asyncio.run(_drive_act(
+        click, parent, {"selector": "#nope"},
+        {"ok": False, "error": "no element matches #nope"},
+    ))
+    assert "Could not" in text and "no element matches #nope" in text
+    assert "ReadPage" in text  # nudges the model to look before acting
+
+
+def test_click_requires_a_selector(captured):
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    text = _text(_call(click, {"selector": "   "}))
+    assert "selector is required" in text
+    assert parent.browser_act is None  # nothing stamped
+
+
+def test_type_rejects_overlong_text(captured):
+    parent = _register_parent()
+    type_ = _type_handler(parent.id)
+    huge = "a" * (lite_server._TYPE_TEXT_MAX + 1)
+    text = _text(_call(type_, {"selector": "#x", "text": huge}))
+    assert "too long to type" in text
+    assert parent.browser_act is None
+
+
+def test_act_times_out_without_an_ack(captured, monkeypatch):
+    monkeypatch.setattr(lite_server, "_BROWSER_ACT_TIMEOUT", 0.05)
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    text = _text(_call(click, {"selector": "button"}))
+    assert "did not confirm" in text
+    assert lite_server._browser_read_waiters == {}  # no leak
+
+
+def test_act_with_parent_gone(captured):
+    click = _click_handler("ghostsession00000000000000000000")
+    text = _text(_call(click, {"selector": "button"}))
+    assert "session is gone" in text
+
+
+def test_click_and_type_share_the_read_result_registry(captured):
+    # Click/Type reuse browser_read's req counter + waiter map; the shared
+    # browser_result endpoint resolves any of them by req without collision.
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    asyncio.run(_drive_act(click, parent, {"selector": "b"}, {"ok": True, "text": "Clicked <b>"}))
+    # act uses its OWN seq field, independent of browser_read's
+    assert parent.browser_act["seq"] >= 1
+    assert parent.browser_read is None
+
+
+def test_click_type_detail_route_carries_browser_act(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["browser_act"] is None
+    parent = lite_server._sessions[sid]
+    click = _click_handler(sid)
+
+    async def scenario():
+        task = asyncio.create_task(click({"selector": "button"}))
+        for _ in range(1000):
+            if parent.browser_act is not None:
+                break
+            await asyncio.sleep(0)
+        req = parent.browser_act["req"]
+        lite_server._browser_read_waiters[req].set_result({"ok": True, "text": "Clicked"})
+        await task
+
+    asyncio.run(scenario())
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["browser_act"] is not None and detail["browser_act"]["action"] == "click"
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "browser_act" not in s
+
+
 # ── the structural depth cap ─────────────────────────────────────────────────
 
 def test_build_options_without_spawner_has_no_orchestra():

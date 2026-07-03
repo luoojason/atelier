@@ -36,6 +36,8 @@ ORCHESTRA_NAMES = {
     "OpenBrowser",
     "CreateCard",
     "ReadPage",
+    "Click",
+    "Type",
 }
 
 
@@ -101,6 +103,10 @@ def test_orchestra_entries_present(client):
     assert orchestra["ReadPage"]["availability"] == "all agent sessions"
     assert orchestra["ReadPage"]["input_schema"].get("required", []) == []
     assert "untrusted" in orchestra["ReadPage"]["description"]
+    assert orchestra["Click"]["availability"] == "all agent sessions"
+    assert orchestra["Click"]["input_schema"]["required"] == ["selector"]
+    assert orchestra["Type"]["availability"] == "all agent sessions"
+    assert orchestra["Type"]["input_schema"]["required"] == ["selector", "text"]
     assert orchestra["DelegateToSubagent"]["availability"] == "sessions governing sub-agents"
     assert orchestra["SpawnAgent"]["input_schema"]["required"] == ["task"]
     assert orchestra["CheckAgent"]["input_schema"]["required"] == ["agent_id"]

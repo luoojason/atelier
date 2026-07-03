@@ -491,6 +491,7 @@
     let lastNavSeq = 0;     // r16: highest agent-requested browser_nav.seq handled
     let lastCanvasOpSeq = 0; // r22: highest agent-requested canvas_op.seq handled
     let lastReadSeq = 0;    // r32: highest agent-requested browser_read.seq handled
+    let lastActSeq = 0;     // r33: highest agent-requested browser_act.seq handled
     let attachBaselined = false; // r22: attached cards adopt existing seqs once
     let spawnedBelow = 0;   // r23: cascade counter for cards spawned below this one
 
@@ -630,6 +631,56 @@
           setNote('Agent tried to read the linked browser but no page was loaded yet.');
         }
       }).catch(() => { post({ ok: false, error: 'the page read failed' }); });
+    }
+
+    // Agent-driven page action (round 33). Same ROUND-TRIP contract as
+    // handleBrowserRead but it OPERATES the linked page: the backend's Click/Type
+    // tool sets browser_act = {req, seq, action, selector, text} and blocks; we
+    // run the click/type on the linked browser's live webview and POST the ack
+    // back to /sessions/{id}/browser_result keyed by req. seq-gated by lastActSeq
+    // so each act fires once even while the async action is still in flight.
+    function handleBrowserAct(act) {
+      if (closed || !act || typeof act.seq !== 'number') return;
+      if (act.seq <= lastActSeq) return; // already handled (polls repeat it)
+      lastActSeq = act.seq;
+      const req = act.req;
+      if (typeof req !== 'number' || !sessionId) return;
+      const post = (body) => {
+        apiJson('/sessions/' + sessionId + '/browser_result', {
+          method: 'POST',
+          body: JSON.stringify(Object.assign({ req: req }, body)),
+        }).catch(() => { /* the tool times out on its own if this never lands */ });
+      };
+      const action = act.action === 'type' ? 'type' : 'click';
+      const links = window.Atelier && window.Atelier.links;
+      const browserEl = (links && typeof links.browserElFor === 'function')
+        ? links.browserElFor(card) : null;
+      const api = window.AtelierApps;
+      if (!browserEl || !api || typeof api.browserAct !== 'function') {
+        setNote('Agent tried to ' + action + ' a page but no browser card is '
+          + 'linked — shift-drag a box around a browser card and this card, or '
+          + 'ask it to open one first.');
+        post({ ok: false, error: 'no browser card is linked to this agent' });
+        return;
+      }
+      setNote('Agent is operating the linked browser (' + action + ')…');
+      let p = null;
+      try { p = api.browserAct(browserEl, action, String(act.selector || ''), String(act.text || '')); }
+      catch { p = null; }
+      Promise.resolve(p).then((out) => {
+        if (out && typeof out === 'object' && out.ok) {
+          // Forward the post-click url on its OWN field (Click sets it, Type
+          // does not) so the backend can host-gate it before the model sees it.
+          post({ ok: true, text: String(out.text || ('Done: ' + action)), url: String(out.url || '') });
+          setNote('Agent ' + (action === 'type' ? 'typed into' : 'clicked') + ' the linked browser.');
+        } else if (out && typeof out === 'object') {
+          post({ ok: false, error: String(out.error || 'the action failed') });
+          setNote('Agent could not ' + action + ' the linked browser (' + String(out.error || 'no match') + ').');
+        } else {
+          post({ ok: false, error: 'the linked browser had no page to operate' });
+          setNote('Agent tried to ' + action + ' the linked browser but no page was loaded yet.');
+        }
+      }).catch(() => { post({ ok: false, error: 'the page action failed' }); });
     }
 
     // Position for a card the agent spawns below this one. The right lane (used
@@ -816,6 +867,7 @@
       lastNavSeq = 0;
       lastCanvasOpSeq = 0; // r22: same reset rationale for the canvas_op counter
       lastReadSeq = 0;     // r32: same reset rationale for the browser_read counter
+      lastActSeq = 0;      // r33: same reset rationale for the browser_act counter
       if (!closed) trackSession(sessionId, card); // card:removed cleans this up
       return sessionId;
     }
@@ -882,6 +934,8 @@
           if (bn && typeof bn.seq === 'number') lastNavSeq = bn.seq;
           const br = r.data.browser_read; // r32: adopt without acting on re-reveal
           if (br && typeof br.seq === 'number') lastReadSeq = br.seq;
+          const ba = r.data.browser_act;  // r33: same adopt-not-act on re-reveal
+          if (ba && typeof ba.seq === 'number') lastActSeq = ba.seq;
           const ops = Array.isArray(r.data.canvas_ops) ? r.data.canvas_ops : [];
           for (const op of ops) {
             if (op && typeof op.seq === 'number' && op.seq > lastCanvasOpSeq) {
@@ -901,6 +955,7 @@
       // r32: AFTER handleCanvasOps so an OpenBrowser+ReadPage burst in one turn
       // spawns/links the browser first, then reads it in the same cycle.
       handleBrowserRead(r.data.browser_read);
+      handleBrowserAct(r.data.browser_act); // r33: click/type the linked browser
       if (r.data.status === 'running') {
         showThinking();
         schedulePoll();
