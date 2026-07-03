@@ -527,6 +527,7 @@
   let mmMap = null; // world->minimap transform of the last draw (for inverse)
   let mmVisible = store.get('minimap', true) !== false; // default ON (shell shows one)
   let mmLast = 0, mmTimer = null;
+  let mmDrag = null; // frozen world->minimap transform held for a whole drag
 
   function drawMinimap() {
     if (!mmSvg || !mmVisible) return;
@@ -546,12 +547,20 @@
       minX = Math.min(minX, c.x); minY = Math.min(minY, c.y);
       maxX = Math.max(maxX, c.x + c.w); maxY = Math.max(maxY, c.y + c.h);
     });
-    const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
-    const scale = Math.min(W / bw, H / bh);
-    const ox = (W - bw * scale) / 2, oy = (H - bh * scale) / 2;
-    mmMap = { scale, minX, minY, ox, oy };
-    const px = (wx) => (wx - minX) * scale + ox;
-    const py = (wy) => (wy - minY) * scale + oy;
+    if (mmDrag) {
+      // FROZEN frame: during a minimap drag the transform is held fixed so the
+      // coordinate system cannot re-fit under the cursor (the viewport rect is
+      // part of the union bbox above, so panning would otherwise shift the frame
+      // and make the drag jump). Only the viewport indicator moves in this frame.
+      mmMap = mmDrag;
+    } else {
+      const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
+      const scale = Math.min(W / bw, H / bh);
+      mmMap = { scale, minX, minY, ox: (W - bw * scale) / 2, oy: (H - bh * scale) / 2 };
+    }
+    const px = (wx) => (wx - mmMap.minX) * mmMap.scale + mmMap.ox;
+    const py = (wy) => (wy - mmMap.minY) * mmMap.scale + mmMap.oy;
+    const scale = mmMap.scale; // used below for rect sizing (frozen or fresh)
 
     mmSvg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
     mmSvg.textContent = '';
@@ -607,9 +616,21 @@
     // click (or drag) pans the canvas so the pointed world point centers
     mmSvg.addEventListener('mousedown', (e) => {
       e.preventDefault();
+      // Freeze the current fit for the whole drag so the frame can't shift under
+      // the cursor (see drawMinimap) — this is what makes the drag smooth. Redraw
+      // directly on each move (cheap; a few rects) so the indicator tracks live
+      // rather than lagging behind the 250ms throttle.
+      drawMinimap();     // refresh mmMap to the current state
+      mmDrag = mmMap;    // freeze it
       minimapPanTo(e.clientX, e.clientY);
-      const move = (ev) => minimapPanTo(ev.clientX, ev.clientY);
-      const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+      drawMinimap();
+      const move = (ev) => { minimapPanTo(ev.clientX, ev.clientY); drawMinimap(); };
+      const up = () => {
+        window.removeEventListener('mousemove', move);
+        window.removeEventListener('mouseup', up);
+        mmDrag = null;   // unfreeze; re-fit to the new viewport/cards
+        drawMinimap();
+      };
       window.addEventListener('mousemove', move);
       window.addEventListener('mouseup', up);
     });
