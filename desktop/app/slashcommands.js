@@ -104,6 +104,7 @@
     { name: 'note', label: 'New Note', icon: '▤', kind: 'app', app: 'note', section: 'Create' },
     { name: 'document', label: 'New Document', icon: '▧', kind: 'app', app: 'document', section: 'Create' },
     { name: 'external', label: 'External agent', icon: '⇄', kind: 'app', app: 'external', section: 'Create' },
+    { name: 'workflowai', label: 'Workflow AI', icon: '✦', kind: 'app', app: 'workflowai', section: 'Create' },
     { name: 'clear', label: 'Clear input', icon: '⌫', kind: 'action', action: 'clear', section: 'Actions' },
     { name: 'commands', label: 'Manage commands…', icon: '⚙', kind: 'action', action: 'manage', section: 'Actions' },
   ];
