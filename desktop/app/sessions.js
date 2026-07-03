@@ -221,6 +221,10 @@
   const CHILD_DY = 210;  // vertical step per already-revealed sibling
   const CHILD_GONE_NOTE = 'This sub-agent session expired on the backend — '
     + 'it cannot be restarted from this card.';
+  // r24: a finished job card whose session was LRU-reclaimed shows THIS instead
+  // of the sub-agent note (it was never a sub-agent).
+  const JOB_GONE_NOTE = 'This job run was reclaimed to free resources — its '
+    + 'transcript is no longer available.';
 
   let agentSeq = 0; // 'Agent N' naming for cards spawned this page-load
 
@@ -373,6 +377,11 @@
           id: String(item.id),
           name: String(item.name || 'Sub-agent'),
           parentEl,
+          // r24: inherit keepAlive down the tree — a running JOB's delegated
+          // sub-agents must survive a board switch / close like the job card
+          // itself (else removeAllCards DELETEs them and aborts the delegation).
+          keepAlive: !!(parentEl && parentEl.dataset
+            && parentEl.dataset.atlKeepAlive === '1'),
         });
         if (!childEl) continue;
         childEl.dataset.atlParentSession = String(item.parent_id);
@@ -400,6 +409,12 @@
   // lands on the canvas-center fallback below (verified — no fix needed).
   function createAgentCard(worldPos, attach) {
     const attached = !!(attach && attach.id);
+    // r24: a job card is a VIEW onto a still-running scheduled-job session —
+    // closing it (× or a board switch's removeAllCards) must NOT DELETE the
+    // backend session, which would abort the running job and destroy its
+    // transcript. keepAlive suppresses the close-time DELETE; LRU still reclaims
+    // the session once the job finishes.
+    const keepAlive = !!(attach && attach.keepAlive);
     let name;
     if (attached) {
       name = attach.name || 'Sub-agent';
@@ -411,6 +426,10 @@
     // shell (same structure core's addCard expects: .card-bar / .card-x)
     const card = document.createElement('section');
     card.className = 'card app-card atl-agent-card';
+    // r24: stamp keepAlive so the child-discovery sweep can INHERIT it onto a
+    // job's sub-agent cards — otherwise a board switch would DELETE (abort) a
+    // running job's delegated children even though the job card itself is spared.
+    if (keepAlive) card.dataset.atlKeepAlive = '1';
     const bar = document.createElement('div');
     bar.className = 'card-bar';
     const dot = document.createElement('span');
@@ -768,8 +787,9 @@
           // the parent-spawned session is gone (backend restart / LRU after
           // it finished). Recreating would orphan the parent link, so this
           // card only reports it; sends fail gracefully with the same note.
+          // r24: a job card gets a job-appropriate note (it was never a sub-agent).
           expired = true;
-          setNote(CHILD_GONE_NOTE);
+          setNote(keepAlive ? JOB_GONE_NOTE : CHILD_GONE_NOTE);
           return;
         }
         // evicted server-side (LRU cap / restart) — next send starts fresh
@@ -822,7 +842,7 @@
     async function send() {
       const text = ta.value.trim();
       if (!text || running || closed) return;
-      if (attached && expired) { setNote(CHILD_GONE_NOTE); return; }
+      if (attached && expired) { setNote(keepAlive ? JOB_GONE_NOTE : CHILD_GONE_NOTE); return; }
       ta.value = '';
       setNote('');
       // Linked browser context (app/link.js, optional — guarded read): when a
@@ -884,7 +904,7 @@
         setNote(err && err.busy
           ? 'Atelier is still on the previous turn — try again in a moment.'
           : err && err.expired
-            ? CHILD_GONE_NOTE
+            ? (keepAlive ? JOB_GONE_NOTE : CHILD_GONE_NOTE)
             : err && err.limit
               ? 'Session limit reached — close an Agent card or wait for a turn to finish, then try again.'
               : err && err.full
@@ -902,13 +922,17 @@
       ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
     });
 
-    // place the card (spawnApp passes a world pos; fall back to canvas center)
+    // place the card (spawnApp passes a world pos; fall back to canvas center).
+    // r24: cascade successive center-spawned cards (jobs firing in a burst, or
+    // several reveals) so they don't stack exactly — keyed on the current card
+    // count, mod 6 like apps.js's centerPos, so it never runs away.
     let pos = worldPos;
     if (!pos) {
       const canvasEl = document.getElementById('canvas');
       const rct = canvasEl.getBoundingClientRect();
+      const casc = (cardBySession.size % 6) * 34;
       pos = A.canvas.screenToWorld(rct.left + rct.width / 2, rct.top + rct.height / 2);
-      pos = { x: pos.x - CARD_W / 2, y: pos.y - CARD_H / 2 };
+      pos = { x: pos.x - CARD_W / 2 + casc, y: pos.y - CARD_H / 2 + casc };
     }
     const handle = A.canvas.addCard(card, { x: pos.x, y: pos.y, w: CARD_W, h: CARD_H });
 
@@ -934,12 +958,16 @@
         // flight can still list this child, and without the set it would be
         // re-revealed as a dead card mid-deletion.
         dismissedSessions.add(sessionId);
-        // best-effort: the backend also reclaims leaked sessions via LRU cap.
-        // An attached card deletes the CHILD session too — same close
-        // semantics as any Agent card; the parent's CheckAgent then reports
-        // the child gone, which the backend handles gracefully. ponytail: a
-        // detach-without-delete close is the upgrade.
-        apiJson('/sessions/' + sessionId, { method: 'DELETE' }).catch(() => {});
+        // r24: a job card (keepAlive) is a VIEW onto a still-running scheduled
+        // job — DELETE would abort the run and destroy its transcript, so skip
+        // it; LRU reclaims the session once the job finishes. Every other card
+        // frees its backend session on close (best-effort; the backend also
+        // reclaims leaked sessions via the LRU cap). An attached agent card
+        // deletes the CHILD session too — the parent's CheckAgent then reports
+        // it gone, which the backend handles gracefully.
+        if (!keepAlive) {
+          apiJson('/sessions/' + sessionId, { method: 'DELETE' }).catch(() => {});
+        }
       }
     });
 
@@ -1004,7 +1032,10 @@
   }
 
   window.AtelierSessions = {
-    reveal(sessionId, name) {
+    // reveal(id, name, opts?) — opts.keepAlive (r24) makes the revealed card a
+    // VIEW that does NOT delete its backend session on close (for a live job
+    // card bound to a still-running scheduled job; see createAgentCard).
+    reveal(sessionId, name, opts) {
       const id = String(sessionId == null ? '' : sessionId);
       if (!id) return null;
       const existing = cardBySession.get(id);
@@ -1028,6 +1059,7 @@
         id,
         name: String(name || 'Agent'),
         parentEl: null,
+        keepAlive: !!(opts && opts.keepAlive),
       });
       if (el) flashReveal(el);
       return el;

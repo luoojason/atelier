@@ -144,6 +144,10 @@
          cards through Atelier.arrows (guarded, so a 404 here stays harmless). -->
     <script defer src="app/arrows.js"></script>
     <script defer src="app/sessions.js"></script>
+    <!-- jobcards.js after sessions.js: watches GET /sessions for fired
+         scheduled-job sessions and auto-reveals each as a live chat card via
+         AtelierSessions.reveal; guards its deps so a 404 stays harmless. -->
+    <script defer src="app/jobcards.js"></script>
     <!-- chatcontrols.js after sessions.js: the shared per-composer model
          picker (Part B) mounts onto the main chat composer and each agent
          card; it guards window.Atelier so a 404 stays harmless under defer. -->

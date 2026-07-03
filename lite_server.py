@@ -500,6 +500,10 @@ class AgencyResponseRequest(BaseModel):
 
     message: str
     recipient_agent: str | None = None
+    # r24: when the scheduler fires a job it now sends the job NAME here; a named
+    # job runs as a tracked, revealable session (see get_response_compat). Absent
+    # (a direct/legacy caller) -> the untracked one-shot path, unchanged.
+    job_name: str | None = None
 
 
 @app.get("/health")
@@ -1603,13 +1607,19 @@ async def chat_stream(req: ChatRequest):
 async def get_response_compat(req: AgencyResponseRequest):
     """Scheduler compat route: the agency server's POST /{agency}/get_response.
 
-    scheduler/client.py fires each job here as {"message", "recipient_agent"?}.
-    Every call runs on a FRESH ClaudeSDKClient — never the long-lived chat
-    client — so a scheduled 7am brief cannot pollute the user's chat context,
-    and it is safe to run concurrently with /chat. recipient_agent is accepted
-    for API parity but ignored (single agent).
+    scheduler/client.py fires each job here as {"message", "recipient_agent"?,
+    "job_name"?}. A NAMED job (r24) runs as a TRACKED depth-0 session so the
+    desktop app can reveal it as a live chat card bound to the run; an unnamed /
+    direct caller keeps the legacy untracked one-shot. Either way the run is on
+    a client SEPARATE from the long-lived chat client, so a scheduled 7am brief
+    cannot pollute the user's chat context, and it is safe to run concurrently
+    with /chat. recipient_agent is accepted for API parity but ignored.
     """
     try:
+        if req.job_name:
+            # r24: a named scheduled job -> a tracked, revealable session.
+            return await _run_job_as_session(req.message, req.job_name)
+        # legacy / direct caller -> untracked fresh one-shot (unchanged).
         async with ClaudeSDKClient(options=build_options()) as client:
             await client.query(req.message)
             return await _collect_response(client)
@@ -2068,8 +2078,8 @@ async def deck_pptx(req: DeckPptxRequest):
 #
 # Shape (fixed contract with app/sessions.js + tests):
 #   POST   /sessions                {"name"?}    -> {"id","name"}
-#   GET    /sessions                             -> {"sessions":[{id,name,status,messages_len,parent_id,depth}]}
-#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}],parent_id,depth,browser_nav,canvas_ops}
+#   GET    /sessions                             -> {"sessions":[{id,name,status,messages_len,parent_id,depth,job_name}]}
+#   GET    /sessions/{id}                        -> {id,name,status,messages:[{role,text,ts}],parent_id,depth,job_name,browser_nav,canvas_ops}
 #   (browser_nav + canvas_ops ride ONLY on the detail route the card polls, never the list)
 #   POST   /sessions/{id}/message   {"message"}  -> 202 {"status":"running"} (fire-and-poll)
 #   DELETE /sessions/{id}                        -> {"ok":true}
@@ -2107,6 +2117,11 @@ class _AgentSession:
         self.name = name
         self.parent_id = parent_id
         self.depth = depth
+        # Set when this session is a fired SCHEDULED JOB run (vs a user chat
+        # card): carries the job name so the desktop app can tell a job session
+        # apart from the user's own Agent cards and auto-reveal it as a live
+        # chat card. None for every user/sub-agent session.
+        self.job_name: str | None = None
         self.model: str | None = None  # per-session model override; None -> _resolved_model()
         # A model change POSTed while this session is mid-turn cannot touch the
         # client the running turn is already using; this flag tells the turn's
@@ -2235,7 +2250,7 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
         if _sessions.get(sess.id) is not sess:
             sess.status = "idle"
             await _close_session_client(sess)
-            return
+            return {"response": "", "error": True}
         try:
             if sess.client is None:
                 # ONLY depth-0 (card-level) sessions get the spawn orchestra
@@ -2257,16 +2272,19 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
             result = await _collect_response(sess.client)
             _append_session_message(sess, "assistant", result["response"])
             sess.status = "error" if result.get("error") else "idle"
+            # Return the drained result so a SYNCHRONOUS caller (the scheduled-job
+            # route, which awaits this turn to completion for the run ledger) can
+            # read the reply. Harmless to the fire-and-forget caller (_start_turn
+            # wraps this coroutine in a task and never reads its result).
+            return result
         except Exception as exc:  # noqa: BLE001 - surface in-band, never crash the task
-            _append_session_message(
-                sess,
-                "assistant",
-                f"Atelier hit an error and could not finish that turn: {exc}",
-            )
+            err = f"Atelier hit an error and could not finish that turn: {exc}"
+            _append_session_message(sess, "assistant", err)
             sess.status = "error"
             # The transport may be wedged (dead CLI subprocess); drop the client
             # so the next message reconnects fresh — mirrors _reset_chat_client.
             await _close_session_client(sess)
+            return {"response": err, "error": True}
         finally:
             _touch_session(sess)
             # A model change landed mid-turn (set_session_model's running
@@ -2280,6 +2298,61 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
             # lazy connect above, leaving a live client on the detached object.
             if _sessions.get(sess.id) is not sess:
                 await _close_session_client(sess)
+
+
+async def _make_room_for_job() -> bool:
+    """Make room for a scheduled-job session WITHOUT evicting the user's own
+    cards: reclaim only FINISHED (idle/error) sessions that are themselves jobs,
+    by LRU. True once the cap has room; a cap saturated by live USER cards
+    yields False (the job then runs untracked rather than nuking a user's chat).
+    Old completed job sessions recycle their own slots this way."""
+    while len(_sessions) >= _max_sessions():
+        evictable = [
+            s for s in _sessions.values()
+            if s.status != "running" and s.job_name is not None
+        ]
+        if not evictable:
+            return False
+        victim = min(evictable, key=lambda s: s.last_used)
+        _sessions.pop(victim.id, None)
+        await _close_session_client(victim)
+    return True
+
+
+async def _run_job_as_session(message: str, job_name: str) -> dict:
+    """Run a fired scheduled job as a TRACKED depth-0 _AgentSession so the
+    desktop app can reveal it as a live chat card bound to the run: the
+    transcript populates during the await (GET /sessions/{id} is served at the
+    loop's await points), and a job that delegates via SpawnAgent gets child
+    cards + arrows like any orchestrator (depth-0 -> full orchestra). Awaits to
+    completion and returns {response, error} in the EXACT shape _collect_response
+    yields, so the scheduler's run ledger + retry logic are untouched. Falls
+    back to an untracked one-shot when the cap is full of live user cards. The
+    session lingers (idle/error) for after-the-fact viewing until a later job
+    recycles its slot (or the app quits)."""
+    if not await _make_room_for_job():
+        async with ClaudeSDKClient(options=build_options()) as client:
+            await client.query(message)
+            return await _collect_response(client)
+    sess = _AgentSession(uuid.uuid4().hex, job_name)
+    sess.job_name = job_name
+    _sessions[sess.id] = sess
+    # a leading display-only note so the card reads as a scheduled job, not a
+    # user message (render-only; never replayed to the model)
+    _append_session_message(sess, "note", f'Scheduled job "{job_name}" fired')
+    _append_session_message(sess, "user", message)
+    sess.status = "running"
+    _touch_session(sess)
+    result = await _run_session_turn(sess, message)
+    # The run is done and the transcript is preserved in sess.messages for
+    # after-the-fact viewing, but a FINISHED job must not hold a live CLI
+    # subprocess until LRU reclaims it (the old untracked async-with path tore
+    # the client down immediately). Drop it now; a user message to the revealed
+    # card rebuilds it via ensureSession -> _run_session_turn's `client is None`
+    # path. Idempotent (no-op if the turn already closed it, or the session was
+    # deleted mid-run — the turn's finally handles that race).
+    await _close_session_client(sess)
+    return result
 
 
 class SessionCreateRequest(BaseModel):
@@ -2322,6 +2395,7 @@ async def list_sessions():
                 "messages_len": len(s.messages),
                 "parent_id": s.parent_id,
                 "depth": s.depth,
+                "job_name": s.job_name,
             }
             for s in _sessions.values()
         ]
@@ -2341,6 +2415,7 @@ async def get_session(session_id: str):
         "parent_id": sess.parent_id,
         "depth": sess.depth,
         "model": sess.model,
+        "job_name": sess.job_name,
         "browser_nav": sess.browser_nav,
         "canvas_ops": list(sess.canvas_ops),
     }

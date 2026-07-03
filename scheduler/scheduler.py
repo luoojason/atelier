@@ -287,6 +287,7 @@ def make_runner(job, base_url, agency, app_token, runs_log):
                 job["prompt"],
                 agent=job.get("agent"),
                 app_token=app_token,
+                job_name=name,  # r24: backend reveals the run as a live card
             )
 
         started = time.monotonic()

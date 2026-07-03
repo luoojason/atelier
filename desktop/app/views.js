@@ -1037,6 +1037,32 @@
       tour.start();
     });
 
+    // 'Live job cards' toggle (r24): when ON (default), a fired scheduled job
+    // auto-reveals as a live chat card on the dashboard (app/jobcards.js). The
+    // preference is a RAW localStorage flag jobcards.js reads; guarded so a
+    // missing module leaves the row a harmless no-op. Same button/DOM cleanup
+    // discipline as the tour row (no timers/bus subscriptions to register).
+    const jobRow = document.createElement('div');
+    jobRow.className = 'vw-kv vw-ctl';
+    const jobLabel = document.createElement('span');
+    jobLabel.className = 'k';
+    jobLabel.textContent = 'Live job cards';
+    const jc = () => window.AtelierJobCards;
+    const jobIsOn = () => {
+      const m = jc();
+      return (m && typeof m.revealOn === 'function') ? m.revealOn() : true;
+    };
+    const jobBtn = btn(jobIsOn() ? 'On' : 'Off', 'vw-btn');
+    jobRow.append(jobLabel, jobBtn);
+    appearCard.appendChild(jobRow);
+    jobBtn.addEventListener('click', () => {
+      const m = jc();
+      if (!m || typeof m.setReveal !== 'function') return; // jobcards absent
+      const next = !jobIsOn();
+      m.setReveal(next);
+      jobBtn.textContent = next ? 'On' : 'Off';
+    });
+
     wrap.append(
       provCard,
       kbCard,
