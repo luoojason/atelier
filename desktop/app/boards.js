@@ -95,6 +95,10 @@
     'atelier:atelier.theme',
     'atelier:palette:theme',
     'atelier:palette:nogrid',
+    // slashcommands.js -> Atelier.store 'atelier.slashcommands' (user-defined
+    // slash commands). GLOBAL so a custom /command follows the user across
+    // every board rather than living on only the board it was created on.
+    'atelier:atelier.slashcommands',
   ];
 
   const stateKey = (id) => BOARD_PREFIX + id + '.state';
