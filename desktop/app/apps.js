@@ -614,9 +614,18 @@
       // Attributes must be set BEFORE insertion — Electron reads
       // partition/useragent at attach time.
       const el = document.createElement('webview');
-      el.setAttribute('partition', 'persist:atelier-browser');
+      // Per-card PROFILE: each browser card gets its own persistent partition
+      // keyed on its stable appId, so two cards are two isolated cookie jars —
+      // you can sign a different Google account into each, and each login
+      // survives restarts (the card restores under the same appId). Falls back
+      // to the legacy shared jar if an appId is somehow absent.
+      const pid = ctl && ctl.appId ? String(ctl.appId).replace(/[^a-z0-9_-]/gi, '') : '';
+      el.setAttribute('partition', pid ? 'persist:atelier-browser-' + pid : 'persist:atelier-browser');
       el.setAttribute('src', 'about:blank');
-      el.setAttribute('useragent', navigator.userAgent.replace(/\s*Electron\/\S+/i, ''));
+      // Present a clean Chrome UA: strip the Electron token AND the app's own
+      // product token (Atelier/x) so sites (Google included) see plain Chrome.
+      el.setAttribute('useragent',
+        navigator.userAgent.replace(/\s*Electron\/\S+/i, '').replace(/\s*Atelier\/\S+/i, ''));
       el.setAttribute('webpreferences', 'autoplayPolicy=no-user-gesture-required');
       el.className = 'atl-frame';
       frameWrap.appendChild(el);
@@ -1021,6 +1030,7 @@
 
     const cleanups = [];
     const ctl = {
+      appId, // exposed so buildBrowser can key its webview partition per card
       setConfig(patch) { Object.assign(cfg, patch); persistDebounced(); },
       setTitle(text) {
         const t = shell.card.querySelector('.card-title');
