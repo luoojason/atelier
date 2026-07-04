@@ -1,0 +1,38 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install pinned test deps
+        run: pip install -r requirements-ci.txt
+      - name: Import smoke (the app's backend must import)
+        run: python -c "import lite_server, scheduler.scheduler; lite_server.build_options(); print('backend imports OK')"
+      - name: Run the test suite
+        run: python -m pytest tests/ -q
+
+  frontend:
+    name: Desktop JS syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: node --check every desktop module
+        run: |
+          set -e
+          for f in desktop/main.js desktop/preload.js desktop/app/*.js; do node --check "$f"; done
+      - name: package.json files are valid JSON
+        run: node -e "require('./package.json'); require('./desktop/package.json')"
