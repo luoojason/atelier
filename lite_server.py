@@ -87,6 +87,7 @@ from scheduler import notify as swarm_notify
 # Pure stdlib Claude Code transcript readers backing /config + /cc/*.
 import cc_usage
 import external_agents
+import external_tools
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -140,18 +141,30 @@ ATELIER_SERVER, ATELIER_ALLOWED_TOOLS = build_atelier_server(LIGHT_TOOLS)
 # Notion tools are served by the atelier MCP server always, but only allowed
 # (and advertised in the system prompt) when a token is configured — same
 # conditional pattern as the govern roster. This keeps the toolset clean when
-# Notion isn't set up.
-NOTION_TOOL_NAMES = [
-    "mcp__atelier__NotionSearch",
-    "mcp__atelier__NotionRead",
-    "mcp__atelier__NotionCreatePage",
-    "mcp__atelier__NotionAppend",
-]
+# Notion isn't set up. NOTION_TOOL_NAMES is DERIVED from the class list so the
+# Claude allowlist and the external tool lane's Notion gating share one source
+# of truth (a class rename can't desync them).
+NOTION_TOOLS = [NotionSearch, NotionRead, NotionCreatePage, NotionAppend]
+NOTION_TOOL_NAMES = [f"mcp__atelier__{cls.__name__}" for cls in NOTION_TOOLS]
 _NOTION_PROMPT = (
     "\n\nNotion is connected: use NotionSearch/NotionRead/NotionCreatePage/"
     "NotionAppend to search, read, create, and append to the user's Notion "
     "workspace as a knowledge base. You can create and append but never delete."
 )
+
+
+def _select_light_tool_specs(notion_enabled: bool) -> list:
+    """The wrapped light-tier SdkMcpTools, Notion-gated exactly as build_options
+    gates the Claude allowlist (Notion tools only when a token is configured).
+
+    One source of truth for BOTH lanes: the Claude CLI path advertises these to
+    the model via ATELIER_ALLOWED_TOOLS / NOTION_TOOL_NAMES (derived from the
+    same LIGHT_TOOLS / NOTION_TOOLS lists), while the external tool lane calls
+    these handlers directly through LiteLLM. Fresh wrap per call is cheap and
+    keeps the emitted schema identical to the Claude server's.
+    """
+    classes = [c for c in LIGHT_TOOLS if notion_enabled or c not in NOTION_TOOLS]
+    return [sdk_tools.wrap_tool(cls) for cls in classes]
 
 
 # --- Provider + model settings store --------------------------------------------
@@ -3022,6 +3035,7 @@ class ExternalAgentRequest(BaseModel):
     api_key: str | None = Field(default=None, max_length=4000)
     model: str | None = Field(default=None, max_length=200)
     adapter: str | None = None
+    tools_enabled: bool | None = None
 
 
 class ExternalMessageRequest(BaseModel):
@@ -3059,6 +3073,73 @@ async def external_agents_message(agent_id: str, req: ExternalMessageRequest):
     if not ok:
         return JSONResponse({"error": text}, status_code=502)
     return {"response": text}
+
+
+async def _external_chat_fallback(agent_id: str, req: ExternalMessageRequest):
+    """Answer via the plain-chat forward() path (no tools), with a one-time note.
+    Used when the model can't do function calling, so the tools lane degrades
+    gracefully instead of erroring."""
+    ok, text = await external_agents.forward(agent_id, req.message, req.history)
+    if not ok:
+        return JSONResponse({"error": text}, status_code=502)
+    return {
+        "response": text,
+        "steps": [],
+        "tools_used": False,
+        "note": "This model can't use tools, so it answered as plain chat.",
+    }
+
+
+@app.post("/external/agents/{agent_id}/agent_message")
+async def external_agents_agent_message(agent_id: str, req: ExternalMessageRequest):
+    """Run one TOOL-USING turn for an external agent — the second, LiteLLM-driven
+    lane. Token-gated (POST). Reuses the light-tier Atelier tool handlers via
+    external_loop (no tool reimplemented; containment preserved inside each
+    handler); degrades to plain chat (forward()) when the endpoint/model can't do
+    function calling. Never 500s and never echoes the key. The Claude CLI lane is
+    untouched. Returns {response, steps, tools_used[, note]}."""
+    agent = next(
+        (a for a in external_agents.load_agents() if a["id"] == agent_id), None
+    )
+    if agent is None:
+        return JSONResponse(
+            {"error": "This external agent is no longer configured."}, status_code=404
+        )
+    if not agent.get("model"):
+        return JSONResponse(
+            {"error": "Set a model on this agent (in Manage agents) to use tools."},
+            status_code=400,
+        )
+    # Known-incapable model (e.g. Perplexity sonar): skip the loop entirely.
+    if not external_agents.model_tools_capable(agent.get("model")):
+        return await _external_chat_fallback(agent_id, req)
+
+    notion_on = bool(load_settings().get("notion_token"))
+    specs = _select_light_tool_specs(notion_on)
+    oai_tools = external_tools.openai_tools_for(specs)
+    by_name = external_tools.dispatch_table(specs)
+
+    # Lazy import keeps litellm off the server's own import path (only the tools
+    # lane needs it); the module is bundled in the packaged backend.
+    import external_loop
+
+    result = await external_loop.run_external_turn(
+        agent, req.message, req.history, oai_tools, by_name
+    )
+    err = result.get("error")
+    if err == "tools-unsupported":
+        # The endpoint rejected the tools field at runtime — fall back to chat.
+        return await _external_chat_fallback(agent_id, req)
+    if result.get("response") is None:
+        reason = err if err not in (None, "no-model") else (
+            "The external agent could not complete the turn."
+        )
+        return JSONResponse({"error": reason}, status_code=502)
+    return {
+        "response": result["response"],
+        "steps": result.get("steps") or [],
+        "tools_used": bool(result.get("steps")),
+    }
 
 
 class SessionGovernRequest(BaseModel):

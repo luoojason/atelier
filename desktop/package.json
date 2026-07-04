@@ -38,6 +38,8 @@
           "lite_server.py",
           "cc_usage.py",
           "external_agents.py",
+          "external_tools.py",
+          "external_loop.py",
           "config.py",
           "helpers.py",
           "run_utils.py",

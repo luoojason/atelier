@@ -36,6 +36,28 @@ import httpx  # already bundled (used by shared_tools/notion_tools)
 
 ADAPTERS = ("openai",)
 _DEFAULT_ADAPTER = "openai"
+
+# Models KNOWN not to support user tool-calling (search-grounded answer models,
+# or reasoning-only models that ignore/reject a tools field). Advisory only: the
+# external tool loop's typed-error fallback is the real gate. This list lets the
+# UI grey the tools toggle up front and lets the agent_message route skip
+# straight to plain chat with a note. Kept conservative on substrings so a
+# tool-capable model is never mislabeled (e.g. no bare "llama3" — the Ollama
+# preset default is changed to a tool-capable model instead).
+_INCAPABLE_SUBSTRINGS = ("sonar",)
+_INCAPABLE_EXACT = frozenset({"deepseek-reasoner", "deepseek-r1"})
+
+
+def model_tools_capable(model: str) -> bool:
+    """False for a model known not to support user tool-calling; True when
+    capable or unknown (blank/custom names default to capable so the runtime
+    fallback decides). Substring match stays narrow to avoid false negatives."""
+    m = (model or "").strip().lower()
+    if not m:
+        return True
+    if m in _INCAPABLE_EXACT:
+        return False
+    return not any(s in m for s in _INCAPABLE_SUBSTRINGS)
 _TIMEOUT = 90.0
 _MAX_HISTORY = 40           # trailing turns forwarded (a stateless endpoint's context)
 _MAX_MSG_CHARS = 200_000    # matches the session message ceiling
@@ -83,6 +105,7 @@ def load_agents() -> list[dict]:
                 "api_key": str(item.get("api_key") or ""),
                 "model": str(item.get("model") or "").strip()[:_MODEL_MAX],
                 "adapter": adapter if adapter in ADAPTERS else _DEFAULT_ADAPTER,
+                "tools_enabled": bool(item.get("tools_enabled")),
             }
         )
     return out
@@ -133,6 +156,8 @@ def sanitize(agent: dict) -> dict:
         "adapter": agent.get("adapter") or _DEFAULT_ADAPTER,
         "key_present": bool(key),
         "key_hint": _key_hint(key),
+        "tools_enabled": bool(agent.get("tools_enabled")),
+        "tools_capable": model_tools_capable(agent.get("model") or ""),
     }
 
 
@@ -172,6 +197,14 @@ def upsert(payload: dict) -> tuple[bool, str | dict]:
     else:
         api_key = existing.get("api_key", "") if existing else ""
 
+    # tools_enabled: an omitted field on an UPDATE keeps the stored value (so an
+    # unrelated edit never silently disables tools); present -> its truthiness.
+    te = payload.get("tools_enabled")
+    if te is None:
+        tools_enabled = bool(existing.get("tools_enabled")) if existing else False
+    else:
+        tools_enabled = bool(te)
+
     record = {
         "id": aid,
         "name": name[:_NAME_MAX],
@@ -179,6 +212,7 @@ def upsert(payload: dict) -> tuple[bool, str | dict]:
         "api_key": api_key,
         "model": str(payload.get("model") or "").strip()[:_MODEL_MAX],
         "adapter": adapter,
+        "tools_enabled": tools_enabled,
     }
     if existing is not None:
         agents = [record if a["id"] == aid else a for a in agents]
