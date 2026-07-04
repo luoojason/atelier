@@ -68,4 +68,12 @@ contextBridge.exposeInMainWorld('atelier', {
   revealFolder: (dirPath) =>
     ipcRenderer.invoke('atelier:reveal-folder', dirPath)
       .catch((e) => ({ error: String((e && e.message) || e) })),
+  // UploadFile: attach a workspace file to a file <input> on a browser-card
+  // webview via main-process CDP (renderer JS cannot set a file input to a
+  // path). arg = { webContentsId, selector, path }. path is the backend-resolved
+  // absolute workspace path; main re-checks it is inside the workspace. Resolves
+  // { ok, text } | { ok:false, error }; never rejects.
+  uploadToWebview: (arg) =>
+    ipcRenderer.invoke('atelier:upload-to-webview', arg)
+      .catch((e) => ({ ok: false, error: String((e && e.message) || e) })),
 });

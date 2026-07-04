@@ -555,6 +555,7 @@
     let lastCanvasOpSeq = 0; // r22: highest agent-requested canvas_op.seq handled
     let lastReadSeq = 0;    // r32: highest agent-requested browser_read.seq handled
     let lastActSeq = 0;     // r33: highest agent-requested browser_act.seq handled
+    let lastUploadSeq = 0;  // highest agent-requested browser_upload.seq handled
     let attachBaselined = false; // r22: attached cards adopt existing seqs once
     let spawnedBelow = 0;   // r23: cascade counter for cards spawned below this one
 
@@ -744,6 +745,50 @@
           setNote('Agent tried to ' + action + ' the linked browser but no page was loaded yet.');
         }
       }).catch(() => { post({ ok: false, error: 'the page action failed' }); });
+    }
+
+    // UploadFile: the agent attaches a workspace file to a file <input> on the
+    // linked browser card. Same round-trip shape as handleBrowserAct; the actual
+    // attach is done by the main process via CDP (browserUpload -> upload bridge).
+    function handleBrowserUpload(up) {
+      if (closed || !up || typeof up.seq !== 'number') return;
+      if (up.seq <= lastUploadSeq) return; // already handled (polls repeat it)
+      lastUploadSeq = up.seq;
+      const req = up.req;
+      if (typeof req !== 'number' || !sessionId) return;
+      const post = (body) => {
+        apiJson('/sessions/' + sessionId + '/browser_result', {
+          method: 'POST',
+          body: JSON.stringify(Object.assign({ req: req }, body)),
+        }).catch(() => { /* the tool times out on its own if this never lands */ });
+      };
+      const links = window.Atelier && window.Atelier.links;
+      const browserEl = (links && typeof links.browserElFor === 'function')
+        ? links.browserElFor(card) : null;
+      const api = window.AtelierApps;
+      if (!browserEl || !api || typeof api.browserUpload !== 'function') {
+        setNote('Agent tried to upload a file but no browser card is linked — '
+          + 'shift-drag a box around a browser card and this card, or ask it to '
+          + 'open one first.');
+        post({ ok: false, error: 'no browser card is linked to this agent' });
+        return;
+      }
+      setNote('Agent is attaching a file to the linked browser…');
+      let p = null;
+      try { p = api.browserUpload(browserEl, String(up.selector || ''), String(up.path || '')); }
+      catch { p = null; }
+      Promise.resolve(p).then((out) => {
+        if (out && typeof out === 'object' && out.ok) {
+          post({ ok: true, text: String(out.text || 'File attached.') });
+          setNote('Agent attached a file to the linked browser.');
+        } else if (out && typeof out === 'object') {
+          post({ ok: false, error: String(out.error || 'the upload failed') });
+          setNote('Agent could not attach the file (' + String(out.error || 'no match') + ').');
+        } else {
+          post({ ok: false, error: 'the linked browser had no page to upload to' });
+          setNote('Agent tried to upload a file but no page was loaded yet.');
+        }
+      }).catch(() => { post({ ok: false, error: 'the upload failed' }); });
     }
 
     // Position for a card the agent spawns below this one. The right lane (used
@@ -1000,6 +1045,8 @@
           if (br && typeof br.seq === 'number') lastReadSeq = br.seq;
           const ba = r.data.browser_act;  // r33: same adopt-not-act on re-reveal
           if (ba && typeof ba.seq === 'number') lastActSeq = ba.seq;
+          const bu = r.data.browser_upload; // same adopt-not-act on re-reveal
+          if (bu && typeof bu.seq === 'number') lastUploadSeq = bu.seq;
           const ops = Array.isArray(r.data.canvas_ops) ? r.data.canvas_ops : [];
           for (const op of ops) {
             if (op && typeof op.seq === 'number' && op.seq > lastCanvasOpSeq) {
@@ -1020,6 +1067,7 @@
       // spawns/links the browser first, then reads it in the same cycle.
       handleBrowserRead(r.data.browser_read);
       handleBrowserAct(r.data.browser_act); // r33: click/type the linked browser
+      handleBrowserUpload(r.data.browser_upload); // attach a workspace file to a file input
       if (r.data.status === 'running') {
         showThinking();
         schedulePoll();

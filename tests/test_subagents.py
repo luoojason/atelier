@@ -1148,7 +1148,12 @@ def test_build_options_no_delegate_when_session_has_no_children():
     assert "mcp__orchestra__DelegateToSubagent" not in opts.allowed_tools
     # a depth-0 spawner still gets the spawn tools even with no children
     assert "mcp__orchestra__SpawnAgent" in opts.allowed_tools
-    assert opts.system_prompt == lite_server.ATELIER_INSTRUCTIONS
+    # no children -> no DelegateToSubagent roster line ...
+    assert "You govern these sub-agent cards" not in opts.system_prompt
+    # ... but a depth-0 spawner DOES get the delegate-first / step-budget
+    # guidance appended after the base instructions.
+    assert opts.system_prompt.startswith(lite_server.ATELIER_INSTRUCTIONS)
+    assert "DELEGATE the heavy work" in opts.system_prompt
 
 
 def test_build_options_depth0_with_children_gets_both_spawn_and_delegate():
@@ -1377,3 +1382,134 @@ def test_delegate_blocked_at_max_depth():
         " delegate further down this chain."
     )
     assert child.messages == []
+
+
+# ── UploadFile (the 10th orchestra tool) ─────────────────────────────────────
+# Same round-trip channel as Click/Type (stamps sess.browser_upload, blocks on a
+# req-keyed future resolved by POST browser_result), PLUS a workspace-containment
+# gate on the path: the agent can only upload a file it wrote inside its own
+# workspace, and the RESOLVED ABSOLUTE path is what travels to the main process.
+
+def _upload_handler(parent_id):
+    """The UploadFile handler coroutine (the 10th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[9].handler
+
+
+def _iso_workspace(monkeypatch, tmp_path):
+    """Point workspace_root() at an empty tmp dir (settings shadowed out)."""
+    monkeypatch.setenv("ATELIER_SETTINGS_PATH", str(tmp_path / "nope.json"))
+    monkeypatch.setenv("ATELIER_WORKSPACE", str(tmp_path / "ws"))
+    ws = tmp_path / "ws"
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
+
+
+async def _drive_upload(parent, args, result):
+    """Fire UploadFile(args), wait for it to stamp browser_upload + register its
+    waiter, resolve that waiter with `result` (the card's ack), return tool text."""
+    upload = _upload_handler(parent.id)
+    task = asyncio.create_task(upload(args))
+    for _ in range(1000):
+        if parent.browser_upload is not None and (
+            parent.browser_upload["req"] in lite_server._browser_read_waiters
+        ):
+            break
+        await asyncio.sleep(0)
+    assert parent.browser_upload is not None
+    req = parent.browser_upload["req"]
+    lite_server._browser_read_waiters[req].set_result(result)
+    return _text(await task)
+
+
+def test_upload_requires_selector_and_path(captured):
+    parent = _register_parent()
+    up = _upload_handler(parent.id)
+    assert "selector is required" in _text(_call(up, {"path": "a.mp4"}))
+    assert "path is required" in _text(_call(up, {"selector": "input"}))
+    assert parent.browser_upload is None  # neither reached the round-trip
+
+
+def test_upload_rejects_path_outside_workspace(captured, monkeypatch, tmp_path):
+    _iso_workspace(monkeypatch, tmp_path)
+    parent = _register_parent()
+    up = _upload_handler(parent.id)
+    for bad in ("../secret.txt", "/etc/passwd", "a/../../b"):
+        text = _text(_call(up, {"selector": "input[type=file]", "path": bad}))
+        assert "Cannot upload that path" in text, bad
+    assert parent.browser_upload is None  # the gate refuses BEFORE stamping
+
+
+def test_upload_rejects_missing_file(captured, monkeypatch, tmp_path):
+    _iso_workspace(monkeypatch, tmp_path)
+    parent = _register_parent()
+    up = _upload_handler(parent.id)
+    text = _text(_call(up, {"selector": "input", "path": "not-there.mp4"}))
+    assert "No file at workspace path" in text
+    assert parent.browser_upload is None
+
+
+def test_upload_round_trip_stamps_abs_path_and_acks(captured, monkeypatch, tmp_path):
+    ws = _iso_workspace(monkeypatch, tmp_path)
+    (ws / "clip.mp4").write_bytes(b"\x00\x01video")
+    parent = _register_parent()
+    text = asyncio.run(_drive_upload(
+        parent,
+        {"selector": "input[type=file]", "path": "clip.mp4"},
+        {"ok": True, "text": "Attached clip.mp4 to input[type=file]."},
+    ))
+    assert "Attached clip.mp4" in text
+    assert parent.browser_upload["action"] == "upload"
+    assert parent.browser_upload["selector"] == "input[type=file]"
+    # the stamp carries the RESOLVED ABSOLUTE path inside the workspace
+    assert parent.browser_upload["path"] == str((ws / "clip.mp4").resolve())
+    assert set(parent.browser_upload) >= {"req", "seq", "action", "selector", "path"}
+    assert lite_server._browser_read_waiters == {}  # no waiter leak
+
+
+def test_upload_reports_a_failed_ack(captured, monkeypatch, tmp_path):
+    ws = _iso_workspace(monkeypatch, tmp_path)
+    (ws / "clip.mp4").write_bytes(b"x")
+    parent = _register_parent()
+    text = asyncio.run(_drive_upload(
+        parent,
+        {"selector": "#nope", "path": "clip.mp4"},
+        {"ok": False, "error": "that element is not a file <input>"},
+    ))
+    assert "Could not upload" in text
+    assert "not a file" in text
+
+
+def test_upload_detail_route_carries_browser_upload(client, captured, monkeypatch, tmp_path):
+    ws = _iso_workspace(monkeypatch, tmp_path)
+    (ws / "clip.mp4").write_bytes(b"x")
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["browser_upload"] is None
+    parent = lite_server._sessions[sid]
+
+    async def scenario():
+        up = _upload_handler(sid)
+        task = asyncio.create_task(up({"selector": "input", "path": "clip.mp4"}))
+        for _ in range(1000):
+            if parent.browser_upload is not None:
+                break
+            await asyncio.sleep(0)
+        req = parent.browser_upload["req"]
+        lite_server._browser_read_waiters[req].set_result({"ok": True, "text": "ok"})
+        await task
+
+    asyncio.run(scenario())
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["browser_upload"] is not None
+    assert detail["browser_upload"]["seq"] >= 1
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "browser_upload" not in s  # list route never carries it
+
+
+def test_upload_times_out_without_a_result(captured, monkeypatch, tmp_path):
+    ws = _iso_workspace(monkeypatch, tmp_path)
+    (ws / "clip.mp4").write_bytes(b"x")
+    monkeypatch.setattr(lite_server, "_BROWSER_ACT_TIMEOUT", 0.05)
+    parent = _register_parent()
+    up = _upload_handler(parent.id)
+    text = _text(_call(up, {"selector": "input", "path": "clip.mp4"}))
+    assert "did not confirm" in text
