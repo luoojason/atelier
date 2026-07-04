@@ -185,7 +185,7 @@ cython_debug/
 third_party/
 .claude/
 .venv-ext/
-.openswarm/
+.atelier/
 
 desktop/node_modules/
 desktop/dist/

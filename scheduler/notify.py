@@ -19,7 +19,7 @@ agency_swarm / apscheduler / pydantic and never touches the network or a real
 vault.
 
 The JSONL sink path comes from ``SWARM_NOTIFICATIONS``
-(default ``~/.openswarm/notifications.jsonl``).
+(default ``~/.atelier/notifications.jsonl``).
 
 AIEOS event shape
 -----------------
@@ -41,7 +41,7 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-DEFAULT_NOTIFICATIONS = "~/.openswarm/notifications.jsonl"
+DEFAULT_NOTIFICATIONS = "~/.atelier/notifications.jsonl"
 
 # AIEOS timeline event defaults (see module docstring).
 EVENT_PATH = "/timeline/event"

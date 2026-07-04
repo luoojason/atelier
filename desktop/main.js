@@ -175,7 +175,7 @@ function killBackend() {
 // ── scheduler daemon ────────────────────────────────────────────────────────
 // Second sidecar: scheduler/scheduler.py fires the vault jobs in
 // ~/.atelier/jobs.yaml (JOBS_FILE, declared with the config up top) at the lite
-// backend (POST /open-swarm/get_response), populating ~/.openswarm/runs.jsonl
+// backend (POST /open-swarm/get_response), populating ~/.atelier/runs.jsonl
 // so the app's live widgets show real data.
 
 let schedulerProc = null;

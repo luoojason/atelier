@@ -19,7 +19,7 @@ import warnings
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_MEMORY_PATH = "~/.openswarm/swarm_memory.json"
+DEFAULT_MEMORY_PATH = "~/.atelier/swarm_memory.json"
 
 
 def memory_path() -> Path:

@@ -71,6 +71,7 @@ if str(_HERE.parent) not in sys.path:
     sys.path.insert(0, str(_HERE.parent))
 
 from scheduler import client, digest, notify, retry, run_store
+from shared_tools.state_migrate import migrate_legacy_state
 from scheduler.jobs_core import (
     build_trigger,
     format_run_line,
@@ -707,6 +708,11 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    # Copy legacy ~/.openswarm state forward into ~/.atelier before the daemon
+    # reads/writes the runs ledger + notifications, so the state-dir rename does
+    # not orphan a returning user's data (idempotent; lite_server does the same).
+    migrate_legacy_state()
 
     jobs_file = resolve_jobs_file()
     base_url = resolve_base_url()
