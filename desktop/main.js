@@ -607,6 +607,15 @@ if (!app.requestSingleInstanceLock()) {
     // working as soon as the backend answers (its cold import can take 15-30s).
     createWindow();
 
+    // Re-open the window on dock-icon activation (macOS). Registered HERE, inside
+    // whenReady, on purpose: the 'activate' event can fire before the app is ready
+    // during launch, and creating a BrowserWindow before ready throws
+    // "Cannot create BrowserWindow before app is ready" — the crash users hit on
+    // every open. Inside whenReady, activate only ever runs post-launch.
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+
     const ready = await waitForBackend();
     // Spawn the scheduler after the health wait either way. Sequencing behind a
     // healthy backend is only a nicety (a job firing into a dead backend just
@@ -638,10 +647,6 @@ if (!app.requestSingleInstanceLock()) {
         );
       }
     }
-  });
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 
   app.on('window-all-closed', () => {
