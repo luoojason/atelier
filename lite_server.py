@@ -1148,9 +1148,9 @@ async def config():
     """
     token_present = bool(os.getenv("ATELIER_TOKEN", ""))
     try:
-        max_turns = int(os.getenv("ATELIER_MAX_TURNS", "40"))
+        max_turns = int(os.getenv("ATELIER_MAX_TURNS", "60"))
     except ValueError:
-        max_turns = 40
+        max_turns = 60
     settings = load_settings()
     key = settings.get("anthropic_api_key") or ""
     return {
