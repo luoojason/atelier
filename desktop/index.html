@@ -227,6 +227,12 @@
     <script defer src="app/focus.js"></script>
     <script defer src="app/ledger.js"></script>
     <script defer src="app/sound.js"></script>
+    <!-- Phase 5 growth: re-runnable/shareable Playbooks, an honest Free/Pro plans
+         panel, and a Playbook marketplace. Playbook loads before market (market
+         consumes window.AtelierPlaybook). Self-contained modules. -->
+    <script defer src="app/playbook.js"></script>
+    <script defer src="app/plans.js"></script>
+    <script defer src="app/market.js"></script>
     <!-- recipes.js loads last: a full-canvas "front door" that greets an empty
          board with a gallery of ready-to-run recipes, spawns an orchestrator
          agent card for the chosen one, and narrates the run. Its board:switched
