@@ -56,11 +56,8 @@ dependencies = [
     "httpx",
 ]
 
-[project.scripts]
-openswarm = "run_utils:main"
-
 [tool.setuptools]
-py-modules = ["agency", "swarm", "helpers", "config", "server", "run_utils"]
+py-modules = ["agency", "helpers", "config", "run_utils"]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -70,7 +67,7 @@ exclude = ["agentswarm-cli*", "venv*", ".venv*", ".agency_swarm*", "node_modules
 "*" = ["*.md", "*.json", "*.mjs", "agency-*"]
 
 [tool.setuptools.data-files]
-"." = ["openswarm.config.mjs", "openswarm.product-env.json", "package.json"]
+"." = ["package.json"]
 "patches" = ["patches/dom-to-pptx+1.1.5.patch"]
 
 [tool.pytest.ini_options]

@@ -23,7 +23,6 @@ _ENV_EXAMPLE = os.path.join(_REPO_ROOT, ".env.example")
 _SHARED_INSTRUCTIONS = os.path.join(_REPO_ROOT, "shared_instructions.md")
 _ORCHESTRATOR_PY = os.path.join(_REPO_ROOT, "orchestrator", "orchestrator.py")
 _ORCHESTRATOR_INSTRUCTIONS = os.path.join(_REPO_ROOT, "orchestrator", "instructions.md")
-_SMOKE_RUN_MODE = os.path.join(_REPO_ROOT, "scripts", "smoke-run-mode.py")
 
 _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
 
@@ -69,11 +68,6 @@ def test_orchestrator_instructions_use_orchestrator_not_agent_swarm():
     text = open(_ORCHESTRATOR_INSTRUCTIONS, encoding="utf-8").read()
     assert "Agent Swarm" not in text, "stale coordinator label 'Agent Swarm' in orchestrator/instructions.md"
     assert "Orchestrator" in text
-
-
-def test_smoke_expected_entry_agent_matches_code_name():
-    text = open(_SMOKE_RUN_MODE, encoding="utf-8").read()
-    assert 'EXPECTED_ENTRY_AGENT = "Orchestrator"' in text
 
 
 def _run_all():
