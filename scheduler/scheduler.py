@@ -28,7 +28,7 @@ Configuration (all via environment):
     SWARM_JOBS_FILE   path to jobs YAML            (default: scheduler/jobs.yaml,
                                                     falls back to jobs.example.yaml)
     SWARM_BASE_URL    agency base URL              (default: http://localhost:8080)
-    SWARM_AGENCY      agency name / route segment  (default: open-swarm)
+    SWARM_AGENCY      agency name / route segment  (default: atelier)
     SWARM_APP_TOKEN   bearer token for the server  (falls back to APP_TOKEN;
                                                     omit if the server has no token)
     SWARM_RUNS_LOG    append-only run log path     (default: scheduler/runs.log)
@@ -85,7 +85,7 @@ DEFAULT_JOBS_FILE = _HERE / "jobs.yaml"
 EXAMPLE_JOBS_FILE = _HERE / "jobs.example.yaml"
 DEFAULT_RUNS_LOG = _HERE / "runs.log"
 DEFAULT_BASE_URL = "http://localhost:8080"
-DEFAULT_AGENCY = "open-swarm"
+DEFAULT_AGENCY = "atelier"
 
 # Retry + ledger tuning (all overridable via env).
 DEFAULT_MAX_RETRIES = 2
