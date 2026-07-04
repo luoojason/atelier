@@ -355,6 +355,13 @@
   // handler, so the key survives and drives the restore. Attached sub-agent
   // cards are NOT owned (they re-reveal from the sweep once the parent is back).
   const OWNED_KEY = 'atelier.agentcards';
+  // True only while a board switch is tearing the canvas down. A card:removed
+  // during a switch means "this card is leaving the current board's canvas",
+  // NOT "the user deleted this conversation" — so its backend session and its
+  // restore entry are preserved (returning to the board, or reopening the app,
+  // rebuilds the layer). An explicit close (× ) happens with this false and
+  // does the full teardown + DELETE.
+  let switchingBoards = false;
   function readOwned() {
     const v = A.store.get(OWNED_KEY, []);
     return Array.isArray(v) ? v.filter((r) => r && r.id) : [];
@@ -1139,25 +1146,30 @@
       offLinkRem();
       if (sessionId) {
         untrackSession(sessionId);
-        // r37: an explicit close removes this card from the restore list. A
-        // board switch / app quit does NOT reach here as a user-intended
-        // delete of the CONVERSATION — but board switch does fire card:removed,
-        // and the outgoing board's snapshot was already taken before it, so the
-        // key it saved still lists the card; app quit never fires this at all.
-        unownCard(sessionId);
-        // dismissed BEFORE the async DELETE: a sweep response already in
-        // flight can still list this child, and without the set it would be
-        // re-revealed as a dead card mid-deletion.
-        dismissedSessions.add(sessionId);
-        // r24: a job card (keepAlive) is a VIEW onto a still-running scheduled
-        // job — DELETE would abort the run and destroy its transcript, so skip
-        // it; LRU reclaims the session once the job finishes. Every other card
-        // frees its backend session on close (best-effort; the backend also
-        // reclaims leaked sessions via the LRU cap). An attached agent card
-        // deletes the CHILD session too — the parent's CheckAgent then reports
-        // it gone, which the backend handles gracefully.
-        if (!keepAlive) {
-          apiJson('/sessions/' + sessionId, { method: 'DELETE' }).catch(() => {});
+        if (switchingBoards) {
+          // r39: a board switch is tearing the canvas down — this card is just
+          // leaving the view, not being deleted. Keep the backend session AND
+          // the restore entry so switching back (or reopening the app) rebuilds
+          // the whole layer. The board's snapshot was already taken above it, so
+          // the outgoing board still lists this card. No unown, no dismiss, no
+          // DELETE. (The backend LRU cap still reclaims if sessions pile up.)
+        } else {
+          // r37: an explicit close removes this card from the restore list.
+          unownCard(sessionId);
+          // dismissed BEFORE the async DELETE: a sweep response already in
+          // flight can still list this child, and without the set it would be
+          // re-revealed as a dead card mid-deletion.
+          dismissedSessions.add(sessionId);
+          // r24: a job card (keepAlive) is a VIEW onto a still-running scheduled
+          // job — DELETE would abort the run and destroy its transcript, so skip
+          // it; LRU reclaims the session once the job finishes. Every other card
+          // frees its backend session on close (best-effort; the backend also
+          // reclaims leaked sessions via the LRU cap). An attached agent card
+          // deletes the CHILD session too — the parent's CheckAgent then reports
+          // it gone, which the backend handles gracefully.
+          if (!keepAlive) {
+            apiJson('/sessions/' + sessionId, { method: 'DELETE' }).catch(() => {});
+          }
         }
       }
     });
@@ -1282,7 +1294,16 @@
   // does not emit 'boards:switched' (the active board's state IS the live keys),
   // so kick a restore on load — it retries until the backend is reachable — and
   // re-run it after every board switch (the newly-mounted board's key is live).
-  A.bus.on('boards:switched', () => { restoreOwnedCards(); });
+  // switchTo() emits will-switch, then `await captureThumb()`, THEN
+  // removeAllCards() (boards.js:308-316). The flag must stay true across that
+  // await — a timer-based clear would fire in the gap and let the cards delete —
+  // so it is cleared ONLY by boards:switched, which fires after removeAllCards.
+  // A switch that ABORTS at the quota gate never emits switched, so the flag can
+  // linger true until the next switch; worst case an explicit close then skips
+  // its DELETE and the backend LRU cap reclaims that one session later. That
+  // rare, self-healing leak is well worth not deleting every layer on a switch.
+  A.bus.on('boards:will-switch', () => { switchingBoards = true; });
+  A.bus.on('boards:switched', () => { switchingBoards = false; restoreOwnedCards(); });
   restoreOwnedCards();
 
   // ── self-check ─────────────────────────────────────────────────────────────

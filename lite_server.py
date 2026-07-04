@@ -432,6 +432,12 @@ async def _reset_chat_client() -> None:
 async def _lifespan(app: FastAPI):
     # Nothing to warm up; the chat client connects lazily on first /chat.
     yield
+    # Final flush on graceful shutdown. The desktop app SIGTERMs the backend on
+    # window close, which unwinds this lifespan; persisting here guarantees a
+    # clean quit saves the exact current session state, not merely whatever the
+    # last per-turn persist happened to capture. (The teardown below then clears
+    # _sessions, so this MUST run first.)
+    _persist_sessions()
     global _chat_client
     if _chat_client is not None:
         try:

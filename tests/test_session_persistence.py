@@ -119,3 +119,18 @@ def test_routes_persist_create_and_delete(monkeypatch):
     client.delete(f"/sessions/{sid}")
     data = json.load(open(lite_server._sessions_file()))
     assert not any(s["id"] == sid for s in data["sessions"])
+
+
+def test_lifespan_shutdown_flushes_sessions():
+    # A clean app quit SIGTERMs the backend, unwinding the FastAPI lifespan. That
+    # teardown clears _sessions, so it MUST persist first — otherwise a session
+    # created since the last per-turn save would be lost on close.
+    from fastapi.testclient import TestClient
+
+    s = _sess("life" * 8, "LifeTest")
+    s.messages = [{"role": "user", "text": "remember me"}]
+    with TestClient(lite_server.app):
+        pass  # context exit unwinds the lifespan -> shutdown flush + teardown
+
+    data = json.load(open(lite_server._sessions_file()))
+    assert ("life" * 8) in [r["id"] for r in data["sessions"]]
