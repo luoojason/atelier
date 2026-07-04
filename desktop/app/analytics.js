@@ -290,7 +290,7 @@
 
   function renderTiles(host, d) {
     if (!d || typeof d !== 'object') {
-      note(host, 'No Claude Code data found.');
+      note(host, 'No usage data found.');
       return;
     }
     host.replaceChildren();
@@ -801,7 +801,7 @@
         if (sig.aborted || (err && err.name === 'AbortError')) return;
         hosts.forEach((h) => note(h, msg));
       };
-      const UNAVAILABLE = 'Claude Code data unavailable.';
+      const UNAVAILABLE = 'Usage data unavailable.';
 
       ccGet('/cc/status', sig)
         .then(guard((d) => renderTiles(ui.tiles, d)))
@@ -841,7 +841,7 @@
   /* ── registration (views.js may load just after us — retry briefly) ────── */
 
   const DEF = {
-    label: 'Claude Code',
+    label: 'Usage',
     icon: '◍',
     section: 'analytics',
     order: 1,

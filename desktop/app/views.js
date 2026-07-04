@@ -565,7 +565,12 @@
     provCard.className = 'vw-card';
     const provTitle = document.createElement('div');
     provTitle.className = 'vw-card-title';
-    provTitle.textContent = 'Model provider';
+    provTitle.textContent = 'Core agent';
+    const provHelp = document.createElement('div');
+    provHelp.className = 'vw-help';
+    provHelp.textContent =
+      "Atelier's built-in agent runs on Claude. OpenAI, Gemini, and local models "
+      + 'run as external agent cards (Manage external agents).';
 
     const provRow = document.createElement('div');
     provRow.className = 'vw-kv vw-ctl';
@@ -574,8 +579,8 @@
     provLabel.textContent = 'Provider';
     const seg = document.createElement('div');
     seg.className = 'vw-seg';
-    const segSub = btn('Claude Max subscription');
-    const segApi = btn('Anthropic API key');
+    const segSub = btn('Subscription');
+    const segApi = btn('API key');
     seg.append(segSub, segApi);
     provRow.append(provLabel, seg);
     const provNote = noteLine();
@@ -606,7 +611,7 @@
     hintRow.append(hintText, removeBtn);
     const keyNote = noteLine();
 
-    provCard.append(provTitle, provRow, provNote, keyRow, hintRow, keyNote);
+    provCard.append(provTitle, provHelp, provRow, provNote, keyRow, hintRow, keyNote);
 
     const provControls = [segSub, segApi, keyInput, saveBtn, validateBtn, removeBtn];
     function setProvEnabled(on) {

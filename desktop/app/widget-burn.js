@@ -1,6 +1,6 @@
 'use strict';
 
-/* Atelier feature module — Claude Code burn gauge widget ('ccburn')
+/* Atelier feature module — Token burn gauge widget ('ccburn')
    =============================================================================
    Registers ONE widget type via Atelier.registerWidget: a semicircle SVG gauge
    comparing TODAY's Claude Code token burn against the average of the 7 prior
@@ -51,7 +51,7 @@
 
    ── MANUAL TEST ────────────────────────────────────────────────────────────
    1. Backend on :8765, `npm start` in desktop/. Double-click empty canvas →
-      pick "Claude Code burn" → the gauge card appears.
+      pick "Token burn" → the gauge card appears.
    2. With real transcript history: the arc eases to today's burn vs the
       7-day average within a second (needle mid-arc = exactly average), the
       numeric row reads like 'today 1.2B · avg 890M', and the caption states
@@ -269,10 +269,10 @@
   }
 
   A.registerWidget('ccburn', {
-    label: 'Claude Code burn',
+    label: 'Token burn',
     icon: '⌁',
     size: { w: 300, h: 200 },
-    defaultConfig: { title: 'Claude Code burn' },
+    defaultConfig: { title: 'Token burn' },
     fields: [
       { name: 'title', label: 'Title', type: 'text' },
     ],
