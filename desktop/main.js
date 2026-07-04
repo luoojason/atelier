@@ -583,22 +583,42 @@ ipcMain.handle('atelier:reveal-folder', async (event, dirPath) => {
   }
 });
 
+// True if `resolvedRoot` must NOT be trusted as the workspace root — the
+// filesystem root, the home dir, ~/.atelier (the app's config dir), or any
+// ANCESTOR of ~/.atelier — because that would pull the app's own secrets
+// (settings.json's API key, claude-home's OAuth, jobs.yaml) into the upload
+// sandbox. Mirrors shared_tools/workspace_core._unsafe_root, so this guard trusts
+// EXACTLY the root the backend contained the file to (a configured workspace_dir
+// the backend rejected must not be honored here either — that was the bypass).
+function unsafeWorkspaceRoot(resolvedRoot) {
+  if (resolvedRoot === path.dirname(resolvedRoot)) return true; // filesystem root '/'
+  const home = path.resolve(os.homedir());
+  const atelier = path.join(home, '.atelier');
+  // resolvedRoot IS ~/.atelier, or an ANCESTOR of it (home, /Users, / …) — an
+  // ancestor is a strict path prefix of ~/.atelier. (home is caught this way.)
+  return resolvedRoot === atelier || atelier.startsWith(resolvedRoot + path.sep);
+}
+
 // The agent's file-write workspace root, mirroring shared_tools/workspace_core:
-// settings `workspace_dir`, then env ATELIER_WORKSPACE, then ~/.atelier/workspace.
-// Used to CONTAIN uploads independently of the backend (see the handler below).
+// settings `workspace_dir` -> env ATELIER_WORKSPACE -> ~/.atelier/workspace, with
+// each configured candidate IGNORED (fall through) when unsafeWorkspaceRoot flags
+// it — same fall-through as workspace_root(). Used to CONTAIN uploads
+// independently of the backend (see the handler below).
 function atelierWorkspaceRoot() {
   const home = os.homedir();
   const expand = (p) => {
     if (!p || typeof p !== 'string') return null;
-    const e = p.startsWith('~') ? path.join(home, p.slice(1)) : p;
-    return path.resolve(e);
+    return path.resolve(p.startsWith('~') ? path.join(home, p.slice(1)) : p);
   };
+  let settingsDir = null;
   try {
     const sp = process.env.ATELIER_SETTINGS_PATH || path.join(home, '.atelier', 'settings.json');
-    const w = expand(JSON.parse(fs.readFileSync(sp, 'utf8')).workspace_dir);
-    if (w) return w;
+    settingsDir = expand(JSON.parse(fs.readFileSync(sp, 'utf8')).workspace_dir);
   } catch { /* no/invalid settings — fall through */ }
-  return expand(process.env.ATELIER_WORKSPACE) || path.join(home, '.atelier', 'workspace');
+  for (const cand of [settingsDir, expand(process.env.ATELIER_WORKSPACE)]) {
+    if (cand && !unsafeWorkspaceRoot(cand)) return cand;
+  }
+  return path.join(home, '.atelier', 'workspace');
 }
 
 // atelier:upload-to-webview — attach a file to a file <input> on a browser
