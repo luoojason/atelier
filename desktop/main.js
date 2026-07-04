@@ -325,6 +325,50 @@ function patchClientHints(sess) {
   } catch { /* leave the apps.js UA-string tweak in place */ }
 }
 
+// The header rewrite above fixes what the NETWORK sees, but page JS still reads
+// navigator.userAgentData.brands as "Chromium" under Electron — the exact tell
+// Google uses to block embedded sign-in ("this browser may not be secure").
+// CDP Network.setUserAgentOverride with userAgentMetadata is the only in-webview
+// primitive that rewrites that in-page object (it is what Puppeteer/Playwright
+// use for page.setUserAgent). It is passive — only sets the override, never
+// pauses execution — so there is no hang risk. Attaching drops when the user
+// opens the card's DevTools, so re-apply on devtools-closed. Best-effort: if CDP
+// is unavailable the UA string + Sec-CH-UA rewrite still stand.
+function attachUaMetadata(contents) {
+  const ua = cleanChromeUA();
+  const major = (ua.match(/Chrome\/(\d+)/i) || [, '130'])[1];
+  const full = (ua.match(/Chrome\/([\d.]+)/i) || [, '130.0.0.0'])[1];
+  const brands = (fullVer) => [
+    { brand: 'Chromium', version: fullVer ? full : major },
+    { brand: 'Google Chrome', version: fullVer ? full : major },
+    { brand: 'Not?A_Brand', version: fullVer ? '99.0.0.0' : '99' },
+  ];
+  const apply = () => {
+    try { contents.debugger.attach('1.3'); } catch { /* already attached */ }
+    try {
+      contents.debugger
+        .sendCommand('Network.setUserAgentOverride', {
+          userAgent: ua,
+          acceptLanguage: 'en-US,en',
+          platform: 'macOS',
+          userAgentMetadata: {
+            brands: brands(false),
+            fullVersionList: brands(true),
+            fullVersion: full,
+            platform: 'macOS',
+            platformVersion: '',
+            architecture: process.arch === 'arm64' ? 'arm' : 'x86',
+            model: '',
+            mobile: false,
+          },
+        })
+        .catch(() => { /* async reject — the header/UA-string disguise still stands */ });
+    } catch { /* debugger not attached — ignore */ }
+  };
+  apply();
+  contents.on('devtools-closed', apply);   // DevTools steals the CDP target; restore on close
+}
+
 app.on('web-contents-created', (_event, contents) => {
   // No webview preload in v1: strip any preload a <webview> tag (or a
   // compromised page) tries to attach. The effective key lives on the
@@ -351,6 +395,7 @@ app.on('web-contents-created', (_event, contents) => {
     // — Google deliberately blocks embedded browsers via deeper signals too;
     // this just removes the easy tells.
     patchClientHints(contents.session);
+    attachUaMetadata(contents); // also rewrite the in-page navigator.userAgentData
     // Tab dispositions (target=_blank links, cmd-click) are routed to the
     // renderer over 'atelier:webview-new-window' — apps.js opens them as tabs
     // in a browser card. Everything else (a real window.open popup, i.e. an
@@ -377,6 +422,12 @@ app.on('web-contents-created', (_event, contents) => {
             nodeIntegration: false,
             contextIsolation: true,
             sandbox: true,
+            // Pin the OAuth popup to the SAME per-card partition as its opener so
+            // a popup sign-in lands cookies in THIS card's jar and stays isolated
+            // from other browser cards — without this the popup falls back to the
+            // default session and the "each card = its own account" guarantee
+            // breaks. `contents` is this card's webview.
+            session: contents.session,
           },
         },
       };
