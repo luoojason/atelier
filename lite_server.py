@@ -1912,7 +1912,8 @@ async def chat_stream(req: ChatRequest):
     )
 
 
-@app.post("/open-swarm/get_response")
+@app.post("/atelier/get_response")
+@app.post("/open-swarm/get_response")  # back-compat alias for the fork's agency name
 async def get_response_compat(req: AgencyResponseRequest):
     """Scheduler compat route: the agency server's POST /{agency}/get_response.
 

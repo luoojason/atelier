@@ -18,9 +18,9 @@ from __future__ import annotations
 import os
 from typing import Any, Optional
 
-# The path segment the agency server mounts its routes under. The server
-# normalizes the agency name by replacing spaces with underscores (hyphens are
-# preserved), so "open-swarm" stays "open-swarm".
+# The path segment the backend mounts the job route under. Comes from the
+# SWARM_AGENCY setting (default "atelier" -> POST /atelier/get_response); the
+# backend also keeps a "/open-swarm/get_response" alias for the fork's old name.
 RESPONSE_ROUTE = "get_response"
 
 
@@ -37,11 +37,11 @@ def build_request(
     revealable chat card; omitted when absent, so a token-less/older backend
     ignores it and behaves exactly as before.
 
-    >>> build_request("http://localhost:8080/", "open-swarm", "hi")
-    {'url': 'http://localhost:8080/open-swarm/get_response', 'json': {'message': 'hi'}}
-    >>> build_request("http://h:8080", "open-swarm", "hi", "orchestrator")['json']
-    {'message': 'hi', 'recipient_agent': 'orchestrator'}
-    >>> build_request("http://h:8080", "open-swarm", "hi", job_name="brief")['json']
+    >>> build_request("http://localhost:8080/", "atelier", "hi")
+    {'url': 'http://localhost:8080/atelier/get_response', 'json': {'message': 'hi'}}
+    >>> build_request("http://h:8080", "atelier", "hi", "researcher")['json']
+    {'message': 'hi', 'recipient_agent': 'researcher'}
+    >>> build_request("http://h:8080", "atelier", "hi", job_name="brief")['json']
     {'message': 'hi', 'job_name': 'brief'}
     """
     if not base_url:

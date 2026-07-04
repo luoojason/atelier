@@ -135,6 +135,20 @@ def test_compat_route_accepts_recipient_agent(monkeypatch, client):
     assert record == ["hi"]
 
 
+def test_atelier_route_and_openswarm_alias_both_reach_the_handler(monkeypatch, client):
+    # The job route is now POST /atelier/get_response; /open-swarm/get_response is
+    # kept as a back-compat alias for the fork's old agency name.
+    record = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _make_fresh_client_factory(record=record),
+    )
+    for route in ("/atelier/get_response", "/open-swarm/get_response"):
+        resp = client.post(route, json={"message": "via " + route})
+        assert resp.status_code == 200, route
+        assert resp.json() == {"response": "fresh reply"}, route
+    assert record == ["via /atelier/get_response", "via /open-swarm/get_response"]
+
+
 def test_compat_route_error_shape_never_500(monkeypatch, client):
     class _ExplodingClient:
         def __init__(self, options=None):
