@@ -95,6 +95,13 @@
     'atelier:atelier.theme',
     'atelier:palette:theme',
     'atelier:palette:nogrid',
+    // slashcommands.js -> Atelier.store 'atelier.slashcommands' (user-defined
+    // slash commands). GLOBAL so a custom /command follows the user across
+    // every board rather than living on only the board it was created on.
+    'atelier:atelier.slashcommands',
+    // premium.js -> Atelier.store 'atelier.premium.license' (Workflow AI unlock
+    // token). GLOBAL so an unlock is not tied to the board it was entered on.
+    'atelier:atelier.premium.license',
   ];
 
   const stateKey = (id) => BOARD_PREFIX + id + '.state';

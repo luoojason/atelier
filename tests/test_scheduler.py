@@ -410,6 +410,32 @@ def test_build_request_validates_inputs():
         raise AssertionError(f"build_request should reject {args!r}")
 
 
+def test_build_request_carries_job_name_when_given():
+    # r24: the job name rides the body so the backend can reveal the run as a
+    # live chat card; absent (back-compat) -> the field is omitted entirely.
+    with_name = client.build_request("http://h:8080", "open-swarm", "hi",
+                                     job_name="morning-brief")
+    assert with_name["json"] == {"message": "hi", "job_name": "morning-brief"}
+    both = client.build_request("http://h:8080", "open-swarm", "hi", "orch",
+                                job_name="rollup")
+    assert both["json"] == {
+        "message": "hi", "recipient_agent": "orch", "job_name": "rollup",
+    }
+    without = client.build_request("http://h:8080", "open-swarm", "hi")
+    assert "job_name" not in without["json"]
+
+
+def test_send_forwards_job_name_to_the_body():
+    fake = _FakeClient(_FakeResponse(200, {"response": "ok"}))
+    client.send("http://h:8080", "open-swarm", "go", client=fake,
+                job_name="overnight-digest")
+    assert fake.calls[0]["json"]["job_name"] == "overnight-digest"
+    # omitting it keeps the field out (a token-less/older backend ignores it)
+    fake2 = _FakeClient(_FakeResponse(200, {"response": "ok"}))
+    client.send("http://h:8080", "open-swarm", "go", client=fake2)
+    assert "job_name" not in fake2.calls[0]["json"]
+
+
 # --------------------------------------------------------------------------- #
 # client.send (injected fake client, no network)
 # --------------------------------------------------------------------------- #

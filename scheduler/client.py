@@ -29,13 +29,20 @@ def build_request(
     agency: str,
     prompt: str,
     agent: Optional[str] = None,
+    job_name: Optional[str] = None,
 ) -> dict:
     """Build the ``{"url": ..., "json": ...}`` for the agency POST.
+
+    ``job_name`` (r24) is sent so the backend can run the fire as a tracked,
+    revealable chat card; omitted when absent, so a token-less/older backend
+    ignores it and behaves exactly as before.
 
     >>> build_request("http://localhost:8080/", "open-swarm", "hi")
     {'url': 'http://localhost:8080/open-swarm/get_response', 'json': {'message': 'hi'}}
     >>> build_request("http://h:8080", "open-swarm", "hi", "orchestrator")['json']
     {'message': 'hi', 'recipient_agent': 'orchestrator'}
+    >>> build_request("http://h:8080", "open-swarm", "hi", job_name="brief")['json']
+    {'message': 'hi', 'job_name': 'brief'}
     """
     if not base_url:
         raise ValueError("base_url is required")
@@ -51,6 +58,8 @@ def build_request(
     body: dict[str, Any] = {"message": prompt}
     if agent:
         body["recipient_agent"] = agent
+    if job_name:
+        body["job_name"] = job_name
 
     return {"url": url, "json": body}
 
@@ -109,15 +118,17 @@ def send(
     app_token: Optional[str] = None,
     timeout: float = 300.0,
     client: Any = None,
+    job_name: Optional[str] = None,
 ) -> dict:
     """POST the prompt to the agency and return a compact result dict.
 
     ``client`` is any object exposing ``.post(url, json=..., headers=...)`` that
     returns a response with ``.status_code`` and (optionally) ``.json()`` /
     ``.text``. When omitted, a short-lived ``httpx.Client`` is created. Tests
-    inject a fake client so no network access is required.
+    inject a fake client so no network access is required. ``job_name`` (r24) is
+    forwarded to build_request so the backend can reveal the run as a card.
     """
-    request = build_request(base_url, agency, prompt, agent)
+    request = build_request(base_url, agency, prompt, agent, job_name)
     headers = _auth_headers(app_token)
 
     owns_client = client is None

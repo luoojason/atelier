@@ -1,8 +1,8 @@
 {
-    "name": "@vrsen/openswarm",
+    "name": "atelier",
   "productName": "Atelier",
     "version": "1.0.1-rc.9",
-    "description": "An open-source multi-agent AI team built on Agency Swarm",
+    "description": "A glass cockpit for a personal AI workforce — research, make, and publish on your own Claude subscription",
     "license": "MIT",
     "publishConfig": {
         "access": "public"

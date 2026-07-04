@@ -221,3 +221,13 @@ def test_web_tools_are_wired_into_atelier_allowed_tools():
     allowed = lite_server.build_options().allowed_tools
     assert "mcp__atelier__WebSearch" in allowed
     assert "mcp__atelier__WebFetch" in allowed
+
+
+def test_user_agent_is_a_full_browser_string():
+    # A bare "Mozilla/5.0" is fingerprinted as a bot and 403'd by many sites
+    # (Reddit on every endpoint, including its RSS); the shared UA must be a
+    # complete Chrome string so WebFetch/WebSearch are served real content.
+    from shared_tools.web_tools import _USER_AGENT
+
+    assert _USER_AGENT != "Mozilla/5.0"
+    assert "Chrome/" in _USER_AGENT and "Safari/" in _USER_AGENT

@@ -516,7 +516,7 @@
         .catch(() => {
           ctx.fillStyle = cssVar('--ink-dim', '#999');
           ctx.font = '13px system-ui, sans-serif';
-          ctx.fillText('Graph unavailable — backend unreachable.', 20, 30);
+          ctx.fillText("Graph unavailable. Can't reach Atelier.", 20, 30);
         });
     }
     load();

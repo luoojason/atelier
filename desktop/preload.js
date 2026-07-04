@@ -48,4 +48,24 @@ contextBridge.exposeInMainWorld('atelier', {
   // them here as { url }; apps.js opens each as a tab in a browser card.
   onWebviewNewWindow: (cb) =>
     ipcRenderer.on('atelier:webview-new-window', (_e, data) => cb(data)),
+  // Document card export: render self-contained document HTML to a PDF the
+  // user picks a path for (Electron printToPDF, main process). Resolves
+  // { saved } | { canceled } | { error } and never rejects.
+  savePDF: (html, name) =>
+    ipcRenderer.invoke('atelier:save-pdf', { html, name })
+      .catch((e) => ({ error: String((e && e.message) || e) })),
+  // Save arbitrary text (HTML/Markdown) to a user-chosen path.
+  saveText: (text, name, ext) =>
+    ipcRenderer.invoke('atelier:save-text', { text, name, ext })
+      .catch((e) => ({ error: String((e && e.message) || e) })),
+  // Save base64-encoded bytes (e.g. a .pptx from the Deck card) to a path.
+  saveBinary: (b64, name, ext, filterName) =>
+    ipcRenderer.invoke('atelier:save-binary', { b64, name, ext, filterName })
+      .catch((e) => ({ error: String((e && e.message) || e) })),
+  // Open the agent's file-write workspace folder in the OS file manager.
+  // Resolves { ok } | { error }; never rejects. Path is guarded to the home
+  // folder in the main process.
+  revealFolder: (dirPath) =>
+    ipcRenderer.invoke('atelier:reveal-folder', dirPath)
+      .catch((e) => ({ error: String((e && e.message) || e) })),
 });

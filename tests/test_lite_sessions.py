@@ -110,6 +110,16 @@ def _scripted_client_factory(script=None, built=None, on_query=None,
         async def disconnect(self):
             self.disconnected = True
 
+        # async-context-manager support so this fake also drives the untracked
+        # `async with ClaudeSDKClient(...)` compat path (r24), not just the
+        # tracked connect()/disconnect() session path.
+        async def __aenter__(self):
+            await self.connect()
+            return self
+
+        async def __aexit__(self, *exc):
+            await self.disconnect()
+
         async def query(self, message):
             self.queried.append(message)
             if on_query is not None:
@@ -178,17 +188,21 @@ def test_create_list_get_shapes(client):
     for s in listing["sessions"]:
         assert set(s) == {
             "id", "name", "status", "messages_len", "parent_id", "depth",
+            "job_name",
         }
         assert s["status"] == "idle"
         assert s["messages_len"] == 0
         # card-created sessions are always depth-0 roots
         assert s["parent_id"] is None
         assert s["depth"] == 0
+        assert s["job_name"] is None  # only fired scheduled jobs set this
 
     detail = client.get(f"/sessions/{made['id']}").json()
     assert detail == {
         "id": made["id"], "name": "Research", "status": "idle", "messages": [],
-        "parent_id": None, "depth": 0, "model": None, "browser_nav": None,
+        "parent_id": None, "depth": 0, "model": None, "job_name": None,
+        "browser_nav": None, "browser_read": None, "browser_act": None,
+        "canvas_ops": [],
     }
 
 
@@ -591,6 +605,91 @@ def test_pending_model_reset_drops_client_after_turn_settles(monkeypatch, client
     assert built[1] is not built[0]
 
 
+# ── conversation memory survives a dropped client (the amnesia fix) ───────────
+# A card's history lives ONLY in its live ClaudeSDKClient; sess.messages is a
+# render ledger never fed to the model. Any drop (turn error, model change, job
+# completion) nulls the client, so the next turn used to start blank even though
+# the card still showed the whole exchange. On rebuild we now replay the ledger.
+
+def test_rebuilt_client_replays_conversation_history(monkeypatch, client):
+    built = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory(built=built))
+    _inline_turns(monkeypatch)
+
+    sid = _create(client)["id"]
+    # turn 1: establish a fact
+    client.post(f"/sessions/{sid}/message",
+                json={"message": "my favorite fruit is dragonfruit"})
+    # simulate a dropped client (what a turn error / model change / job
+    # completion all leave behind: sess.client is None, session still alive)
+    lite_server._sessions[sid].client = None
+    # turn 2: a follow-up that only makes sense WITH the prior context
+    client.post(f"/sessions/{sid}/message",
+                json={"message": "what is my favorite fruit?"})
+
+    assert len(built) == 2 and built[1] is not built[0]  # a fresh client
+    sent = built[1].queried[0]
+    assert "dragonfruit" in sent                  # turn-1 history was replayed
+    assert "what is my favorite fruit?" in sent   # plus the new message
+    assert "restored after a reconnection" in sent  # framed as restored context
+
+
+def test_first_turn_sends_raw_message_without_a_preamble(monkeypatch, client):
+    built = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory(built=built))
+    _inline_turns(monkeypatch)
+    sid = _create(client)["id"]
+    client.post(f"/sessions/{sid}/message", json={"message": "hello"})
+    # a fresh card has no prior turns to replay: the message is sent verbatim
+    assert built[0].queried == ["hello"]
+
+
+def test_live_client_is_reused_without_replaying(monkeypatch, client):
+    built = []
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory(built=built))
+    _inline_turns(monkeypatch)
+    sid = _create(client)["id"]
+    client.post(f"/sessions/{sid}/message", json={"message": "first"})
+    client.post(f"/sessions/{sid}/message", json={"message": "second"})
+    # the live client carries context itself, so no rebuild and no replay:
+    # one client, both messages sent raw (no preamble double-counting history)
+    assert len(built) == 1
+    assert built[0].queried == ["first", "second"]
+
+
+def test_conversation_preamble_excludes_current_message_and_notes():
+    sess = lite_server._AgentSession("s0", "Card")
+    lite_server._append_session_message(sess, "user", "u1")
+    lite_server._append_session_message(sess, "assistant", "a1")
+    lite_server._append_session_message(sess, "note", "-> Delegated to sub-agent")
+    lite_server._append_session_message(sess, "user", "the current message")
+    pre = lite_server._conversation_preamble(sess)
+    assert "u1" in pre and "a1" in pre
+    assert "-> Delegated to sub-agent" not in pre  # internal notes are skipped
+    assert "the current message" not in pre        # the current turn is excluded
+    assert pre.startswith("[Conversation so far")
+
+
+def test_conversation_preamble_empty_for_a_fresh_session():
+    sess = lite_server._AgentSession("s0", "Card")
+    lite_server._append_session_message(sess, "user", "only message")
+    assert lite_server._conversation_preamble(sess) == ""
+
+
+def test_conversation_preamble_respects_the_char_budget(monkeypatch):
+    monkeypatch.setattr(lite_server, "_REPLAY_CHAR_BUDGET", 60)
+    sess = lite_server._AgentSession("s0", "Card")
+    for i in range(20):
+        lite_server._append_session_message(sess, "assistant", f"reply-{i}-" + "x" * 20)
+    lite_server._append_session_message(sess, "user", "current")
+    pre = lite_server._conversation_preamble(sess)
+    assert "reply-19" in pre     # the most recent turn is kept
+    assert "reply-0-" not in pre  # older turns fall outside the budget
+
+
 # ── governance links: cycle helper + POST/DELETE /sessions/{id}/govern ────────
 
 def test_governs_cycle_helper_walks_parent_chain():
@@ -765,3 +864,110 @@ def test_ungovern_unknown_child_is_404(client):
     resp = client.delete(f"/sessions/{parent}/govern/nope")
     assert resp.status_code == 404
     assert resp.json() == {"error": "unknown session"}
+
+
+# ── r24: scheduled jobs surface as tracked, revealable sessions ──────────────
+
+def test_compat_with_job_name_creates_tracked_revealable_session(monkeypatch, client):
+    # A NAMED job runs as a depth-0 session tagged with job_name, so the desktop
+    # app can auto-reveal it as a live chat card; the {response} ledger shape is
+    # preserved for the scheduler.
+    monkeypatch.setattr(lite_server, "ClaudeSDKClient", _scripted_client_factory())
+    resp = client.post(
+        "/open-swarm/get_response",
+        json={"message": "brief me", "job_name": "morning-brief"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["response"] == "scripted reply"
+    assert body.get("error") in (None, False)
+
+    jobs = [s for s in client.get("/sessions").json()["sessions"] if s["job_name"]]
+    assert len(jobs) == 1
+    j = jobs[0]
+    assert j["job_name"] == "morning-brief" and j["name"] == "morning-brief"
+    assert j["depth"] == 0 and j["parent_id"] is None
+
+    detail = client.get(f"/sessions/{j['id']}").json()
+    assert detail["job_name"] == "morning-brief"
+    roles = [(m["role"], m["text"]) for m in detail["messages"]]
+    assert roles[0] == ("note", 'Scheduled job "morning-brief" fired')
+    assert ("user", "brief me") in roles
+    assert any(r == "assistant" for r, _ in roles)
+
+
+def test_compat_without_job_name_stays_untracked(monkeypatch, client):
+    # No job_name -> the legacy untracked one-shot: same reply, but NO session
+    # is registered (the user's /sessions surface is untouched).
+    monkeypatch.setattr(lite_server, "ClaudeSDKClient", _scripted_client_factory())
+    before = len(lite_server._sessions)
+    resp = client.post("/open-swarm/get_response", json={"message": "hi"})
+    assert resp.status_code == 200
+    assert resp.json()["response"] == "scripted reply"
+    assert len(lite_server._sessions) == before
+    assert client.get("/sessions").json()["sessions"] == []
+
+
+def test_job_session_error_preserves_ledger_shape(monkeypatch, client):
+    # A job turn that raises still returns {response, error:True} (never a 500),
+    # so the scheduler's summarize_response/ledger path is unchanged.
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient",
+        _scripted_client_factory(query_error=RuntimeError("boom")),
+    )
+    resp = client.post(
+        "/open-swarm/get_response",
+        json={"message": "go", "job_name": "flaky-job"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["error"] is True
+    assert "boom" in body["response"]
+    # the session is still there (status error), revealable after the fact
+    jobs = [s for s in client.get("/sessions").json()["sessions"] if s["job_name"]]
+    assert len(jobs) == 1 and jobs[0]["status"] == "error"
+
+
+def test_make_room_for_job_spares_user_cards(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("ATELIER_MAX_SESSIONS", "2")
+    user = lite_server._AgentSession("u", "User card")
+    user.status = "idle"
+    old_job = lite_server._AgentSession("j", "old-job")
+    old_job.status = "idle"
+    old_job.job_name = "old-job"
+    lite_server._sessions["u"] = user
+    lite_server._sessions["j"] = old_job
+    # cap 2, full: a new job reclaims the finished JOB slot, never the user card
+    assert asyncio.run(lite_server._make_room_for_job()) is True
+    assert "u" in lite_server._sessions       # user card spared
+    assert "j" not in lite_server._sessions   # old job reclaimed
+
+
+def test_make_room_for_job_falls_back_when_only_user_cards(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("ATELIER_MAX_SESSIONS", "1")
+    user = lite_server._AgentSession("u", "User")
+    user.status = "idle"
+    lite_server._sessions["u"] = user
+    # cap 1, full with a USER card and no job sessions -> no room, and the user
+    # card is NOT evicted for a job (the job then runs untracked)
+    assert asyncio.run(lite_server._make_room_for_job()) is False
+    assert "u" in lite_server._sessions
+
+
+def test_finished_job_session_drops_its_client_but_keeps_transcript(monkeypatch, client):
+    # r24 review fix: a completed job lingers for viewing but must NOT hold a
+    # live CLI subprocess — the client is dropped, the transcript is preserved.
+    monkeypatch.setattr(lite_server, "ClaudeSDKClient", _scripted_client_factory())
+    resp = client.post(
+        "/open-swarm/get_response", json={"message": "hi", "job_name": "j"}
+    )
+    assert resp.status_code == 200
+    jobs = [s for s in lite_server._sessions.values() if s.job_name]
+    assert len(jobs) == 1
+    assert jobs[0].client is None                 # subprocess torn down
+    assert jobs[0].status == "idle"
+    # note + user + assistant all still readable for the revealed card
+    roles = [m["role"] for m in jobs[0].messages]
+    assert "note" in roles and "user" in roles and "assistant" in roles

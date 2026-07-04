@@ -179,12 +179,14 @@ def test_list_and_detail_carry_parent_id_and_depth(client, captured):
     assert by_id[child_id]["parent_id"] == parent_id
     assert by_id[child_id]["depth"] == 1
     assert by_id[child_id]["status"] == "running"
-    assert by_id[child_id]["messages_len"] == 1
+    # a leading "note" labels the delegated task, then the task itself
+    assert by_id[child_id]["messages_len"] == 2
 
     detail = client.get(f"/sessions/{child_id}").json()
     assert detail["parent_id"] == parent_id
     assert detail["depth"] == 1
     assert [(m["role"], m["text"]) for m in detail["messages"]] == [
+        ("note", 'Task from orchestrator "Card"'),
         ("user", "dig into X"),
     ]
 
@@ -204,6 +206,7 @@ def test_spawn_creates_running_child_with_task_as_first_message(captured):
     assert child.depth == 1
     assert child.status == "running"
     assert [(m["role"], m["text"]) for m in child.messages] == [
+        ("note", 'Task from orchestrator "Card"'),
         ("user", "summarize the vault"),
     ]
     assert len(captured) == 1  # exactly one turn task fired for the child
@@ -311,7 +314,7 @@ def test_check_running_child(captured):
     child_id = _SPAWNED_RE.match(reply).group("id")
 
     assert _text(_call(check, {"agent_id": child_id})) == (
-        f'Sub-agent "Scout" ({child_id}) is still working (1 messages so far).'
+        f'Sub-agent "Scout" ({child_id}) is still working (2 messages so far).'
     )
 
 
@@ -433,6 +436,625 @@ def test_navigate_tool_description_mentions_the_link_requirement():
     assert "linked" in nav_tool.description
 
 
+# ── OpenBrowser (agent-driven card spawn, round 22) ───────────────────────────
+
+def _open_browser_handler(parent_id):
+    """The OpenBrowser handler coroutine (the 5th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[4].handler
+
+
+def test_open_browser_sets_canvas_op_and_seq_increments(captured):
+    parent = _register_parent()
+    ob = _open_browser_handler(parent.id)
+    assert parent.canvas_ops == []
+
+    reply = _text(_call(ob, {"url": "https://example.com/a"}))
+    assert "example.com/a" in reply
+    first = parent.canvas_ops[-1]
+    assert set(first) == {"kind", "url", "seq"}
+    assert first["kind"] == "browser"
+    assert first["url"] == "https://example.com/a"
+    assert isinstance(first["seq"], int)
+
+    # a second request strictly advances seq so the poller distinguishes it
+    _call(ob, {"url": "http://example.org/b"})
+    second = parent.canvas_ops[-1]
+    assert second["url"] == "http://example.org/b"
+    assert second["seq"] == first["seq"] + 1
+
+
+def test_open_browser_and_navigate_use_independent_seq_counters(captured):
+    # canvas_op (OpenBrowser) and browser_nav (NavigateBrowser) are separate
+    # fields with separate monotonic counters — one must never clobber the other
+    parent = _register_parent()
+    _, _, nav = _handlers(parent.id)
+    ob = _open_browser_handler(parent.id)
+
+    _call(ob, {"url": "https://a.example/1"})
+    _call(nav, {"url": "https://b.example/2"})
+    assert parent.canvas_ops[-1]["url"] == "https://a.example/1"
+    assert parent.browser_nav["url"] == "https://b.example/2"
+    # both are set and independent — the nav call did not touch canvas_op
+    _call(ob, {"url": "https://a.example/3"})
+    assert parent.canvas_ops[-1]["url"] == "https://a.example/3"
+    assert parent.browser_nav["url"] == "https://b.example/2"  # unchanged
+
+
+def test_open_browser_rejects_non_http_urls(captured):
+    parent = _register_parent()
+    ob = _open_browser_handler(parent.id)
+    for args in (
+        {"url": "ftp://example.com"},
+        {"url": "javascript:alert(1)"},
+        {"url": "file:///etc/passwd"},
+        {"url": "example.com"},
+        {"url": ""},
+        {},
+    ):
+        assert _text(_call(ob, args)) == "Only http(s) URLs can be opened."
+    assert parent.canvas_ops == []  # nothing was ever recorded
+
+
+def test_open_browser_rejects_private_and_loopback_hosts(captured):
+    # OpenBrowser is agent-initiated with no user gesture, so it is restricted
+    # to the public web — loopback/LAN/link-local/metadata hosts are refused so
+    # a prompt-injected agent cannot reach the backend, the router, or metadata.
+    parent = _register_parent()
+    ob = _open_browser_handler(parent.id)
+    for url in (
+        "http://127.0.0.1:8765/exfil",
+        "http://localhost/admin",
+        "https://LOCALHOST/x",
+        "http://app.localhost/x",
+        "http://10.0.0.5/",
+        "http://192.168.1.1/",
+        "http://172.16.0.1/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/",
+        "http://0.0.0.0/",
+    ):
+        reply = _text(_call(ob, {"url": url}))
+        assert "private, loopback, or link-local" in reply, url
+    assert parent.canvas_ops == []  # nothing recorded for any blocked host
+
+    # a public host still passes and records the op
+    _call(ob, {"url": "https://example.com/ok"})
+    assert parent.canvas_ops[-1]["url"] == "https://example.com/ok"
+
+
+def test_agent_open_host_blocked_helper_edges():
+    b = lite_server._agent_open_host_blocked
+    assert b("https://example.com") is False
+    assert b("https://sub.example.co.uk/path?q=1") is False
+    assert b("http://8.8.8.8/") is False           # public IP literal is fine
+    assert b("http://127.0.0.1/") is True
+    assert b("http://localhost") is True
+    assert b("http://[fe80::1]/") is True           # link-local v6
+    assert b("http://[fc00::1]/") is True           # unique-local v6 (private)
+    assert b("not a url") is True                    # unparseable/no host -> refuse
+    assert b("https://") is True                     # empty host -> refuse
+
+
+def test_open_browser_with_parent_gone(captured):
+    ob = _open_browser_handler("deadbeef00000000deadbeef00000000")
+    assert _text(_call(ob, {"url": "https://example.com"})) == (
+        "Your session is gone; cannot open a browser."
+    )
+
+
+def test_detail_carries_canvas_op_and_list_does_not(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["canvas_ops"] == []
+
+    ob = _open_browser_handler(sid)
+    _call(ob, {"url": "https://example.com/page"})
+
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["canvas_ops"][-1]["kind"] == "browser"
+    assert detail["canvas_ops"][-1]["url"] == "https://example.com/page"
+    assert detail["canvas_ops"][-1]["seq"] >= 1
+
+    # the list route deliberately does NOT carry canvas_op
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "canvas_ops" not in s
+
+
+def test_open_browser_tool_description_mentions_spawning_and_arrow():
+    ob_tool = lite_server._orchestra_tools("p")[4]
+    assert ob_tool.name == "OpenBrowser"
+    assert ob_tool.input_schema["required"] == ["url"]
+    # the description must distinguish it from NavigateBrowser: it SPAWNS a card
+    assert "arrow" in ob_tool.description
+
+
+# ── CreateCard (agent-authored note/document cards, round 23) ─────────────────
+
+def _create_card_handler(parent_id):
+    """The CreateCard handler coroutine (the 6th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[5].handler
+
+
+def test_create_card_note_sets_canvas_op_and_seq_increments(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    assert parent.canvas_ops == []
+
+    reply = _text(_call(cc, {"kind": "note", "content": "remember: milk", "title": "Groceries"}))
+    assert "note" in reply
+    first = parent.canvas_ops[-1]
+    assert set(first) == {"kind", "title", "content", "seq"}
+    assert first["kind"] == "note"
+    assert first["title"] == "Groceries"
+    assert first["content"] == "remember: milk"
+    assert isinstance(first["seq"], int)
+
+    _call(cc, {"kind": "note", "content": "second"})
+    second = parent.canvas_ops[-1]
+    assert second["content"] == "second"
+    assert second["title"] == ""  # optional title defaults to empty
+    assert second["seq"] == first["seq"] + 1
+
+
+def test_create_card_document_carries_html_content(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    html = "<!doctype html><html><body><h1>Memo</h1></body></html>"
+    _text(_call(cc, {"kind": "document", "content": html, "title": "Memo"}))
+    op = parent.canvas_ops[-1]
+    assert op["kind"] == "document"
+    assert op["content"] == html
+    assert op["title"] == "Memo"
+
+
+def test_create_card_rejects_unknown_kind(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    for kind in ("browser", "deck", "", "NOTE", "widget"):
+        reply = _text(_call(cc, {"kind": kind, "content": "x"}))
+        assert reply == 'kind must be "note" or "document".'
+    assert parent.canvas_ops == []
+
+
+def test_create_card_rejects_empty_content(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    for content in ("", "   ", "\n\t "):
+        reply = _text(_call(cc, {"kind": "note", "content": content}))
+        assert reply == "content is required — write the card's content."
+    assert _text(_call(cc, {"kind": "note"})) == "content is required — write the card's content."
+    assert parent.canvas_ops == []
+
+
+def test_create_card_enforces_per_kind_content_caps(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    # a note over 8k is rejected; a document of the same size is fine
+    big = "x" * 8_001
+    assert "too long for a note card" in _text(_call(cc, {"kind": "note", "content": big}))
+    assert parent.canvas_ops == []
+    _call(cc, {"kind": "document", "content": big})
+    assert parent.canvas_ops[-1]["kind"] == "document"  # 8001 < the 300k document cap
+    # a document over 300k is rejected
+    huge = "y" * 300_001
+    assert "too long for a document card" in _text(_call(cc, {"kind": "document", "content": huge}))
+
+
+def test_create_card_with_parent_gone(captured):
+    cc = _create_card_handler("deadbeef00000000deadbeef00000000")
+    assert _text(_call(cc, {"kind": "note", "content": "x"})) == (
+        "Your session is gone; cannot create a card."
+    )
+
+
+def test_detail_carries_canvas_op_for_a_created_card(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    cc = _create_card_handler(sid)
+    _call(cc, {"kind": "note", "content": "hello world", "title": "T"})
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["canvas_ops"][-1]["kind"] == "note"
+    assert detail["canvas_ops"][-1]["content"] == "hello world"
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "canvas_ops" not in s  # list route never carries it
+
+
+def test_create_card_tool_description_and_schema():
+    cc_tool = lite_server._orchestra_tools("p")[5]
+    assert cc_tool.name == "CreateCard"
+    assert cc_tool.input_schema["required"] == ["kind", "content"]
+    assert cc_tool.input_schema["properties"]["kind"]["enum"] == ["note", "document"]
+    # the description must warn the document HTML is sandboxed (no scripts)
+    assert "sandbox" in cc_tool.description.lower() or "no scripts" in cc_tool.description.lower()
+
+
+# ── canvas_ops is a QUEUE (the r23 review fix — multiple ops per turn) ─────────
+
+def test_canvas_ops_is_a_queue_not_a_single_slot(captured):
+    # several spawn ops emitted in one turn must ALL be retained; a single slot
+    # would drop all but the last, silently losing an agent-authored deliverable
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    ob = _open_browser_handler(parent.id)
+    _call(cc, {"kind": "note", "content": "one"})
+    _call(cc, {"kind": "document", "content": "<h1>two</h1>"})
+    _call(ob, {"url": "https://example.com/three"})
+    assert [op["kind"] for op in parent.canvas_ops] == ["note", "document", "browser"]
+    seqs = [op["seq"] for op in parent.canvas_ops]
+    assert seqs == sorted(seqs) and len(set(seqs)) == 3  # strictly increasing, distinct
+
+
+def test_canvas_ops_queue_is_bounded(captured):
+    parent = _register_parent()
+    cc = _create_card_handler(parent.id)
+    over = lite_server._MAX_CANVAS_OPS + 15
+    for i in range(over):
+        _call(cc, {"kind": "note", "content": f"n{i}"})
+    # capped at the max; the OLDEST were dropped, the newest survive in order
+    assert len(parent.canvas_ops) == lite_server._MAX_CANVAS_OPS
+    assert parent.canvas_ops[-1]["content"] == f"n{over - 1}"
+    assert parent.canvas_ops[0]["content"] == f"n{over - lite_server._MAX_CANVAS_OPS}"
+    seqs = [op["seq"] for op in parent.canvas_ops]
+    assert seqs == sorted(seqs)
+
+
+def test_detail_carries_canvas_ops_list_and_list_route_omits_it(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["canvas_ops"] == []
+    cc = _create_card_handler(sid)
+    _call(cc, {"kind": "note", "content": "a"})
+    _call(cc, {"kind": "note", "content": "b"})
+    detail = client.get(f"/sessions/{sid}").json()
+    assert isinstance(detail["canvas_ops"], list) and len(detail["canvas_ops"]) == 2
+    assert [op["content"] for op in detail["canvas_ops"]] == ["a", "b"]
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "canvas_ops" not in s  # list route never carries the queue
+
+
+# ── ReadPage: the round-trip computer-use tool (r32) ─────────────────────────
+# Unlike every other orchestra tool, ReadPage BLOCKS awaiting a result the card
+# posts back. It stamps sess.browser_read = {req, seq}, registers a future keyed
+# by req, and awaits it; the card reads its linked browser and POSTs to
+# /sessions/{id}/browser_result, which resolves the future.
+
+def _read_page_handler(parent_id):
+    """The ReadPage handler coroutine (the 7th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[6].handler
+
+
+async def _drive_read(parent, result):
+    """Fire ReadPage, wait for it to stamp browser_read + register its waiter,
+    resolve that waiter with `result` (the card's answer), and return the tool
+    text. Runs the whole exchange on ONE loop, as production does."""
+    read = _read_page_handler(parent.id)
+    task = asyncio.create_task(read({}))
+    for _ in range(1000):  # yield until the tool has stamped + registered
+        if parent.browser_read is not None and (
+            parent.browser_read["req"] in lite_server._browser_read_waiters
+        ):
+            break
+        await asyncio.sleep(0)
+    assert parent.browser_read is not None
+    req = parent.browser_read["req"]
+    fut = lite_server._browser_read_waiters[req]
+    fut.set_result(result)
+    return _text(await task)
+
+
+def test_read_page_round_trip_returns_page_text(captured):
+    parent = _register_parent()
+    text = asyncio.run(_drive_read(parent, {
+        "ok": True, "url": "https://example.com/", "title": "Example Domain",
+        "text": "This domain is for use in illustrative examples.",
+    }))
+    assert "This domain is for use in illustrative examples." in text
+    assert "https://example.com/" in text
+    assert "Example Domain" in text
+    # the page text is framed as untrusted data, not instructions
+    assert "untrusted" in text.lower()
+    # the waiter map does not leak an entry per read
+    assert lite_server._browser_read_waiters == {}
+
+
+def test_read_page_stamps_browser_read_seq(captured):
+    parent = _register_parent()
+    assert parent.browser_read is None
+    asyncio.run(_drive_read(parent, {"ok": True, "text": "hi", "url": "https://example.com/", "title": "t"}))
+    assert parent.browser_read is not None
+    assert set(parent.browser_read) == {"req", "seq"}
+    assert isinstance(parent.browser_read["seq"], int)
+    assert parent.browser_read["seq"] >= 1
+
+
+def test_read_page_detail_route_carries_browser_read(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["browser_read"] is None
+    parent = lite_server._sessions[sid]
+
+    async def scenario():
+        read = _read_page_handler(sid)
+        task = asyncio.create_task(read({}))
+        for _ in range(1000):
+            if parent.browser_read is not None:
+                break
+            await asyncio.sleep(0)
+        req = parent.browser_read["req"]
+        lite_server._browser_read_waiters[req].set_result({"ok": True, "text": "x"})
+        await task
+
+    asyncio.run(scenario())
+    # after the round trip the stamp persists on the detail route (seq-gated poll)
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["browser_read"] is not None
+    assert detail["browser_read"]["seq"] >= 1
+    # the list route never carries it
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "browser_read" not in s
+
+
+def test_read_page_reports_an_unreadable_page(captured):
+    parent = _register_parent()
+    text = asyncio.run(_drive_read(parent, {"ok": False, "error": "no page loaded yet"}))
+    assert "Could not read" in text
+    assert "no page loaded yet" in text
+    assert lite_server._browser_read_waiters == {}
+
+
+def test_read_page_reports_empty_text(captured):
+    parent = _register_parent()
+    text = asyncio.run(_drive_read(parent, {"ok": True, "text": "   ", "url": "https://example.com/", "title": "t"}))
+    assert "no readable text" in text
+
+
+def test_read_page_truncates_a_huge_page(captured):
+    parent = _register_parent()
+    huge = "A" * (lite_server._READ_PAGE_MAX + 5000)
+    text = asyncio.run(_drive_read(parent, {"ok": True, "text": huge, "url": "https://example.com/", "title": "t"}))
+    assert "page text truncated" in text
+    # far shorter than the raw page (framed + capped at _READ_PAGE_MAX)
+    assert len(text) < lite_server._READ_PAGE_MAX + 500
+
+
+def test_read_page_refuses_internal_page_content(captured):
+    # SSRF-read guard: OpenBrowser is public-host-gated, but NavigateBrowser can
+    # drive a linked card to loopback/LAN (a user's own localhost). ReadPage must
+    # not pipe that internal page's body into the model even so — it gates the
+    # RETURNED CONTENT on the page's real loaded URL.
+    for bad in (
+        "http://127.0.0.1:8765/config",
+        "http://localhost/admin",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://192.168.1.1/",
+        "http://10.0.0.5/secrets",
+    ):
+        parent = _register_parent()
+        text = asyncio.run(_drive_read(parent, {
+            "ok": True, "url": bad, "title": "Internal", "text": "SECRET INTERNAL BODY",
+        }))
+        assert "SECRET INTERNAL BODY" not in text, bad
+        assert "private, loopback, or link-local" in text, bad
+        # cleanup for the next loop iteration (single fixed parent id)
+        lite_server._sessions.clear()
+
+
+def test_read_page_allows_public_page_content(captured):
+    # The gate must not block ordinary public pages (regression guard).
+    parent = _register_parent()
+    text = asyncio.run(_drive_read(parent, {
+        "ok": True, "url": "https://en.wikipedia.org/wiki/Ohio",
+        "title": "Ohio", "text": "Ohio is a state.",
+    }))
+    assert "Ohio is a state." in text
+
+
+def test_read_page_times_out_without_a_result(captured, monkeypatch):
+    monkeypatch.setattr(lite_server, "_READ_PAGE_TIMEOUT", 0.05)
+    parent = _register_parent()
+    read = _read_page_handler(parent.id)
+    text = _text(_call(read, {}))
+    assert "No linked browser" in text
+    # the waiter is cleaned up even on timeout (no leak)
+    assert lite_server._browser_read_waiters == {}
+
+
+def test_read_page_with_parent_gone(captured):
+    read = _read_page_handler("ghostsession00000000000000000000")
+    text = _text(_call(read, {}))
+    assert "session is gone" in text
+
+
+def test_browser_result_endpoint_resolves_the_waiter(captured):
+    async def scenario():
+        fut = asyncio.get_running_loop().create_future()
+        lite_server._browser_read_waiters[424242] = fut
+        req = lite_server.BrowserResultRequest(
+            req=424242, ok=True, url="u", title="t", text="body text",
+        )
+        resp = await lite_server.browser_result("sess", req)
+        assert resp == {"ok": True}
+        assert fut.done()
+        return fut.result()
+
+    result = asyncio.run(scenario())
+    assert result["ok"] is True and result["text"] == "body text"
+    lite_server._browser_read_waiters.pop(424242, None)
+
+
+def test_browser_result_unknown_req_is_a_noop(client, captured):
+    # A repeat poll or a timed-out tool posts a req nobody is awaiting: 200 no-op.
+    resp = client.post(
+        "/sessions/whatever/browser_result",
+        json={"req": 999999, "ok": True, "text": "orphan"},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+def test_read_page_tool_description_and_schema():
+    read = lite_server._orchestra_tools("p")[6]
+    assert read.name == "ReadPage"
+    assert read.input_schema.get("required", []) == []
+    assert "untrusted" in read.description
+
+
+# ── Click / Type: operate the linked page (r33) ──────────────────────────────
+# Same round-trip channel as ReadPage (browser_act instead of browser_read), but
+# the tool needs only an ACK back, and the returned summary is app-authored (no
+# page HTML), so there is no read-side host gate.
+
+def _click_handler(parent_id):
+    """The Click handler coroutine (the 8th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[7].handler
+
+
+def _type_handler(parent_id):
+    """The Type handler coroutine (the 9th orchestra tool)."""
+    return lite_server._orchestra_tools(parent_id)[8].handler
+
+
+async def _drive_act(handler, parent, args, result):
+    """Fire a Click/Type handler, wait for it to stamp browser_act + register its
+    waiter, resolve that waiter with the card's ack, and return the tool text."""
+    task = asyncio.create_task(handler(args))
+    for _ in range(1000):
+        if parent.browser_act is not None and (
+            parent.browser_act["req"] in lite_server._browser_read_waiters
+        ):
+            break
+        await asyncio.sleep(0)
+    assert parent.browser_act is not None
+    req = parent.browser_act["req"]
+    lite_server._browser_read_waiters[req].set_result(result)
+    return _text(await task)
+
+
+def test_click_round_trip_reports_the_click_and_public_url(captured):
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    text = asyncio.run(_drive_act(
+        click, parent, {"selector": "button#go"},
+        {"ok": True, "text": "Clicked <button> #go.", "url": "https://example.com/next"},
+    ))
+    assert "Clicked <button>" in text
+    assert "https://example.com/next" in text  # a public post-click URL is reported
+    assert lite_server._browser_read_waiters == {}
+
+
+def test_click_withholds_internal_url(captured):
+    # A click can navigate to an internal page; its URL (which can carry session
+    # tokens) must be host-gated like ReadPage's content, not handed to the model.
+    for bad in ("http://192.168.1.1/admin?session=secret", "http://127.0.0.1:8765/config"):
+        lite_server._sessions.clear()
+        parent = _register_parent()
+        click = _click_handler(parent.id)
+        text = asyncio.run(_drive_act(
+            click, parent, {"selector": "a"},
+            {"ok": True, "text": "Clicked <a>.", "url": bad},
+        ))
+        assert bad not in text, bad
+        assert "secret" not in text
+        assert "withheld" in text
+
+
+def test_click_stamps_browser_act(captured):
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    asyncio.run(_drive_act(click, parent, {"selector": "a.more"}, {"ok": True, "text": "Clicked <a>"}))
+    assert parent.browser_act is not None
+    assert set(parent.browser_act) == {"req", "seq", "action", "selector", "text"}
+    assert parent.browser_act["action"] == "click"
+    assert parent.browser_act["selector"] == "a.more"
+    assert isinstance(parent.browser_act["seq"], int)
+
+
+def test_type_round_trip_passes_selector_and_text(captured):
+    parent = _register_parent()
+    type_ = _type_handler(parent.id)
+    text = asyncio.run(_drive_act(
+        type_, parent, {"selector": "input[name=q]", "text": "hello world"},
+        {"ok": True, "text": "Typed into <input>; value is now: hello world"},
+    ))
+    assert "Typed into <input>" in text
+    assert parent.browser_act["action"] == "type"
+    assert parent.browser_act["selector"] == "input[name=q]"
+    assert parent.browser_act["text"] == "hello world"
+
+
+def test_act_reports_no_match(captured):
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    text = asyncio.run(_drive_act(
+        click, parent, {"selector": "#nope"},
+        {"ok": False, "error": "no element matches #nope"},
+    ))
+    assert "Could not" in text and "no element matches #nope" in text
+    assert "ReadPage" in text  # nudges the model to look before acting
+
+
+def test_click_requires_a_selector(captured):
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    text = _text(_call(click, {"selector": "   "}))
+    assert "selector is required" in text
+    assert parent.browser_act is None  # nothing stamped
+
+
+def test_type_rejects_overlong_text(captured):
+    parent = _register_parent()
+    type_ = _type_handler(parent.id)
+    huge = "a" * (lite_server._TYPE_TEXT_MAX + 1)
+    text = _text(_call(type_, {"selector": "#x", "text": huge}))
+    assert "too long to type" in text
+    assert parent.browser_act is None
+
+
+def test_act_times_out_without_an_ack(captured, monkeypatch):
+    monkeypatch.setattr(lite_server, "_BROWSER_ACT_TIMEOUT", 0.05)
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    text = _text(_call(click, {"selector": "button"}))
+    assert "did not confirm" in text
+    assert lite_server._browser_read_waiters == {}  # no leak
+
+
+def test_act_with_parent_gone(captured):
+    click = _click_handler("ghostsession00000000000000000000")
+    text = _text(_call(click, {"selector": "button"}))
+    assert "session is gone" in text
+
+
+def test_click_and_type_share_the_read_result_registry(captured):
+    # Click/Type reuse browser_read's req counter + waiter map; the shared
+    # browser_result endpoint resolves any of them by req without collision.
+    parent = _register_parent()
+    click = _click_handler(parent.id)
+    asyncio.run(_drive_act(click, parent, {"selector": "b"}, {"ok": True, "text": "Clicked <b>"}))
+    # act uses its OWN seq field, independent of browser_read's
+    assert parent.browser_act["seq"] >= 1
+    assert parent.browser_read is None
+
+
+def test_click_type_detail_route_carries_browser_act(client, captured):
+    sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
+    assert client.get(f"/sessions/{sid}").json()["browser_act"] is None
+    parent = lite_server._sessions[sid]
+    click = _click_handler(sid)
+
+    async def scenario():
+        task = asyncio.create_task(click({"selector": "button"}))
+        for _ in range(1000):
+            if parent.browser_act is not None:
+                break
+            await asyncio.sleep(0)
+        req = parent.browser_act["req"]
+        lite_server._browser_read_waiters[req].set_result({"ok": True, "text": "Clicked"})
+        await task
+
+    asyncio.run(scenario())
+    detail = client.get(f"/sessions/{sid}").json()
+    assert detail["browser_act"] is not None and detail["browser_act"]["action"] == "click"
+    for s in client.get("/sessions").json()["sessions"]:
+        assert "browser_act" not in s
+
+
 # ── the structural depth cap ─────────────────────────────────────────────────
 
 def test_build_options_without_spawner_has_no_orchestra():
@@ -450,6 +1072,8 @@ def test_build_options_with_spawner_gains_orchestra():
     assert "mcp__orchestra__SpawnAgent" in opts.allowed_tools
     assert "mcp__orchestra__CheckAgent" in opts.allowed_tools
     assert "mcp__orchestra__NavigateBrowser" in opts.allowed_tools
+    assert "mcp__orchestra__OpenBrowser" in opts.allowed_tools
+    assert "mcp__orchestra__CreateCard" in opts.allowed_tools
     # the base allowlist is intact alongside the orchestra tools (Notion tools
     # are gated on a stored token — excluded here since none is set)
     assert (
@@ -457,7 +1081,7 @@ def test_build_options_with_spawner_gains_orchestra():
     ) <= set(opts.allowed_tools)
 
 
-def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
+def test_depth0_gets_spawn_tools_depth1_gets_canvas_tools_only(
     monkeypatch, client
 ):
     built = []
@@ -466,7 +1090,7 @@ def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
     )
     _inline_turns(monkeypatch)
 
-    # depth-0 card session: its lazy client is built WITH the orchestra
+    # depth-0 card session: full orchestra incl. the SPAWN tools
     sid = client.post("/sessions", json={"name": "Card"}).json()["id"]
     assert client.post(
         f"/sessions/{sid}/message", json={"message": "hi"}
@@ -474,7 +1098,9 @@ def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
     assert "orchestra" in built[0].options.mcp_servers
     assert "mcp__orchestra__SpawnAgent" in built[0].options.allowed_tools
 
-    # depth-1 sub-agent session: NO orchestra, so it cannot spawn further
+    # depth-1 sub-agent: gets the orchestra with the CANVAS tools (so it can
+    # OpenBrowser / CreateCard on its own card) but NOT the spawn tools (the
+    # depth cap still stops it spawning further sub-agents).
     child = lite_server._AgentSession(
         "c" * 32, "Scout", parent_id=sid, depth=1
     )
@@ -483,10 +1109,13 @@ def test_depth0_turn_gets_orchestra_and_depth1_turn_does_not(
         f"/sessions/{child.id}/message", json={"message": "task"}
     ).status_code == 202
     assert child.status == "idle"  # the scripted turn ran to completion
-    assert "orchestra" not in built[1].options.mcp_servers
-    assert not any(
-        t.startswith("mcp__orchestra__") for t in built[1].options.allowed_tools
-    )
+    tools = built[1].options.allowed_tools
+    assert "orchestra" in built[1].options.mcp_servers
+    assert "mcp__orchestra__OpenBrowser" in tools
+    assert "mcp__orchestra__NavigateBrowser" in tools
+    assert "mcp__orchestra__CreateCard" in tools
+    assert "mcp__orchestra__SpawnAgent" not in tools
+    assert "mcp__orchestra__CheckAgent" not in tools
 
 
 def test_build_options_attaches_delegate_when_session_has_children():
@@ -615,6 +1244,7 @@ def test_delegate_runs_a_turn_on_the_governed_child_and_returns_its_reply(
     assert reply == 'Sub-agent "Scout" replied: scripted reply'
     assert child.status == "idle"
     assert [(m["role"], m["text"]) for m in child.messages] == [
+        ("note", 'Task from orchestrator "Card"'),
         ("user", "summarize the vault"),
         ("assistant", "scripted reply"),
     ]
@@ -677,6 +1307,49 @@ def test_delegate_rejects_a_busy_child(monkeypatch):
     )
     # nothing appended: the turn was refused before it ran
     assert child.messages == []
+
+
+# ── delegation visibility on the orchestrator's own card (round 18) ───────────
+# The hand-off is a tool call the parent's TextBlock transcript never shows, so
+# spawn/delegate append a display-only "note" event to the parent session. It
+# is render-only (never replayed to the model), so it makes the delegation
+# visible on the card without touching the orchestrator's own context.
+
+def test_spawn_records_a_delegation_note_on_the_parent(captured):
+    parent = _register_parent()
+    spawn, _, _ = _handlers(parent.id)
+    _call(spawn, {"task": "summarize the vault", "name": "Scout"})
+    assert [(m["role"], m["text"]) for m in parent.messages] == [
+        ("note", '→ Delegated to sub-agent "Scout": summarize the vault'),
+    ]
+
+
+def test_spawn_note_truncates_a_long_task(captured):
+    parent = _register_parent()
+    spawn, _, _ = _handlers(parent.id)
+    _call(spawn, {"task": "x" * 900, "name": "Scout"})
+    (note,) = parent.messages
+    assert note["role"] == "note"
+    assert note["text"].endswith("…") and len(note["text"]) < 320
+
+
+def test_delegate_records_delegation_and_reply_notes_on_the_parent(monkeypatch):
+    monkeypatch.setattr(
+        lite_server, "ClaudeSDKClient", _scripted_client_factory()
+    )
+    parent = _register_parent()
+    child = _govern(parent, "Scout")
+    delegate = _delegate_handler(parent.id)
+    _call(delegate, {"subagent": child.id, "task": "summarize the vault"})
+    assert [(m["role"], m["text"]) for m in parent.messages] == [
+        ("note", '→ Delegated to sub-agent "Scout": summarize the vault'),
+        ('note', '← "Scout" replied: scripted reply'),
+    ]
+    # the CheckAgent last-assistant-reply scan must ignore the new "note" role
+    _, check, _ = _handlers(parent.id)
+    assert 'Last reply: scripted reply' in _text(
+        _call(check, {"agent_id": child.id})
+    )
 
 
 def test_delegate_with_parent_gone():

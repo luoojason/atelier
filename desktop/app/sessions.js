@@ -15,7 +15,7 @@
      GET    /sessions                            -> {"sessions":[{id,name,status,
                                                     messages_len,parent_id,depth}]}
      GET    /sessions/{id}                       -> {id,name,status,parent_id,
-                                                    depth,browser_nav,
+                                                    depth,browser_nav,canvas_ops,
                                                     messages:[{role,text,ts}]}
      POST   /sessions/{id}/message   {"message"} -> 202 {"status":"running"}
                                        (409 {"error":"turn in progress"} mid-turn)
@@ -63,6 +63,30 @@
    was linked. Both modules are optional and guarded at every access — the
    r15 note-clobbering rule stays (the link-status note yields to any note
    text, including these).
+
+   Agent-driven card spawn (rounds 22-23): the backend's orchestra tools let an
+   agent SPAWN a card connected to its own card — no user gesture. The session
+   detail carries canvas_ops = [{kind, seq, ...payload}, …] — a QUEUE (the model
+   can emit several spawn tools in one turn, faster than this poll; a single
+   field would drop all but the last). handleCanvasOps drains every op past the
+   monotonic lastCanvasOpSeq (start 0) high-water mark, in seq order, then
+   dispatchCanvasOp routes by kind:
+     • kind "browser" (r22, OpenBrowser): {url}. openLinkedBrowser reuses an
+       already-linked browser (Atelier.links.browserElFor) if present, else
+       A.spawnApp('browser') below this card + Atelier.links.link (the
+       programmatic link — draws the arrow AND registers the pair so later
+       NavigateBrowser drives it) + AtelierApps.browserNavigate.
+     • kind "note"/"document" (r23, CreateCard): {title, content}.
+       openLinkedCard spawns the card below this one (AtelierApps.spawnNote for
+       a note; AtelierDocuments.spawn for a document, rendering the agent's HTML
+       in a sandbox="" iframe), fills it, and draws the arrow via
+       A.arrows.link DIRECTLY — NOT the browser ride-along registry (a note is
+       not a browser; browserElFor has no type guard). arrows.js auto-unlinks
+       on card:removed, so no manual teardown.
+   Cards spawned below cascade (belowPos) so a burst doesn't stack. core's
+   spawnApp, link.js, apps.js, arrows.js, and the deliverable-card globals are
+   all guarded — without them the op is consumed and the note explains. Unknown
+   kinds are a forward-compat no-op.
 
    Sessions accessor (round 17): window.AtelierSessions = { reveal(id, name) }
    is the small cross-module surface other modules (the agent-orbs widget's
@@ -195,8 +219,12 @@
   const SWEEP_MS = 2500; // child-discovery sweep cadence (GET /sessions list)
   const CHILD_DX = 70;   // revealed child sits this far right of its parent
   const CHILD_DY = 210;  // vertical step per already-revealed sibling
-  const CHILD_GONE_NOTE = 'This sub-agent session expired on the backend — '
-    + 'it cannot be restarted from this card.';
+  const CHILD_GONE_NOTE = "This helper's chat has ended and can't be restarted "
+    + 'from this card.';
+  // r24: a finished job card whose session was LRU-reclaimed shows THIS instead
+  // of the sub-agent note (it was never a sub-agent).
+  const JOB_GONE_NOTE = 'This run was cleared to free up space, so its history '
+    + 'is no longer available.';
 
   let agentSeq = 0; // 'Agent N' naming for cards spawned this page-load
 
@@ -241,6 +269,13 @@
       .atl-agent-send:disabled { opacity: 0.5; }
       .atl-agent-subdot { background: #fff; border: 2px solid var(--accent);
         box-sizing: border-box; }
+      /* orchestration event line — a delegation the transcript would otherwise
+         hide (backend "note" role). Centered, muted, framed by hairlines. */
+      .atl-agent-eventline { text-align: center; font-size: 11px;
+        color: var(--ink-dim); font-style: italic; margin: 8px 6px;
+        padding: 4px 10px; border-top: 1px dashed var(--border-soft);
+        border-bottom: 1px dashed var(--border-soft); white-space: pre-wrap;
+        word-wrap: break-word; line-height: 1.4; }
       .atl-agent-reveal { animation: atl-agent-reveal-flash 1s ease-out; }
       @keyframes atl-agent-reveal-flash {
         0%, 55% { outline: 3px solid var(--accent); outline-offset: 3px; }
@@ -310,6 +345,68 @@
   function trackSession(id, cardEl) { cardBySession.set(id, cardEl); syncSweep(); }
   function untrackSession(id) { cardBySession.delete(id); syncSweep(); }
 
+  // ── session restore across app restart (r37, frontend half) ────────────────
+  // The backend now persists sessions to disk; this remembers WHICH depth-0
+  // agent cards were open on each board (a board-scoped 'atelier.agentcards' key
+  // = [{id,name}]) and re-reveals them on load, so a closed-and-reopened app
+  // redraws the orchestrator card and — via the child-discovery sweep — its
+  // sub-agent layer. A card is "owned" when it created its own session
+  // (ensureSession); an explicit close prunes it. App QUIT never fires the close
+  // handler, so the key survives and drives the restore. Attached sub-agent
+  // cards are NOT owned (they re-reveal from the sweep once the parent is back).
+  const OWNED_KEY = 'atelier.agentcards';
+  // True only while a board switch is tearing the canvas down. A card:removed
+  // during a switch means "this card is leaving the current board's canvas",
+  // NOT "the user deleted this conversation" — so its backend session and its
+  // restore entry are preserved (returning to the board, or reopening the app,
+  // rebuilds the layer). An explicit close (× ) happens with this false and
+  // does the full teardown + DELETE.
+  let switchingBoards = false;
+  function readOwned() {
+    const v = A.store.get(OWNED_KEY, []);
+    return Array.isArray(v) ? v.filter((r) => r && r.id) : [];
+  }
+  function ownCard(id, name) {
+    if (!id) return;
+    const list = readOwned().filter((r) => r.id !== id);
+    list.push({ id: String(id), name: String(name || 'Agent') });
+    A.store.set(OWNED_KEY, list);
+  }
+  function unownCard(id) {
+    if (!id) return;
+    const list = readOwned().filter((r) => r.id !== id);
+    if (list.length !== readOwned().length) A.store.set(OWNED_KEY, list);
+  }
+  // Re-reveal the persisted depth-0 cards whose backend session still exists,
+  // pruning any that are gone. Retries while the backend is still cold-starting.
+  async function restoreOwnedCards(attempt) {
+    attempt = attempt || 0;
+    const list = readOwned();
+    if (!list.length) return;
+    let sessions;
+    try {
+      const r = await apiJson('/sessions', { method: 'GET' });
+      if (!r.ok || !r.data || !Array.isArray(r.data.sessions)) throw new Error('unavailable');
+      sessions = r.data.sessions;
+    } catch {
+      if (attempt < 12) setTimeout(() => restoreOwnedCards(attempt + 1), 2500);
+      return;
+    }
+    const aliveDepth0 = new Set(
+      sessions.filter((s) => s && s.parent_id == null && !s.job_name).map((s) => s.id)
+    );
+    const surviving = [];
+    const sessApi = window.AtelierSessions;
+    for (const rec of list) {
+      if (!aliveDepth0.has(rec.id)) continue;         // gone -> pruned
+      surviving.push(rec);
+      if (!cardBySession.has(rec.id) && sessApi && typeof sessApi.reveal === 'function') {
+        try { sessApi.reveal(rec.id, rec.name); } catch { /* card system absent */ }
+      }
+    }
+    if (surviving.length !== list.length) A.store.set(OWNED_KEY, surviving);
+  }
+
   // k in the reveal-position formula: children of this parent already on
   // canvas (the sweep stamps data-atl-parent-session on each revealed card,
   // and card:removed drops the map entry, so the count is self-maintaining).
@@ -340,8 +437,16 @@
         };
         const childEl = createAgentCard(pos, {
           id: String(item.id),
-          name: String(item.name || 'Sub-agent'),
+          name: String(item.name || 'Helper'),
           parentEl,
+          // r24: inherit keepAlive down the tree — a running JOB's delegated
+          // sub-agents must survive a board switch / close like the job card
+          // itself (else removeAllCards DELETEs them and aborts the delegation).
+          keepAlive: !!(parentEl && parentEl.dataset
+            && parentEl.dataset.atlKeepAlive === '1'),
+          // this is the child's FIRST (and only) card, so process its own fresh
+          // canvas ops — a sub-agent told to OpenBrowser must spawn the browser.
+          noBaseline: true,
         });
         if (!childEl) continue;
         childEl.dataset.atlParentSession = String(item.parent_id);
@@ -349,7 +454,7 @@
         // it auto-unlinks on card:removed, so the unlink handle can be dropped
         const arrows = window.Atelier && window.Atelier.arrows;
         if (arrows && typeof arrows.link === 'function') {
-          arrows.link(parentEl, childEl);
+          arrows.link(parentEl, childEl, { kind: 'parent' });
         }
       }
     } catch {
@@ -369,9 +474,22 @@
   // lands on the canvas-center fallback below (verified — no fix needed).
   function createAgentCard(worldPos, attach) {
     const attached = !!(attach && attach.id);
+    // r24: a job card is a VIEW onto a still-running scheduled-job session —
+    // closing it (× or a board switch's removeAllCards) must NOT DELETE the
+    // backend session, which would abort the running job and destroy its
+    // transcript. keepAlive suppresses the close-time DELETE; LRU still reclaims
+    // the session once the job finishes.
+    const keepAlive = !!(attach && attach.keepAlive);
+    // r24 fix: a FIRST card for a session (a sweep-revealed sub-agent, or a job
+    // card) must PROCESS its session's own fresh canvas ops — e.g. a sub-agent
+    // that called OpenBrowser must spawn the browser. The r22 attach-baseline
+    // (adopt-seqs-without-acting) only exists to stop a RE-reveal of a session a
+    // previous card already acted on from replaying those ops; noBaseline turns
+    // it off for the first-card cases.
+    const noBaseline = !!(attach && attach.noBaseline);
     let name;
     if (attached) {
-      name = attach.name || 'Sub-agent';
+      name = attach.name || 'Helper';
     } else {
       agentSeq += 1;
       name = 'Agent ' + agentSeq;
@@ -380,6 +498,10 @@
     // shell (same structure core's addCard expects: .card-bar / .card-x)
     const card = document.createElement('section');
     card.className = 'card app-card atl-agent-card';
+    // r24: stamp keepAlive so the child-discovery sweep can INHERIT it onto a
+    // job's sub-agent cards — otherwise a board switch would DELETE (abort) a
+    // running job's delegated children even though the job card itself is spared.
+    if (keepAlive) card.dataset.atlKeepAlive = '1';
     const bar = document.createElement('div');
     bar.className = 'card-bar';
     const dot = document.createElement('span');
@@ -394,7 +516,7 @@
     if (attached) {
       // sub-agent hint: hollow dot + tooltip; .card-bar structure untouched
       dot.classList.add('atl-agent-subdot');
-      bar.title = 'Sub-agent — spawned by another agent card';
+      bar.title = 'Helper (started by another chat)';
     }
 
     const body = document.createElement('div');
@@ -412,6 +534,7 @@
     sendBtn.className = 'atl-agent-send';
     sendBtn.textContent = '➤';
     sendBtn.title = 'Send';
+    sendBtn.setAttribute('aria-label', 'Send message');
     composer.append(ta, sendBtn);
     // link-status note sits UNDER the composer (dedicated element so it never
     // fights the error note above — see refreshLinkNote)
@@ -429,6 +552,11 @@
     let pollTimer = null;
     let thinkingRow = null;
     let lastNavSeq = 0;     // r16: highest agent-requested browser_nav.seq handled
+    let lastCanvasOpSeq = 0; // r22: highest agent-requested canvas_op.seq handled
+    let lastReadSeq = 0;    // r32: highest agent-requested browser_read.seq handled
+    let lastActSeq = 0;     // r33: highest agent-requested browser_act.seq handled
+    let attachBaselined = false; // r22: attached cards adopt existing seqs once
+    let spawnedBelow = 0;   // r23: cascade counter for cards spawned below this one
 
     if (attached) trackSession(sessionId, card); // fresh cards register in ensureSession
 
@@ -487,12 +615,264 @@
       }
     }
 
+    // Agent-driven card spawning (round 22). The backend's OpenBrowser tool
+    // sets canvas_op = {kind, url, seq} on the session; the detail poll
+    // re-delivers it every cycle, so the monotonic lastCanvasOpSeq gate fires
+    // each request exactly once. Unlike browser_nav (which drives a browser
+    // the USER linked), canvas_op tells this card to CREATE the browser card
+    // itself, arrow-link it, and drive it — no manual gesture. Both spawnApp
+    // (core), Atelier.links (link.js), and AtelierApps (apps.js) are guarded:
+    // without them the op is consumed (seq advances) and the note explains.
+    // Drain the canvas-op QUEUE (r22 browser + r23 note/document). The backend
+    // serves a LIST because the model can emit several spawn tools in ONE turn,
+    // sub-second apart — faster than this 1.5s poll — so a single field would
+    // silently drop all but the last (a lost deliverable). Act on every op past
+    // the high-water mark, in seq order, exactly once; repeats across polls
+    // (seq <= lastCanvasOpSeq) are skipped.
+    function handleCanvasOps(ops) {
+      if (closed || !Array.isArray(ops)) return;
+      const pending = ops
+        .filter((op) => op && typeof op.seq === 'number' && op.seq > lastCanvasOpSeq)
+        .sort((a, b) => a.seq - b.seq);
+      for (const op of pending) {
+        lastCanvasOpSeq = op.seq;
+        dispatchCanvasOp(op);
+      }
+    }
+
+    function dispatchCanvasOp(op) {
+      if (op.kind === 'browser') openLinkedBrowser(String(op.url || ''));
+      else if (op.kind === 'note' || op.kind === 'document') openLinkedCard(op.kind, op);
+      // unknown kinds are consumed silently — a forward-compat no-op so an
+      // older card never chokes on a newer backend op it does not understand.
+    }
+
+    // Agent-driven page read (round 32). The backend's ReadPage tool sets
+    // browser_read = {req, seq} on the session AND blocks awaiting the result —
+    // unlike browser_nav/canvas_op (fire-and-forget), this is a ROUND TRIP: the
+    // agent needs the page text back. The detail poll re-delivers it every
+    // cycle, so the monotonic lastReadSeq gate reads exactly once even while the
+    // async read is still in flight across several polls. We read THIS card's
+    // LINKED browser (the same one NavigateBrowser drives, incl. a browser the
+    // agent just OpenBrowser'd this turn) and POST the result to
+    // /sessions/{id}/browser_result keyed by req, which resolves the waiting
+    // tool. Atelier.links + AtelierApps are optional/guarded: with no linked
+    // browser (or those modules absent) we post ok:false so the tool returns a
+    // clear "no page" note instead of hanging to its 25s timeout.
+    function handleBrowserRead(read) {
+      if (closed || !read || typeof read.seq !== 'number') return;
+      if (read.seq <= lastReadSeq) return; // already handled (polls repeat it)
+      lastReadSeq = read.seq;
+      const req = read.req;
+      if (typeof req !== 'number' || !sessionId) return;
+      const post = (body) => {
+        apiJson('/sessions/' + sessionId + '/browser_result', {
+          method: 'POST',
+          body: JSON.stringify(Object.assign({ req: req }, body)),
+        }).catch(() => { /* the tool times out on its own if this never lands */ });
+      };
+      const links = window.Atelier && window.Atelier.links;
+      const browserEl = (links && typeof links.browserElFor === 'function')
+        ? links.browserElFor(card) : null;
+      const api = window.AtelierApps;
+      if (!browserEl || !api || typeof api.browserReadPage !== 'function') {
+        setNote('Agent tried to read a page but no browser card is linked — '
+          + 'shift-drag a box around a browser card and this card, or ask it to '
+          + 'open one first.');
+        post({ ok: false, error: 'no browser card is linked to this agent' });
+        return;
+      }
+      setNote('Agent is reading the linked browser page…');
+      let p = null;
+      try { p = api.browserReadPage(browserEl); } catch { p = null; }
+      Promise.resolve(p).then((out) => {
+        if (out && typeof out === 'object' && typeof out.text === 'string') {
+          post({ ok: true, url: String(out.url || ''), title: String(out.title || ''), text: out.text });
+          setNote('Agent read the linked browser page (' + out.text.length + ' chars).');
+        } else {
+          post({ ok: false, error: 'the linked browser had no readable page loaded' });
+          setNote('Agent tried to read the linked browser but no page was loaded yet.');
+        }
+      }).catch(() => { post({ ok: false, error: 'the page read failed' }); });
+    }
+
+    // Agent-driven page action (round 33). Same ROUND-TRIP contract as
+    // handleBrowserRead but it OPERATES the linked page: the backend's Click/Type
+    // tool sets browser_act = {req, seq, action, selector, text} and blocks; we
+    // run the click/type on the linked browser's live webview and POST the ack
+    // back to /sessions/{id}/browser_result keyed by req. seq-gated by lastActSeq
+    // so each act fires once even while the async action is still in flight.
+    function handleBrowserAct(act) {
+      if (closed || !act || typeof act.seq !== 'number') return;
+      if (act.seq <= lastActSeq) return; // already handled (polls repeat it)
+      lastActSeq = act.seq;
+      const req = act.req;
+      if (typeof req !== 'number' || !sessionId) return;
+      const post = (body) => {
+        apiJson('/sessions/' + sessionId + '/browser_result', {
+          method: 'POST',
+          body: JSON.stringify(Object.assign({ req: req }, body)),
+        }).catch(() => { /* the tool times out on its own if this never lands */ });
+      };
+      const action = act.action === 'type' ? 'type' : 'click';
+      const links = window.Atelier && window.Atelier.links;
+      const browserEl = (links && typeof links.browserElFor === 'function')
+        ? links.browserElFor(card) : null;
+      const api = window.AtelierApps;
+      if (!browserEl || !api || typeof api.browserAct !== 'function') {
+        setNote('Agent tried to ' + action + ' a page but no browser card is '
+          + 'linked — shift-drag a box around a browser card and this card, or '
+          + 'ask it to open one first.');
+        post({ ok: false, error: 'no browser card is linked to this agent' });
+        return;
+      }
+      setNote('Agent is operating the linked browser (' + action + ')…');
+      let p = null;
+      try { p = api.browserAct(browserEl, action, String(act.selector || ''), String(act.text || '')); }
+      catch { p = null; }
+      Promise.resolve(p).then((out) => {
+        if (out && typeof out === 'object' && out.ok) {
+          // Forward the post-click url on its OWN field (Click sets it, Type
+          // does not) so the backend can host-gate it before the model sees it.
+          post({ ok: true, text: String(out.text || ('Done: ' + action)), url: String(out.url || '') });
+          setNote('Agent ' + (action === 'type' ? 'typed into' : 'clicked') + ' the linked browser.');
+        } else if (out && typeof out === 'object') {
+          post({ ok: false, error: String(out.error || 'the action failed') });
+          setNote('Agent could not ' + action + ' the linked browser (' + String(out.error || 'no match') + ').');
+        } else {
+          post({ ok: false, error: 'the linked browser had no page to operate' });
+          setNote('Agent tried to ' + action + ' the linked browser but no page was loaded yet.');
+        }
+      }).catch(() => { post({ ok: false, error: 'the page action failed' }); });
+    }
+
+    // Position for a card the agent spawns below this one. The right lane (used
+    // by auto-revealed sub-agent children) would collide, so drop into the free
+    // lane BELOW; successive spawns cascade by `step` so a burst of CreateCard
+    // / OpenBrowser ops don't stack exactly on top of each other. left/top are
+    // world coords (core.js/arrows.js convention); using our own offsetHeight
+    // needs no target-card dimensions. Only the ACT of spawning advances the
+    // counter (the browser reuse path never calls this).
+    function belowPos() {
+      const step = spawnedBelow * 34;
+      const p = {
+        x: (parseFloat(card.style.left) || 0) + step,
+        y: (parseFloat(card.style.top) || 0) + card.offsetHeight + 40 + step,
+      };
+      spawnedBelow += 1;
+      return p;
+    }
+
+    // r23: agent-created content card (CreateCard). Generalizes the r22
+    // spawn+link path to NON-browser cards: spawn the card below this one,
+    // fill it with the agent-authored content, and draw the connecting arrow
+    // via A.arrows.link DIRECTLY — NOT the browser link registry (A.links),
+    // which is single-slot ride-along state for NavigateBrowser and has no
+    // type guard; a note/document only needs the visual arrow, and arrows.js
+    // auto-unlinks it on card:removed for either endpoint. All target modules
+    // (AtelierApps.spawnNote, AtelierDocuments.spawn, Atelier.arrows) are
+    // optional and guarded — without them the op is consumed and the note
+    // explains. Content is server-derived: notes render through mdRender
+    // (HTML-inert) and documents through document.js's sandbox="" iframe, so
+    // neither can inject markup into the app.
+    function openLinkedCard(type, op) {
+      const pos = belowPos();
+      let cardEl = null;
+      if (type === 'note') {
+        const api = window.AtelierApps;
+        if (api && typeof api.spawnNote === 'function') {
+          cardEl = api.spawnNote(String(op.content || ''), pos);
+        }
+      } else if (type === 'document') {
+        const docs = window.AtelierDocuments;
+        if (docs && typeof docs.spawn === 'function') {
+          const inst = docs.spawn({
+            worldPos: pos,
+            html: String(op.content || ''),
+            title: String(op.title || ''),
+          });
+          cardEl = inst && inst.handle ? inst.handle.el : null;
+        }
+      }
+      if (!cardEl) {
+        setNote('Agent tried to create a ' + type + ' card but that card type '
+          + 'is unavailable here.');
+        return;
+      }
+      const arrows = window.Atelier && window.Atelier.arrows;
+      if (arrows && typeof arrows.link === 'function') arrows.link(card, cardEl, { kind: 'content' });
+      setNote('Agent created a ' + type + ' card on the dashboard'
+        + (op.title ? ' — ' + String(op.title) : '') + '.');
+    }
+
+    // Spawn (or reuse) a browser card linked to THIS agent card and navigate
+    // it. Reuse: if link.js already holds a browser for this card, drive that
+    // one instead of stacking a second (OpenBrowser called twice, or after a
+    // manual marquee-link). Spawn: A.spawnApp('browser') beside this card,
+    // then Atelier.links.link registers the pair (drawing the arrow) so the
+    // auto-created browser behaves exactly like a user-linked one and later
+    // NavigateBrowser drives it. The browser card queues the load until its
+    // webview attaches (apps.js loadInTab), so navigating right after spawn is
+    // safe. The url is server-derived and only ever lands via setNote/textContent.
+    function openLinkedBrowser(url) {
+      const links = window.Atelier && window.Atelier.links;
+      const api = window.AtelierApps;
+      let browserEl = (links && typeof links.browserElFor === 'function')
+        ? links.browserElFor(card)
+        : null;
+      let spawned = false;
+      let linked = false;
+      if (!browserEl) {
+        if (typeof A.spawnApp !== 'function') {
+          setNote('Agent wanted to open ' + url + ' but browser cards are '
+            + 'unavailable here.');
+          return;
+        }
+        // Place the browser in the free lane BELOW this card (the right lane is
+        // the sub-agent child column; see belowPos), cascading past any card
+        // already spawned below.
+        const pos = belowPos();
+        browserEl = A.spawnApp('browser', pos);
+        spawned = true;
+        if (browserEl && links && typeof links.link === 'function') {
+          linked = links.link(card, browserEl) === true; // registers pair + arrow
+        }
+      }
+      let done = false;
+      if (browserEl && api && typeof api.browserNavigate === 'function') {
+        try { done = api.browserNavigate(browserEl, url); } catch { done = false; }
+      }
+      if (done) {
+        // note honesty: only claim "linked" when the arrow/registry actually
+        // registered (link.js present); an already-linked browser is reused.
+        setNote('Agent opened ' + url + (spawned
+          ? (linked ? ' in a new linked browser card' : ' in a new browser card')
+          : ' in the linked browser'));
+      } else {
+        setNote('Agent tried to open ' + url + ' but the browser card refused it.');
+      }
+    }
+
     function addBubble(role, text) {
+      // "note" role: an orchestration event (a delegation, on either the
+      // orchestrator's card as "→ Delegated …" or a sub-agent's card as
+      // "Task from orchestrator …"). A full-width centered line, no avatar —
+      // it poses as neither side of the conversation.
+      if (role === 'note') {
+        const line = document.createElement('div');
+        line.className = 'atl-agent-eventline';
+        line.textContent = text; // XSS rule: server text only ever lands here
+        line.title = text;
+        msgs.appendChild(line);
+        msgs.scrollTop = msgs.scrollHeight;
+        return line;
+      }
+      const isUser = role === 'user';
       const row = document.createElement('div');
-      row.className = 'atl-agent-row ' + (role === 'user' ? 'user' : 'assistant');
+      row.className = 'atl-agent-row ' + (isUser ? 'user' : 'assistant');
       const av = document.createElement('div');
       av.className = 'atl-agent-avatar';
-      av.textContent = role === 'user' ? 'You' : 'A';
+      av.textContent = isUser ? 'You' : 'A';
       const b = document.createElement('div');
       b.className = 'atl-agent-bubble';
       b.textContent = text; // XSS rule: server text only ever lands here
@@ -514,7 +894,7 @@
     function renderNew(messages) {
       for (let i = renderedCount; i < messages.length; i++) {
         const m = messages[i] || {};
-        addBubble(m.role === 'user' ? 'user' : 'assistant', String(m.text || ''));
+        addBubble(m.role, String(m.text || ''));
       }
       if (messages.length > renderedCount) renderedCount = messages.length;
     }
@@ -548,7 +928,11 @@
       // handleBrowserNav silently drop every new request until the fresh
       // counter climbed past it.
       lastNavSeq = 0;
+      lastCanvasOpSeq = 0; // r22: same reset rationale for the canvas_op counter
+      lastReadSeq = 0;     // r32: same reset rationale for the browser_read counter
+      lastActSeq = 0;      // r33: same reset rationale for the browser_act counter
       if (!closed) trackSession(sessionId, card); // card:removed cleans this up
+      if (!closed) ownCard(sessionId, name);      // r37: remember for restore
       return sessionId;
     }
 
@@ -580,24 +964,62 @@
           // the parent-spawned session is gone (backend restart / LRU after
           // it finished). Recreating would orphan the parent link, so this
           // card only reports it; sends fail gracefully with the same note.
+          // r24: a job card gets a job-appropriate note (it was never a sub-agent).
           expired = true;
-          setNote(CHILD_GONE_NOTE);
+          setNote(keepAlive ? JOB_GONE_NOTE : CHILD_GONE_NOTE);
           return;
         }
         // evicted server-side (LRU cap / restart) — next send starts fresh
         untrackSession(sessionId);
         sessionId = null;
-        setNote('This session expired on the backend — the next message starts a fresh one.');
+        setNote('This chat has ended. Your next message starts a fresh one.');
         return;
       }
       if (!r.ok || !r.data) { schedulePoll(); return; }
       setNote('');
       hideThinking(); // new messages must land ABOVE the thinking bubble
       renderNew(r.data.messages || []);
+      // r22: an ATTACHED card is a live VIEW onto a session another agent owns
+      // (AtelierSessions.reveal a still-live depth-0 session, or a sub-agent).
+      // Any browser_nav/canvas_op the session already holds at attach time was
+      // requested for the ORIGINAL card, not this view — adopt their seqs on the
+      // first poll WITHOUT acting, so revealing a depth-0 session can't replay a
+      // stale OpenBrowser into a spurious browser spawn. Only ops that arrive
+      // AFTER attach fire. (Sub-agents carry neither field, so this is a no-op
+      // for them.)
+      if (attached && !attachBaselined) {
+        attachBaselined = true;
+        // Skip the baseline for a FIRST card (sub-agent / job — noBaseline): it
+        // must PROCESS its session's own fresh ops. Otherwise adopt the highest
+        // existing seqs WITHOUT acting, so a RE-reveal of a session a previous
+        // card already handled does not replay a queue of stale ops.
+        if (!noBaseline) {
+          const bn = r.data.browser_nav;
+          if (bn && typeof bn.seq === 'number') lastNavSeq = bn.seq;
+          const br = r.data.browser_read; // r32: adopt without acting on re-reveal
+          if (br && typeof br.seq === 'number') lastReadSeq = br.seq;
+          const ba = r.data.browser_act;  // r33: same adopt-not-act on re-reveal
+          if (ba && typeof ba.seq === 'number') lastActSeq = ba.seq;
+          const ops = Array.isArray(r.data.canvas_ops) ? r.data.canvas_ops : [];
+          for (const op of ops) {
+            if (op && typeof op.seq === 'number' && op.seq > lastCanvasOpSeq) {
+              lastCanvasOpSeq = op.seq;
+            }
+          }
+        }
+      }
       // r16: AFTER the routine setNote('') so a fresh nav request's note
       // wins this cycle (the next healthy poll clears it — transient by
       // design; a nav landing on the turn's final poll stays visible).
       handleBrowserNav(r.data.browser_nav);
+      // r22/r23: drain the agent-driven canvas-op queue (OpenBrowser +
+      // CreateCard). A LIST so several ops from one turn all fire (see
+      // handleCanvasOps); runs after handleBrowserNav so a spawn note wins.
+      handleCanvasOps(r.data.canvas_ops);
+      // r32: AFTER handleCanvasOps so an OpenBrowser+ReadPage burst in one turn
+      // spawns/links the browser first, then reads it in the same cycle.
+      handleBrowserRead(r.data.browser_read);
+      handleBrowserAct(r.data.browser_act); // r33: click/type the linked browser
       if (r.data.status === 'running') {
         showThinking();
         schedulePoll();
@@ -609,8 +1031,9 @@
     async function send() {
       const text = ta.value.trim();
       if (!text || running || closed) return;
-      if (attached && expired) { setNote(CHILD_GONE_NOTE); return; }
+      if (attached && expired) { setNote(keepAlive ? JOB_GONE_NOTE : CHILD_GONE_NOTE); return; }
       ta.value = '';
+      autoGrow(); // collapse the composer back to one row after sending
       setNote('');
       // Linked browser context (app/link.js, optional — guarded read): when a
       // browser card is marquee-linked to this agent, the POSTED message gets
@@ -667,16 +1090,17 @@
       } catch (err) {
         optimistic.remove();
         ta.value = text; // hand the message back so a retry is one keystroke
+        autoGrow();      // re-fit the composer to the restored text
         settle();
         setNote(err && err.busy
           ? 'Atelier is still on the previous turn — try again in a moment.'
           : err && err.expired
-            ? CHILD_GONE_NOTE
+            ? (keepAlive ? JOB_GONE_NOTE : CHILD_GONE_NOTE)
             : err && err.limit
               ? 'Session limit reached — close an Agent card or wait for a turn to finish, then try again.'
               : err && err.full
                 ? 'This conversation is full — close this card and start a fresh Agent.'
-                : 'Could not reach the Atelier backend. It may still be starting — try again in a moment.');
+                : 'Could not reach Atelier. It may still be starting, so try again in a moment.');
       }
     }
 
@@ -684,18 +1108,24 @@
     ta.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
-    ta.addEventListener('input', () => {
+    function autoGrow() { // size the composer to its content (capped 120px)
+      if (!ta.value) { ta.style.height = ''; return; } // empty -> exact CSS one-row height
       ta.style.height = 'auto';
       ta.style.height = Math.min(ta.scrollHeight, 120) + 'px';
-    });
+    }
+    ta.addEventListener('input', autoGrow);
 
-    // place the card (spawnApp passes a world pos; fall back to canvas center)
+    // place the card (spawnApp passes a world pos; fall back to canvas center).
+    // r24: cascade successive center-spawned cards (jobs firing in a burst, or
+    // several reveals) so they don't stack exactly — keyed on the current card
+    // count, mod 6 like apps.js's centerPos, so it never runs away.
     let pos = worldPos;
     if (!pos) {
       const canvasEl = document.getElementById('canvas');
       const rct = canvasEl.getBoundingClientRect();
+      const casc = (cardBySession.size % 6) * 34;
       pos = A.canvas.screenToWorld(rct.left + rct.width / 2, rct.top + rct.height / 2);
-      pos = { x: pos.x - CARD_W / 2, y: pos.y - CARD_H / 2 };
+      pos = { x: pos.x - CARD_W / 2 + casc, y: pos.y - CARD_H / 2 + casc };
     }
     const handle = A.canvas.addCard(card, { x: pos.x, y: pos.y, w: CARD_W, h: CARD_H });
 
@@ -717,16 +1147,31 @@
       offLinkRem();
       if (sessionId) {
         untrackSession(sessionId);
-        // dismissed BEFORE the async DELETE: a sweep response already in
-        // flight can still list this child, and without the set it would be
-        // re-revealed as a dead card mid-deletion.
-        dismissedSessions.add(sessionId);
-        // best-effort: the backend also reclaims leaked sessions via LRU cap.
-        // An attached card deletes the CHILD session too — same close
-        // semantics as any Agent card; the parent's CheckAgent then reports
-        // the child gone, which the backend handles gracefully. ponytail: a
-        // detach-without-delete close is the upgrade.
-        apiJson('/sessions/' + sessionId, { method: 'DELETE' }).catch(() => {});
+        if (switchingBoards) {
+          // r39: a board switch is tearing the canvas down — this card is just
+          // leaving the view, not being deleted. Keep the backend session AND
+          // the restore entry so switching back (or reopening the app) rebuilds
+          // the whole layer. The board's snapshot was already taken above it, so
+          // the outgoing board still lists this card. No unown, no dismiss, no
+          // DELETE. (The backend LRU cap still reclaims if sessions pile up.)
+        } else {
+          // r37: an explicit close removes this card from the restore list.
+          unownCard(sessionId);
+          // dismissed BEFORE the async DELETE: a sweep response already in
+          // flight can still list this child, and without the set it would be
+          // re-revealed as a dead card mid-deletion.
+          dismissedSessions.add(sessionId);
+          // r24: a job card (keepAlive) is a VIEW onto a still-running scheduled
+          // job — DELETE would abort the run and destroy its transcript, so skip
+          // it; LRU reclaims the session once the job finishes. Every other card
+          // frees its backend session on close (best-effort; the backend also
+          // reclaims leaked sessions via the LRU cap). An attached agent card
+          // deletes the CHILD session too — the parent's CheckAgent then reports
+          // it gone, which the backend handles gracefully.
+          if (!keepAlive) {
+            apiJson('/sessions/' + sessionId, { method: 'DELETE' }).catch(() => {});
+          }
+        }
       }
     });
 
@@ -791,7 +1236,10 @@
   }
 
   window.AtelierSessions = {
-    reveal(sessionId, name) {
+    // reveal(id, name, opts?) — opts.keepAlive (r24) makes the revealed card a
+    // VIEW that does NOT delete its backend session on close (for a live job
+    // card bound to a still-running scheduled job; see createAgentCard).
+    reveal(sessionId, name, opts) {
       const id = String(sessionId == null ? '' : sessionId);
       if (!id) return null;
       const existing = cardBySession.get(id);
@@ -815,6 +1263,12 @@
         id,
         name: String(name || 'Agent'),
         parentEl: null,
+        keepAlive: !!(opts && opts.keepAlive),
+        // a job card (keepAlive) is the FIRST card for its session — process
+        // its own fresh ops (a job that calls OpenBrowser/CreateCard shows it).
+        // An orb-click / manual reveal of an existing session keeps the baseline
+        // (it may be a re-reveal), unless the caller opts out.
+        noBaseline: !!(opts && (opts.noBaseline || opts.keepAlive)),
       });
       if (el) flashReveal(el);
       return el;
@@ -827,15 +1281,31 @@
   // handler lives in this module anymore.
 
   // ── board switch ───────────────────────────────────────────────────────────
-  // Nothing to do here on purpose. Agent cards are ordinary addCard cards, so
-  // boards' in-place switch closes them at its canvas.removeAllCards() step
-  // (AFTER the snapshot quota gate) and each card's card:removed handler above
-  // does the full teardown: stop poll, untrack, mark dismissed, best-effort
-  // DELETE, arrows unlink. An earlier 'boards:will-switch' close was removed —
-  // it fired BEFORE the quota gate, so a switch that aborted on the "storage
-  // is full" toast (board unchanged) had already destroyed every agent
-  // conversation on both sides. Nothing to flush either: this module never
-  // writes board-scoped store keys.
+  // Agent cards are ordinary addCard cards, so boards' in-place switch closes
+  // them at its canvas.removeAllCards() step (AFTER the snapshot quota gate) and
+  // each card's card:removed handler above does the full teardown: stop poll,
+  // untrack, mark dismissed, best-effort DELETE, arrows unlink. An earlier
+  // 'boards:will-switch' close was removed — it fired BEFORE the quota gate, so
+  // a switch that aborted on the "storage is full" toast had already destroyed
+  // every agent conversation. The one board-scoped key this module writes
+  // (r37 'atelier.agentcards') is snapshotted by boards BEFORE removeAllCards, so
+  // the outgoing board's saved state still lists its cards.
+
+  // r37: restore persisted depth-0 agent cards for the CURRENT board. boot()
+  // does not emit 'boards:switched' (the active board's state IS the live keys),
+  // so kick a restore on load — it retries until the backend is reachable — and
+  // re-run it after every board switch (the newly-mounted board's key is live).
+  // switchTo() emits will-switch, then `await captureThumb()`, THEN
+  // removeAllCards() (boards.js:308-316). The flag must stay true across that
+  // await — a timer-based clear would fire in the gap and let the cards delete —
+  // so it is cleared ONLY by boards:switched, which fires after removeAllCards.
+  // A switch that ABORTS at the quota gate never emits switched, so the flag can
+  // linger true until the next switch; worst case an explicit close then skips
+  // its DELETE and the backend LRU cap reclaims that one session later. That
+  // rare, self-healing leak is well worth not deleting every layer on a switch.
+  A.bus.on('boards:will-switch', () => { switchingBoards = true; });
+  A.bus.on('boards:switched', () => { switchingBoards = false; restoreOwnedCards(); });
+  restoreOwnedCards();
 
   // ── self-check ─────────────────────────────────────────────────────────────
   (function selfCheck() {

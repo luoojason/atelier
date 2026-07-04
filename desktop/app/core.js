@@ -82,6 +82,13 @@
 
   function applyTransform() {
     content.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+    // The dotted grid is a CSS background on the (static) .canvas, so it must be
+    // panned/zoomed by hand to track #content's transform — otherwise the dots
+    // sit still while the cards move. background-position follows the pan and
+    // background-size scales the 22px world spacing by zoom, so the dots stay
+    // locked to world coordinates.
+    canvas.style.backgroundPosition = `${panX}px ${panY}px`;
+    canvas.style.backgroundSize = `${22 * zoom}px ${22 * zoom}px`;
     zoomLabel.textContent = Math.round(zoom * 100) + '%';
     scheduleMinimap(); // hoisted; throttled ~250ms, so per-mousemove calls are cheap
   }
@@ -100,8 +107,23 @@
   document.getElementById('zoom-in').onclick = () => zoomCenter(zoom * 1.15);
   document.getElementById('zoom-out').onclick = () => zoomCenter(zoom / 1.15);
 
+  // Wheel zooms the board — UNLESS the pointer is over a scrollable region
+  // inside a card (a chat transcript, a note, a list, a textarea, …), in which
+  // case that region scrolls and the board does not zoom. Walk from the wheel
+  // target up to the card and bail if any ancestor can actually scroll.
+  function overScrollableCard(el) {
+    if (!el || !el.closest || !el.closest('.card')) return false;
+    let n = el;
+    while (n && n !== canvas && n.nodeType === 1) {
+      if (n.tagName === 'TEXTAREA') return true;
+      const oy = getComputedStyle(n).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && n.scrollHeight > n.clientHeight + 1) return true;
+      n = n.parentElement;
+    }
+    return false;
+  }
   canvas.addEventListener('wheel', (e) => {
-    if (e.target.closest('.chat-body') || e.target.closest('textarea')) return; // let cards scroll
+    if (overScrollableCard(e.target)) return; // let the card region scroll
     e.preventDefault();
     const r = canvas.getBoundingClientRect();
     const factor = e.ctrlKey ? (1 - e.deltaY * 0.01) : (e.deltaY < 0 ? 1.1 : 1 / 1.1);
@@ -505,6 +527,7 @@
   let mmMap = null; // world->minimap transform of the last draw (for inverse)
   let mmVisible = store.get('minimap', true) !== false; // default ON (shell shows one)
   let mmLast = 0, mmTimer = null;
+  let mmDrag = null; // frozen world->minimap transform held for a whole drag
 
   function drawMinimap() {
     if (!mmSvg || !mmVisible) return;
@@ -524,12 +547,20 @@
       minX = Math.min(minX, c.x); minY = Math.min(minY, c.y);
       maxX = Math.max(maxX, c.x + c.w); maxY = Math.max(maxY, c.y + c.h);
     });
-    const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
-    const scale = Math.min(W / bw, H / bh);
-    const ox = (W - bw * scale) / 2, oy = (H - bh * scale) / 2;
-    mmMap = { scale, minX, minY, ox, oy };
-    const px = (wx) => (wx - minX) * scale + ox;
-    const py = (wy) => (wy - minY) * scale + oy;
+    if (mmDrag) {
+      // FROZEN frame: during a minimap drag the transform is held fixed so the
+      // coordinate system cannot re-fit under the cursor (the viewport rect is
+      // part of the union bbox above, so panning would otherwise shift the frame
+      // and make the drag jump). Only the viewport indicator moves in this frame.
+      mmMap = mmDrag;
+    } else {
+      const bw = Math.max(1, maxX - minX), bh = Math.max(1, maxY - minY);
+      const scale = Math.min(W / bw, H / bh);
+      mmMap = { scale, minX, minY, ox: (W - bw * scale) / 2, oy: (H - bh * scale) / 2 };
+    }
+    const px = (wx) => (wx - mmMap.minX) * mmMap.scale + mmMap.ox;
+    const py = (wy) => (wy - mmMap.minY) * mmMap.scale + mmMap.oy;
+    const scale = mmMap.scale; // used below for rect sizing (frozen or fresh)
 
     mmSvg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
     mmSvg.textContent = '';
@@ -585,9 +616,21 @@
     // click (or drag) pans the canvas so the pointed world point centers
     mmSvg.addEventListener('mousedown', (e) => {
       e.preventDefault();
+      // Freeze the current fit for the whole drag so the frame can't shift under
+      // the cursor (see drawMinimap) — this is what makes the drag smooth. Redraw
+      // directly on each move (cheap; a few rects) so the indicator tracks live
+      // rather than lagging behind the 250ms throttle.
+      drawMinimap();     // refresh mmMap to the current state
+      mmDrag = mmMap;    // freeze it
       minimapPanTo(e.clientX, e.clientY);
-      const move = (ev) => minimapPanTo(ev.clientX, ev.clientY);
-      const up = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', up); };
+      drawMinimap();
+      const move = (ev) => { minimapPanTo(ev.clientX, ev.clientY); drawMinimap(); };
+      const up = () => {
+        window.removeEventListener('mousemove', move);
+        window.removeEventListener('mouseup', up);
+        mmDrag = null;   // unfreeze; re-fit to the new viewport/cards
+        drawMinimap();
+      };
       window.addEventListener('mousemove', move);
       window.addEventListener('mouseup', up);
     });
@@ -881,14 +924,14 @@
           bus.emit('chat:reply', { data });
         } catch {
           t.classList.remove('thinking');
-          t.textContent = 'Could not reach the Atelier backend. It may still be starting — try again in a moment.';
+          t.textContent = 'Could not reach Atelier. It may still be starting, so try again in a moment.';
         }
       }
     } finally {
       sending = false; sendEl.disabled = false; scrollBottom(); inputEl.focus();
     }
   }
-  function grow() { inputEl.style.height = 'auto'; inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px'; }
+  function grow() { if (!inputEl.value) { inputEl.style.height = ''; return; } inputEl.style.height = 'auto'; inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + 'px'; }
   inputEl.addEventListener('input', grow);
   inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
   sendEl.addEventListener('click', send);
@@ -911,7 +954,7 @@
   function setStatus(ok) {
     dotEl.classList.remove('ok', 'bad');
     if (ok === true) { dotEl.classList.add('ok'); statusTextEl.textContent = 'on subscription'; }
-    else if (ok === false) { dotEl.classList.add('bad'); statusTextEl.textContent = 'backend offline'; }
+    else if (ok === false) { dotEl.classList.add('bad'); statusTextEl.textContent = 'Atelier offline'; }
     else { statusTextEl.textContent = 'connecting…'; }
     bus.emit('backend:status', { ok });
   }

@@ -12,7 +12,14 @@ import httpx
 from agency_swarm.tools import BaseTool
 from pydantic import Field
 
-_USER_AGENT = "Mozilla/5.0"
+# A complete, realistic browser User-Agent. A bare "Mozilla/5.0" is fingerprinted
+# as a bot by many sites (Reddit 403s it on every endpoint, including its RSS);
+# a full Chrome UA gets served normally, so WebFetch reads far more of the web
+# (e.g. a subreddit's .rss feed for the reddit-stories pipeline).
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+    " (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 _TIMEOUT = 12
 
 # The lite results page lists each hit as an anchor with class 'result-link'

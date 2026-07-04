@@ -88,10 +88,18 @@
       .atl-arrow-layer { position: absolute; left: 0; top: 0;
         width: 1px; height: 1px; overflow: visible;
         pointer-events: none; z-index: 5; }
-      .atl-arrow-layer .atl-arrow { stroke: var(--accent); stroke-width: 2;
-        fill: none; opacity: .55; stroke-dasharray: 6 6;
-        animation: atl-arrow-flow 1.6s linear infinite; }
+      .atl-arrow-layer .atl-arrow { stroke: var(--accent); stroke-width: 2.5;
+        fill: none; opacity: .82; stroke-dasharray: 7 5; stroke-linecap: round;
+        filter: drop-shadow(0 1px 2px rgba(179, 74, 38, .35));
+        animation: atl-arrow-flow 1.4s linear infinite; }
       @keyframes atl-arrow-flow { to { stroke-dashoffset: -12; } }
+      /* group hull: a soft rounded box around each connected cluster of cards
+         (an orchestrator + its sub-agents + linked tools). Rendered behind the
+         arrows (inserted before the paths), tinted with the accent. */
+      .atl-arrow-layer .atl-group-hull {
+        fill: color-mix(in srgb, var(--accent) 5%, transparent);
+        stroke: color-mix(in srgb, var(--accent) 38%, transparent);
+        stroke-width: 1.5; pointer-events: none; }
     `;
     document.head.appendChild(style);
   })();
@@ -166,6 +174,67 @@
       `${q.x + q.nx * bend} ${q.y + q.ny * bend}, ${q.x} ${q.y}`);
   }
 
+  // ── group hulls: a rounded box around each connected cluster ───────────────
+  // Cards joined (transitively) by arrows form a "connected setup" — an
+  // orchestrator + its sub-agents + linked tools/browsers/loops. A soft rounded
+  // rect is drawn around each such cluster (>=2 cards), recomputed every refresh
+  // so it follows drags/pan/zoom for free (world coords in #content).
+  const hullRects = []; // pooled <rect>, reused across frames (hidden when spare)
+  const HULL_PAD = 18;
+
+  function ensureHulls(n) {
+    while (hullRects.length < n) {
+      const rect = document.createElementNS(SVG_NS, 'rect');
+      rect.setAttribute('class', 'atl-group-hull');
+      rect.setAttribute('rx', '20'); rect.setAttribute('ry', '20');
+      layer.insertBefore(rect, layer.firstChild); // behind the arrow paths
+      hullRects.push(rect);
+    }
+  }
+
+  // connected components of the arrow graph, via union-find over linked els.
+  function components() {
+    const parent = new Map();
+    const find = (x) => {
+      let r = x;
+      while (parent.get(r) !== r) r = parent.get(r);
+      while (parent.get(x) !== r) { const nx = parent.get(x); parent.set(x, r); x = nx; }
+      return r;
+    };
+    const add = (x) => { if (!parent.has(x)) parent.set(x, x); };
+    links.forEach((l) => { add(l.from); add(l.to); parent.set(find(l.from), find(l.to)); });
+    const groups = new Map();
+    parent.forEach((_, el) => {
+      const root = find(el);
+      if (!groups.has(root)) groups.set(root, []);
+      groups.get(root).push(el);
+    });
+    return Array.from(groups.values()).filter((g) => g.length >= 2);
+  }
+
+  function drawHulls(live) {
+    const comps = components();
+    ensureHulls(comps.length);
+    hullRects.forEach((rect, i) => {
+      if (i >= comps.length) { rect.style.display = 'none'; return; }
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      comps[i].forEach((el) => {
+        if (!el || !el.isConnected) return;
+        const r = worldRect(el, live);
+        if (minX > r.x) minX = r.x;
+        if (minY > r.y) minY = r.y;
+        if (maxX < r.x + r.w) maxX = r.x + r.w;
+        if (maxY < r.y + r.h) maxY = r.y + r.h;
+      });
+      if (!isFinite(minX)) { rect.style.display = 'none'; return; }
+      rect.style.display = '';
+      rect.setAttribute('x', String(minX - HULL_PAD));
+      rect.setAttribute('y', String(minY - HULL_PAD));
+      rect.setAttribute('width', String(maxX - minX + HULL_PAD * 2));
+      rect.setAttribute('height', String(maxY - minY + HULL_PAD * 2));
+    });
+  }
+
   // ── link registry + redraw scheduling ─────────────────────────────────────
   const links = new Set(); // { from, to, path, observers[], unlink }
 
@@ -186,9 +255,17 @@
       if (!link.from.isConnected || !link.to.isConnected) { link.unlink(); return; }
       drawLink(link, live);
     });
+    drawHulls(live); // group boxes recompute every frame -> follow drags/pan/zoom
   }
 
-  function link(fromEl, toEl) {
+  // link(fromEl, toEl, opts) — opts.kind (optional) tags the arrow so a
+  // caller can later clear ONLY arrows of one kind. Kinds in use: 'parent'
+  // (orchestrator/sweep -> sub-agent), 'browser' (a marquee/OpenBrowser
+  // ride-along), 'content' (agent -> a note/document it created). govern.js
+  // clears only 'parent' arrows into a re-parented child, so governing an
+  // agent no longer wipes its linked browser (direction alone can't tell them
+  // apart — a browser ride-along is also incoming to the agent).
+  function link(fromEl, toEl, opts) {
     if (!fromEl || !toEl || fromEl === toEl) {
       console.warn('[arrows] link() needs two distinct elements.');
       return function unlink() {};
@@ -206,14 +283,17 @@
       return obs;
     });
 
-    const entry = { from: fromEl, to: toEl, path, observers, unlink };
+    const entry = { from: fromEl, to: toEl, path, observers, unlink,
+      kind: (opts && opts.kind) || null };
     function unlink() {
       if (!links.delete(entry)) return; // idempotent
       observers.forEach((o) => o.disconnect());
       path.remove();
+      scheduleRefresh(); // recompute group hulls without this link
     }
     links.add(entry);
     drawLink(entry);
+    scheduleRefresh(); // recompute group hulls with this new link
     return unlink;
   }
 
@@ -224,10 +304,21 @@
   // hold no unlink() handle for (e.g. sessions.js's sweep auto-reveal draws
   // straight into this module's own registry). Snapshot first: unlink()
   // mutates `links` mid-iteration otherwise.
-  function unlinkTouching(el) {
+  // dir (optional): 'to' unlinks only arrows POINTING AT el (to === el); 'from'
+  // only arrows LEAVING el; omitted = either endpoint (the original behavior).
+  // kind (optional): when set, only arrows tagged that kind are unlinked.
+  // Together they let govern.js clear a child's INCOMING 'parent' arrow when it
+  // is re-parented WITHOUT wiping the child's OWN outgoing arrows to its
+  // sub-agents (a chain A3->A1->A2 keeps A1->A2 when A3 governs A1) AND without
+  // wiping a browser ride-along that is also incoming to the same agent.
+  function unlinkTouching(el, dir, kind) {
     if (!el) return;
     Array.from(links).forEach((entry) => {
-      if (entry.from === el || entry.to === el) entry.unlink();
+      if (kind && entry.kind !== kind) return;
+      const match = dir === 'to' ? entry.to === el
+        : dir === 'from' ? entry.from === el
+        : (entry.from === el || entry.to === el);
+      if (match) entry.unlink();
     });
   }
 

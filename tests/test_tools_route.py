@@ -1,8 +1,9 @@
 """Tests for lite_server's GET /tools (r16 Feature 2) — the read-only tool
 registry the tool-inspector card renders: the 16 atelier LIGHT_TOOLS
 introspected with the SAME schema builder sdk_tools uses to register them,
-plus the orchestra tools (SpawnAgent/CheckAgent/NavigateBrowser) with their
-declared schemas. Fixed shape, never 500, no token (read-only GET).
+plus the orchestra tools (SpawnAgent/CheckAgent/NavigateBrowser/OpenBrowser/
+CreateCard/DelegateToSubagent) with their declared schemas. Fixed shape, never
+500, no token (read-only GET).
 
 Needs the extension venv:
 
@@ -32,6 +33,11 @@ ORCHESTRA_NAMES = {
     "CheckAgent",
     "NavigateBrowser",
     "DelegateToSubagent",
+    "OpenBrowser",
+    "CreateCard",
+    "ReadPage",
+    "Click",
+    "Type",
 }
 
 
@@ -64,7 +70,9 @@ def test_shape(client):
 # ── the atelier tools ────────────────────────────────────────────────────────
 
 def test_all_atelier_tools_present(client):
-    assert len(lite_server.LIGHT_TOOLS) == 16  # the card counts on all 16 (incl. 4 Notion)
+    assert len(lite_server.LIGHT_TOOLS) == 19  # incl. 4 Notion + 3 workspace file tools
+    names = {cls.__name__ for cls in lite_server.LIGHT_TOOLS}
+    assert {"WriteFile", "ReadFile", "ListFiles"} <= names  # the workspace file tools
     atelier = [t for t in _tools(client) if t["server"] == "atelier"]
     assert {t["name"] for t in atelier} == {
         cls.__name__ for cls in lite_server.LIGHT_TOOLS
@@ -87,12 +95,33 @@ def test_orchestra_entries_present(client):
         t["name"]: t for t in _tools(client) if t["server"] == "orchestra"
     }
     assert set(orchestra) == ORCHESTRA_NAMES
-    for entry in orchestra.values():
-        assert entry["availability"] == "agent cards (depth 0)"
+    # two tiers: spawn tools are depth-0 only; canvas tools reach every session
+    # (so a sub-agent can open a browser / create a card); delegate needs children
+    assert orchestra["SpawnAgent"]["availability"] == "agent cards (depth 0)"
+    assert orchestra["CheckAgent"]["availability"] == "agent cards (depth 0)"
+    assert orchestra["OpenBrowser"]["availability"] == "all agent sessions"
+    assert orchestra["NavigateBrowser"]["availability"] == "all agent sessions"
+    assert orchestra["CreateCard"]["availability"] == "all agent sessions"
+    assert orchestra["ReadPage"]["availability"] == "all agent sessions"
+    assert orchestra["ReadPage"]["input_schema"].get("required", []) == []
+    assert "untrusted" in orchestra["ReadPage"]["description"]
+    assert orchestra["Click"]["availability"] == "all agent sessions"
+    assert orchestra["Click"]["input_schema"]["required"] == ["selector"]
+    assert orchestra["Type"]["availability"] == "all agent sessions"
+    assert orchestra["Type"]["input_schema"]["required"] == ["selector", "text"]
+    assert orchestra["DelegateToSubagent"]["availability"] == "sessions governing sub-agents"
     assert orchestra["SpawnAgent"]["input_schema"]["required"] == ["task"]
     assert orchestra["CheckAgent"]["input_schema"]["required"] == ["agent_id"]
     assert orchestra["NavigateBrowser"]["input_schema"]["required"] == ["url"]
     assert "linked" in orchestra["NavigateBrowser"]["description"]
+    assert orchestra["OpenBrowser"]["input_schema"]["required"] == ["url"]
+    # OpenBrowser spawns a NEW card (vs NavigateBrowser driving a linked one)
+    assert "arrow" in orchestra["OpenBrowser"]["description"]
+    assert orchestra["CreateCard"]["input_schema"]["required"] == ["kind", "content"]
+    assert orchestra["CreateCard"]["input_schema"]["properties"]["kind"]["enum"] == [
+        "note",
+        "document",
+    ]
     assert orchestra["DelegateToSubagent"]["input_schema"]["required"] == [
         "subagent",
         "task",

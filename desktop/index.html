@@ -11,14 +11,14 @@
     <header class="topbar">
       <div class="tb-left">
         <span class="traffic-space"></span>
-        <button class="icon-btn" title="Toggle sidebar">▨</button>
-        <button class="icon-btn" title="Back">‹</button>
-        <button class="icon-btn" title="Forward">›</button>
+        <button class="icon-btn" title="Toggle sidebar" aria-label="Toggle sidebar">▨</button>
+        <button class="icon-btn" title="Back" aria-label="Back">‹</button>
+        <button class="icon-btn" title="Forward" aria-label="Forward">›</button>
       </div>
       <div class="tb-center">
         <div class="search">
           <span class="search-ic">⌕</span>
-          <input placeholder="Search…" />
+          <input placeholder="Search…" aria-label="Search apps, cards, and boards" />
           <span class="kbd">⌘K</span>
         </div>
       </div>
@@ -55,7 +55,7 @@
             <div class="card-bar">
               <span class="card-dot"></span>
               <span class="card-title">Atelier · metrics</span>
-              <span class="card-x">×</span>
+              <button type="button" class="card-x" aria-label="Close">×</button>
             </div>
             <div class="metrics-body">
               <div class="stat"><div class="num">10</div><div class="lab">deliverables</div></div>
@@ -75,9 +75,9 @@
           <section class="card chat-card" data-card="chat" style="left: 230px; top: 336px;">
             <div class="card-bar">
               <span class="card-dot"></span>
-              <span class="card-title">Atelier — session</span>
+              <span class="card-title">Atelier · chat</span>
               <span class="card-badge">Claude Max</span>
-              <span class="card-x">×</span>
+              <button type="button" class="card-x" aria-label="Close">×</button>
             </div>
             <div class="chat-body" id="messages">
               <div class="empty" id="empty-state">
@@ -87,7 +87,7 @@
             </div>
             <div class="composer">
               <textarea id="input" rows="1" placeholder="Message Atelier…"></textarea>
-              <button id="send" class="send">➤</button>
+              <button id="send" class="send" aria-label="Send message">➤</button>
             </div>
           </section>
 
@@ -95,12 +95,12 @@
 
         <!-- Bottom dock -->
         <div class="dock">
-          <button class="dock-btn active" title="Chat">💬</button>
-          <button class="dock-btn" title="Apps">▦</button>
-          <button class="dock-btn" title="Browser">🌐</button>
-          <button class="dock-btn accent-btn" title="Campaign">↺</button>
-          <button class="dock-btn" title="Notes">🗒</button>
-          <button class="dock-btn" title="History">🕘</button>
+          <button class="dock-btn active" title="Chat" aria-label="Chat">💬</button>
+          <button class="dock-btn" title="Apps" aria-label="Apps">▦</button>
+          <button class="dock-btn" title="Browser" aria-label="Browser">🌐</button>
+          <button class="dock-btn accent-btn" title="Campaign" aria-label="Campaign">↺</button>
+          <button class="dock-btn" title="Notes" aria-label="Notes">🗒</button>
+          <button class="dock-btn" title="History" aria-label="History">🕘</button>
         </div>
 
         <!-- Minimap -->
@@ -113,12 +113,12 @@
 
         <!-- Zoom -->
         <div class="zoombar">
-          <button id="zoom-out">−</button>
+          <button id="zoom-out" aria-label="Zoom out">−</button>
           <span id="zoom-level">100%</span>
-          <button id="zoom-in">+</button>
-          <button title="Fit">⤢</button>
-          <button class="accent-ic" title="Auto-arrange">✦</button>
-          <button title="Minimap">▣</button>
+          <button id="zoom-in" aria-label="Zoom in">+</button>
+          <button title="Fit" aria-label="Fit">⤢</button>
+          <button class="accent-ic" title="Auto-arrange" aria-label="Auto-arrange">✦</button>
+          <button title="Minimap" aria-label="Minimap">▣</button>
         </div>
       </main>
 
@@ -144,6 +144,10 @@
          cards through Atelier.arrows (guarded, so a 404 here stays harmless). -->
     <script defer src="app/arrows.js"></script>
     <script defer src="app/sessions.js"></script>
+    <!-- jobcards.js after sessions.js: watches GET /sessions for fired
+         scheduled-job sessions and auto-reveals each as a live chat card via
+         AtelierSessions.reveal; guards its deps so a 404 stays harmless. -->
+    <script defer src="app/jobcards.js"></script>
     <!-- chatcontrols.js after sessions.js: the shared per-composer model
          picker (Part B) mounts onto the main chat composer and each agent
          card; it guards window.Atelier so a 404 stays harmless under defer. -->
@@ -161,6 +165,20 @@
     <script defer src="app/versions.js"></script>
     <script defer src="app/runlog.js"></script>
     <script defer src="app/miniapp.js"></script>
+    <!-- document.js: the ported docs_agent deliverable — a Document card that
+         generates a print-ready HTML document and exports it to PDF (Electron
+         printToPDF via the preload bridge) or HTML. Guards window.Atelier so a
+         404 stays harmless under defer. -->
+    <script defer src="app/document.js"></script>
+    <!-- research.js after document.js: reuses document.js's shared card CSS.
+         The ported deep_research deliverable — a Research card that runs a
+         keyless multi-source research loop and produces a cited HTML report,
+         exportable to PDF/HTML. Guards window.Atelier so a 404 stays harmless. -->
+    <script defer src="app/research.js"></script>
+    <!-- deck.js: the ported slides_agent deliverable — a Slides card that
+         authors a structured deck, previews it, and exports a real editable
+         .pptx (built server-side with python-pptx). Reuses document.js CSS. -->
+    <script defer src="app/deck.js"></script>
     <script defer src="app/toolinspector.js"></script>
     <script defer src="app/tour.js"></script>
     <!-- Phase B living widgets (each registers one type; widgets.js machinery
@@ -172,9 +190,54 @@
     <script defer src="app/widget-burn.js"></script>
     <script defer src="app/widget-heartbeat.js"></script>
     <script defer src="app/jobsedit.js"></script>
+    <!-- loopcard.js: a visual per-chat scheduler ("Loop") — pick a schedule +
+         task, it becomes a real scheduler job (POST /jobs) with a countdown
+         ring, and fires reveal as live chat cards (jobcards.js). ⌘K -> Loop. -->
+    <script defer src="app/loopcard.js"></script>
+    <!-- slashcommands.js: "/" menu on every chat composer (main + agent cards);
+         prompt-template / app-spawn / action commands, fully customizable via a
+         manager panel (⌘K -> Manage slash commands), user commands persisted. -->
+    <script defer src="app/slashcommands.js"></script>
+    <!-- external.js: connect Iris/Hermes/OpenClaw or any OpenAI-compatible agent
+         as a first-class canvas chat card (backend forwards via /external/*). -->
+    <script defer src="app/external.js"></script>
+    <!-- premium.js: the Workflow AI paywall scaffold (a locked premium card +
+         a global license gate) — the product itself is a future build. -->
+    <script defer src="app/premium.js"></script>
     <script defer src="vendor/chart.umd.min.js"></script>
     <script defer src="app/views.js"></script>
     <script defer src="app/analytics.js"></script>
     <script defer src="app/graph.js"></script>
+    <!-- Phase 1 safety + trust surfaces: a live usage/STOP HUD and a
+         hold-for-approval lane over what agents produce. Self-contained modules. -->
+    <script defer src="app/cost.js"></script>
+    <script defer src="app/approvals.js"></script>
+    <!-- Phase 2 own-the-last-mile: in-app render + player, a run receipt
+         (provenance/undo), and honest publish/export. Self-contained modules. -->
+    <script defer src="app/render.js"></script>
+    <script defer src="app/receipt.js"></script>
+    <script defer src="app/publish.js"></script>
+    <!-- Phase 3 walk-away & stay-oriented: welcome-back digest, desktop
+         notifications, and an autonomy dial. Self-contained modules. -->
+    <script defer src="app/welcome.js"></script>
+    <script defer src="app/notify.js"></script>
+    <script defer src="app/autonomy.js"></script>
+    <!-- Phase 4 depth, calm & craft: focus/calm mode + wellbeing, a run ledger
+         (ops rigor), and opt-in state-carrying sound. Self-contained modules. -->
+    <script defer src="app/focus.js"></script>
+    <script defer src="app/ledger.js"></script>
+    <script defer src="app/sound.js"></script>
+    <!-- Phase 5 growth: re-runnable/shareable Playbooks, an honest Free/Pro plans
+         panel, and a Playbook marketplace. Playbook loads before market (market
+         consumes window.AtelierPlaybook). Self-contained modules. -->
+    <script defer src="app/playbook.js"></script>
+    <script defer src="app/plans.js"></script>
+    <script defer src="app/market.js"></script>
+    <!-- recipes.js loads last: a full-canvas "front door" that greets an empty
+         board with a gallery of ready-to-run recipes, spawns an orchestrator
+         agent card for the chosen one, and narrates the run. Its board:switched
+         and card:added/removed listeners must fire after the card-owning
+         modules re-mount, so keep it at the end. -->
+    <script defer src="app/recipes.js"></script>
   </body>
 </html>

@@ -290,6 +290,85 @@ function createWindow() {
 
 // ── webview hardening + renderer IPC ────────────────────────────────────────
 
+// A clean Chrome UA (Electron + the app's own product token stripped), derived
+// from Electron's default so the Chrome major/build always matches this runtime.
+function cleanChromeUA() {
+  return String(app.userAgentFallback || '')
+    .replace(/\s*Electron\/\S+/i, '')
+    .replace(/\s*Atelier\/\S+/i, '');
+}
+
+// Rewrite the User-Agent Client Hints on a browser partition session so sites
+// see plain Chrome (not Electron). Registered once per session (WeakSet guard);
+// only ever called with a webview's partition session, never the default one.
+const _chPatched = new WeakSet();
+function patchClientHints(sess) {
+  if (!sess || _chPatched.has(sess)) return;
+  _chPatched.add(sess);
+  const ua = cleanChromeUA();
+  const major = (ua.match(/Chrome\/(\d+)/i) || [, '130'])[1];
+  const full = (ua.match(/Chrome\/([\d.]+)/i) || [, '130.0.0.0'])[1];
+  const brandList = `"Chromium";v="${major}", "Google Chrome";v="${major}", "Not?A_Brand";v="99"`;
+  const fullList = `"Chromium";v="${full}", "Google Chrome";v="${full}", "Not?A_Brand";v="99.0.0.0"`;
+  try {
+    sess.webRequest.onBeforeSendHeaders((details, cb) => {
+      const h = details.requestHeaders;
+      for (const k of Object.keys(h)) {
+        const lk = k.toLowerCase();
+        if (lk === 'sec-ch-ua') h[k] = brandList;
+        else if (lk === 'sec-ch-ua-full-version-list') h[k] = fullList;
+        else if (lk === 'sec-ch-ua-platform') h[k] = '"macOS"';
+        else if (lk === 'sec-ch-ua-mobile') h[k] = '?0';
+      }
+      cb({ requestHeaders: h });
+    });
+  } catch { /* leave the apps.js UA-string tweak in place */ }
+}
+
+// The header rewrite above fixes what the NETWORK sees, but page JS still reads
+// navigator.userAgentData.brands as "Chromium" under Electron — the exact tell
+// Google uses to block embedded sign-in ("this browser may not be secure").
+// CDP Network.setUserAgentOverride with userAgentMetadata is the only in-webview
+// primitive that rewrites that in-page object (it is what Puppeteer/Playwright
+// use for page.setUserAgent). It is passive — only sets the override, never
+// pauses execution — so there is no hang risk. Attaching drops when the user
+// opens the card's DevTools, so re-apply on devtools-closed. Best-effort: if CDP
+// is unavailable the UA string + Sec-CH-UA rewrite still stand.
+function attachUaMetadata(contents) {
+  const ua = cleanChromeUA();
+  const major = (ua.match(/Chrome\/(\d+)/i) || [, '130'])[1];
+  const full = (ua.match(/Chrome\/([\d.]+)/i) || [, '130.0.0.0'])[1];
+  const brands = (fullVer) => [
+    { brand: 'Chromium', version: fullVer ? full : major },
+    { brand: 'Google Chrome', version: fullVer ? full : major },
+    { brand: 'Not?A_Brand', version: fullVer ? '99.0.0.0' : '99' },
+  ];
+  const apply = () => {
+    try { contents.debugger.attach('1.3'); } catch { /* already attached */ }
+    try {
+      contents.debugger
+        .sendCommand('Network.setUserAgentOverride', {
+          userAgent: ua,
+          acceptLanguage: 'en-US,en',
+          platform: 'macOS',
+          userAgentMetadata: {
+            brands: brands(false),
+            fullVersionList: brands(true),
+            fullVersion: full,
+            platform: 'macOS',
+            platformVersion: '',
+            architecture: process.arch === 'arm64' ? 'arm' : 'x86',
+            model: '',
+            mobile: false,
+          },
+        })
+        .catch(() => { /* async reject — the header/UA-string disguise still stands */ });
+    } catch { /* debugger not attached — ignore */ }
+  };
+  apply();
+  contents.on('devtools-closed', apply);   // DevTools steals the CDP target; restore on close
+}
+
 app.on('web-contents-created', (_event, contents) => {
   // No webview preload in v1: strip any preload a <webview> tag (or a
   // compromised page) tries to attach. The effective key lives on the
@@ -307,6 +386,16 @@ app.on('web-contents-created', (_event, contents) => {
     webPreferences.contextIsolation = true;
   });
   if (contents.getType() === 'webview') {
+    // Make the Chrome disguise CONSISTENT: the UA string is stripped to Chrome
+    // in apps.js, but the User-Agent Client Hints (Sec-CH-UA* request headers)
+    // still carry the embedded/Electron brand, and a UA/Client-Hints mismatch is
+    // itself a fingerprint. Rewrite the headers to match, on the browser
+    // partition session only (the default session — app + backend — is never
+    // touched). NOTE: this alone does NOT guarantee Google account sign-in works
+    // — Google deliberately blocks embedded browsers via deeper signals too;
+    // this just removes the easy tells.
+    patchClientHints(contents.session);
+    attachUaMetadata(contents); // also rewrite the in-page navigator.userAgentData
     // Tab dispositions (target=_blank links, cmd-click) are routed to the
     // renderer over 'atelier:webview-new-window' — apps.js opens them as tabs
     // in a browser card. Everything else (a real window.open popup, i.e. an
@@ -333,6 +422,12 @@ app.on('web-contents-created', (_event, contents) => {
             nodeIntegration: false,
             contextIsolation: true,
             sandbox: true,
+            // Pin the OAuth popup to the SAME per-card partition as its opener so
+            // a popup sign-in lands cookies in THIS card's jar and stays isolated
+            // from other browser cards — without this the popup falls back to the
+            // default session and the "each card = its own account" guarantee
+            // breaks. `contents` is this card's webview.
+            session: contents.session,
           },
         },
       };
@@ -384,6 +479,109 @@ ipcMain.handle('atelier:scheduler-status', () => ({
   running: !!schedulerProc,
   pid: schedulerProc ? schedulerProc.pid : null,
 }));
+
+// atelier:save-pdf — render a self-contained document HTML to a PDF the user
+// picks a path for. Used by the Document card's export. The HTML is fully
+// self-contained (the generator emits no network refs and no JS); we load it
+// into an OFFSCREEN, node-less, JAVASCRIPT-DISABLED BrowserWindow, printToPDF,
+// then write the chosen path. Returns { saved } | { canceled } | { error };
+// never throws to the renderer.
+ipcMain.handle('atelier:save-pdf', async (event, payload) => {
+  const html = payload && typeof payload.html === 'string' ? payload.html : '';
+  const suggested = (payload && payload.name) ? String(payload.name) : 'document';
+  if (!html) return { error: 'no document to export' };
+  const safe = suggested.replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'document';
+  let win = null;
+  try {
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const { filePath, canceled } = await dialog.showSaveDialog(parent, {
+      title: 'Export PDF',
+      defaultPath: safe + '.pdf',
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+    });
+    if (canceled || !filePath) return { canceled: true };
+    win = new BrowserWindow({
+      show: false,
+      webPreferences: { javascript: false, sandbox: true, contextIsolation: true, nodeIntegration: false },
+    });
+    await win.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(html));
+    const pdf = await win.webContents.printToPDF({ printBackground: true, preferCSSPageSize: true });
+    fs.writeFileSync(filePath, pdf);
+    return { saved: filePath };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  } finally {
+    if (win && !win.isDestroyed()) win.destroy();
+  }
+});
+
+// atelier:save-text — write text (HTML/Markdown) to a user-chosen path.
+ipcMain.handle('atelier:save-text', async (event, payload) => {
+  const text = payload && typeof payload.text === 'string' ? payload.text : '';
+  const suggested = (payload && payload.name) ? String(payload.name) : 'document';
+  const ext = (payload && payload.ext) ? String(payload.ext).replace(/[^\w]/g, '').slice(0, 8) : 'txt';
+  const safe = suggested.replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'document';
+  try {
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const { filePath, canceled } = await dialog.showSaveDialog(parent, {
+      title: 'Save file',
+      defaultPath: safe + '.' + (ext || 'txt'),
+      filters: [{ name: (ext || 'txt').toUpperCase(), extensions: [ext || 'txt'] }],
+    });
+    if (canceled || !filePath) return { canceled: true };
+    fs.writeFileSync(filePath, text, 'utf8');
+    return { saved: filePath };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
+
+// atelier:save-binary — write base64-encoded bytes (e.g. a .pptx from the Deck
+// card) to a user-chosen path. base64 travels over IPC cleanly; the main
+// process decodes and writes it. Returns { saved } | { canceled } | { error }.
+ipcMain.handle('atelier:save-binary', async (event, payload) => {
+  const b64 = payload && typeof payload.b64 === 'string' ? payload.b64 : '';
+  const suggested = (payload && payload.name) ? String(payload.name) : 'file';
+  const ext = (payload && payload.ext) ? String(payload.ext).replace(/[^\w]/g, '').slice(0, 8) : 'bin';
+  const safe = suggested.replace(/[^\w.\- ]+/g, '_').slice(0, 120) || 'file';
+  if (!b64) return { error: 'nothing to save' };
+  try {
+    const parent = BrowserWindow.fromWebContents(event.sender);
+    const { filePath, canceled } = await dialog.showSaveDialog(parent, {
+      title: 'Save',
+      defaultPath: safe + '.' + (ext || 'bin'),
+      filters: [{ name: (payload && payload.filterName) || (ext || 'bin').toUpperCase(), extensions: [ext || 'bin'] }],
+    });
+    if (canceled || !filePath) return { canceled: true };
+    fs.writeFileSync(filePath, Buffer.from(b64, 'base64'));
+    return { saved: filePath };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
+
+// atelier:reveal-folder — open a folder (the agent's file-write workspace) in
+// the OS file manager. Guarded to a directory UNDER the user's home so a
+// compromised renderer cannot point it at an arbitrary system path; the folder
+// is created if missing so a never-yet-used workspace still opens. Returns
+// { ok } | { error }, never rejects.
+ipcMain.handle('atelier:reveal-folder', async (event, dirPath) => {
+  try {
+    if (typeof dirPath !== 'string' || !dirPath.trim()) return { error: 'no path' };
+    const home = fs.realpathSync(os.homedir());
+    const target = path.resolve(dirPath);
+    // Must be the home dir itself or strictly inside it (compare with a trailing
+    // separator so '/Users/xevil' cannot pass as inside '/Users/x').
+    if (target !== home && !target.startsWith(home + path.sep)) {
+      return { error: 'refusing to reveal a path outside your home folder' };
+    }
+    fs.mkdirSync(target, { recursive: true });
+    const err = await shell.openPath(target); // '' on success
+    return err ? { error: err } : { ok: true };
+  } catch (err) {
+    return { error: String((err && err.message) || err) };
+  }
+});
 
 // ── boot ────────────────────────────────────────────────────────────────────
 

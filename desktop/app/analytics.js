@@ -304,7 +304,7 @@
     tile('Conversations', fmtNum(d.conversations));
     tile('Projects', fmtNum(d.projects));
     tile('Tokens this week', fmtNum(d.this_week_tokens));
-    tile('Cost this month', fmtUsd(d.this_month_usd), true);
+    tile('Estimated value this month', fmtUsd(d.this_month_usd), true);
     tile('Storage', fmtMb(d.storage_mb));
     host.appendChild(grid);
   }
@@ -314,8 +314,8 @@
   function renderDaily(state, tokHost, usdHost, daily) {
     const rows = Array.isArray(daily) ? daily.filter((r) => r && r.date) : [];
     if (!rows.length) {
-      note(tokHost, 'No Claude Code transcripts found.');
-      note(usdHost, 'No Claude Code transcripts found.');
+      note(tokHost, 'No usage recorded yet.');
+      note(usdHost, 'No usage recorded yet.');
       return;
     }
     if (!hasChart()) { chartsUnavailable(tokHost); chartsUnavailable(usdHost); return; }
@@ -762,7 +762,7 @@
     const rowDaily = el('div', 'cca-grid-2');
     inner.appendChild(rowDaily);
     ui.dailyTok = panel(rowDaily, 'Tokens per day');
-    ui.dailyUsd = panel(rowDaily, 'Cost per day');
+    ui.dailyUsd = panel(rowDaily, 'Estimated value per day');
 
     const rowMid = el('div', 'cca-grid-2');
     inner.appendChild(rowMid);
@@ -772,7 +772,7 @@
     const rowModels = el('div', 'cca-grid-2');
     inner.appendChild(rowModels);
     ui.modelTok = panel(rowModels, 'Usage by model');
-    ui.modelUsd = panel(rowModels, 'Cost by model');
+    ui.modelUsd = panel(rowModels, 'Estimated value by model');
 
     ui.heatmap = panel(inner, 'Daily tokens');
     ui.sessions = panel(inner, 'Recent sessions');
