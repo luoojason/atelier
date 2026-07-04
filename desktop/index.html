@@ -208,5 +208,11 @@
     <script defer src="app/views.js"></script>
     <script defer src="app/analytics.js"></script>
     <script defer src="app/graph.js"></script>
+    <!-- recipes.js loads last: a full-canvas "front door" that greets an empty
+         board with a gallery of ready-to-run recipes, spawns an orchestrator
+         agent card for the chosen one, and narrates the run. Its board:switched
+         and card:added/removed listeners must fire after the card-owning
+         modules re-mount, so keep it at the end. -->
+    <script defer src="app/recipes.js"></script>
   </body>
 </html>
