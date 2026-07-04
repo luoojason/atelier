@@ -51,6 +51,24 @@ def test_completions_url_normalizes():
     )
 
 
+def test_completions_url_for_provider_preset_bases():
+    # The connection presets (external.js) prefill these base URLs; every one must
+    # resolve to the provider's real OpenAI-compatible endpoint by appending
+    # /chat/completions to the PATH — including bases with no /v1 and Gemini's
+    # /v1beta/openai path.
+    cases = {
+        "https://api.openai.com/v1": "https://api.openai.com/v1/chat/completions",
+        "https://generativelanguage.googleapis.com/v1beta/openai":
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "https://api.deepseek.com": "https://api.deepseek.com/chat/completions",
+        "https://api.perplexity.ai": "https://api.perplexity.ai/chat/completions",
+        "https://api.groq.com/openai/v1": "https://api.groq.com/openai/v1/chat/completions",
+        "https://openrouter.ai/api/v1": "https://openrouter.ai/api/v1/chat/completions",
+    }
+    for base, expected in cases.items():
+        assert ea._completions_url(base) == expected, base
+
+
 def test_url_ok_rejects_control_chars():
     # urlparse tolerates some control chars and httpx.URL later raises on others
     for bad in ("http://ho\tst", "http://h\x00ost", "http://ho\nst", "https://e\x7fx.com"):
