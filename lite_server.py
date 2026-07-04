@@ -33,6 +33,8 @@ import json
 import os
 import re
 import secrets
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -1175,6 +1177,182 @@ async def workspace_file(path: str = ""):
         return {"path": path, "text": read_file(path)}
     except Exception as exc:  # noqa: BLE001 - surface as an explicit, contained error
         return {"path": path, "text": "", "error": str(exc)}
+
+
+@app.get("/workspace/raw")
+async def workspace_raw(path: str = ""):
+    """Stream a workspace file's raw bytes (for playing a rendered video or
+    downloading a deliverable). Containment is enforced by resolving inside the
+    workspace root; anything outside 404s rather than leaking a file."""
+    from shared_tools.workspace_core import workspace_root, _resolve_in_workspace
+
+    try:
+        target = _resolve_in_workspace(workspace_root(), path)
+    except Exception:  # noqa: BLE001 - traversal/absolute/symlink escape
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not target.is_file():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    ext = target.suffix.lower()
+    media = {".mp4": "video/mp4", ".mp3": "audio/mpeg", ".png": "image/png",
+             ".jpg": "image/jpeg", ".json": "application/json", ".txt": "text/plain"}.get(ext, "application/octet-stream")
+
+    def _iter():
+        with open(target, "rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(_iter(), media_type=media)
+
+
+# ── in-app render: run a workspace video pipeline and surface the result ──────
+# The whole review flagged that rendering happened OUTSIDE the app. This runs a
+# pipeline (ranking / reddit) as a subprocess with the backend's interpreter and
+# tracks it so the frontend can trigger a render, watch it, and play the result
+# in-app. NOTE: the pipeline's deps (edge-tts, Pillow, ffmpeg) must be present in
+# the backend's environment; a packaged build without them reports an error
+# rather than a video (packaging follow-up).
+_render_jobs: dict = {}
+
+
+class RenderRequest(BaseModel):
+    kind: str = "ranking"          # "ranking" | "reddit"
+    topic: str = ""                # ranking: the countdown topic
+    text: str = ""                 # reddit: the story text
+    voice: str = ""                # optional TTS voice
+
+
+@app.post("/render")
+async def render_start(req: RenderRequest):
+    from shared_tools.workspace_core import workspace_root
+
+    root = workspace_root()
+    rid = uuid.uuid4().hex[:12]
+    out = root / "renders" / f"{rid}.mp4"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return {"error": "could not create the renders folder"}
+
+    if req.kind == "ranking":
+        script = root / "video-making" / "ranking" / "pipeline.py"
+        if not req.topic.strip():
+            return {"error": "a topic is required to render a ranking video"}
+        args = [sys.executable, str(script), "--topic", req.topic.strip(), "--output", str(out)]
+    elif req.kind == "reddit":
+        script = root / "video-making" / "reddit" / "pipeline.py"
+        if not req.text.strip():
+            return {"error": "story text is required to render a reddit video"}
+        args = [sys.executable, str(script), "--pasted", req.text.strip(), "--output", str(out)]
+    else:
+        return {"error": f"unknown render kind {req.kind!r}"}
+    if req.voice.strip():
+        args += ["--voice", req.voice.strip()]
+    if not script.is_file():
+        return {"error": f"the {req.kind} pipeline is not in the workspace yet"}
+
+    try:
+        proc = subprocess.Popen(
+            args, cwd=str(script.parent),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface a start failure
+        return {"error": f"could not start the render: {exc}"}
+    _render_jobs[rid] = {"status": "running", "output": str(out), "kind": req.kind, "proc": proc, "tail": ""}
+    return {"id": rid, "status": "running"}
+
+
+@app.get("/render/{rid}")
+async def render_status(rid: str):
+    job = _render_jobs.get(rid)
+    if not job:
+        return JSONResponse({"error": "no such render"}, status_code=404)
+    proc = job["proc"]
+    if proc.poll() is None:
+        return {"id": rid, "status": "running"}
+    if job["status"] == "running":  # settle once
+        try:
+            job["tail"] = (proc.stdout.read() or "")[-600:] if proc.stdout else ""
+        except Exception:  # noqa: BLE001
+            job["tail"] = ""
+        ok = proc.returncode == 0 and os.path.exists(job["output"])
+        job["status"] = "done" if ok else "error"
+    from shared_tools.workspace_core import workspace_root
+
+    rel = os.path.relpath(job["output"], str(workspace_root())) if job["status"] == "done" else ""
+    return {"id": rid, "status": job["status"], "rel": rel, "tail": job.get("tail", "")}
+
+
+class PublishRequest(BaseModel):
+    channel: str
+    path: str = ""
+    caption: str = ""
+    token: str = ""
+
+
+@app.post("/publish")
+async def publish(req: PublishRequest):
+    """Post a deliverable's caption to a channel. HONEST by contract: only returns
+    {ok:true} when something actually posted. Webhook + Bluesky post for real;
+    X/Reddit need full OAuth the user can't paste as one token, so they decline
+    cleanly rather than pretend. The frontend never claims success without ok."""
+    import httpx
+
+    ch = (req.channel or "").lower()
+    cap = (req.caption or "").strip()
+    token = (req.token or "").strip()
+    if not token:
+        return {"ok": False, "error": "no token saved for this channel"}
+    try:
+        if ch == "webhook":
+            # token is the webhook URL (Discord/Slack/Zapier/generic).
+            payload = {"content": cap, "text": cap}
+            if req.path:
+                payload["deliverable"] = req.path
+            r = httpx.post(token, json=payload, timeout=15)
+            if r.status_code < 300:
+                return {"ok": True, "url": token.split("?")[0]}
+            return {"ok": False, "error": f"the webhook rejected it (HTTP {r.status_code})"}
+
+        if ch == "bluesky":
+            # token is "handle:app-password".
+            if ":" not in token:
+                return {"ok": False, "error": "Bluesky token must be handle:app-password"}
+            handle, _, app_pw = token.partition(":")
+            base = "https://bsky.social/xrpc"
+            sess = httpx.post(f"{base}/com.atproto.server.createSession",
+                              json={"identifier": handle.strip(), "password": app_pw.strip()}, timeout=15)
+            if sess.status_code >= 300:
+                return {"ok": False, "error": "Bluesky login failed — check the handle + app password"}
+            sd = sess.json()
+            jwt, did = sd.get("accessJwt"), sd.get("did")
+            post = httpx.post(
+                f"{base}/com.atproto.repo.createRecord",
+                headers={"Authorization": f"Bearer {jwt}"},
+                json={"repo": did, "collection": "app.bsky.feed.post",
+                      "record": {"text": cap or "(posted from Atelier)", "createdAt": _now_iso()}},
+                timeout=15,
+            )
+            if post.status_code < 300:
+                return {"ok": True, "url": f"https://bsky.app/profile/{handle.strip()}"}
+            return {"ok": False, "error": f"Bluesky rejected the post (HTTP {post.status_code})"}
+
+        if ch in ("x", "reddit"):
+            return {"ok": False, "error": (
+                f"Direct posting to {ch.upper()} needs full OAuth, which a single pasted token can't do. "
+                "Export the file and post it, or use a logged-in browser card.")}
+        return {"ok": False, "error": f"unknown channel {ch!r}"}
+    except Exception as exc:  # noqa: BLE001 - never 500; report honestly
+        return {"ok": False, "error": f"could not post: {exc}"}
+
+
+def _now_iso() -> str:
+    """UTC timestamp for Bluesky's createdAt. Local import keeps the top clean."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
 class ProviderRequest(BaseModel):
