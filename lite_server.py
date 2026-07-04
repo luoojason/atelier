@@ -338,6 +338,25 @@ def build_options(
                 "mcp__orchestra__SpawnAgent",
                 "mcp__orchestra__CheckAgent",
             ]
+            # Delegate-first bias for depth-0 orchestrators. A turn has a bounded
+            # step budget (max_turns) and every WebSearch/WebFetch/Read/SpawnAgent
+            # the orchestrator runs ITSELF spends one step, so doing the legwork
+            # inline is what exhausts the budget before the job finishes (the
+            # step-limit path in _friendly_turn_error). Steer spawners to hand
+            # heavy or multi-step subtasks to sub-agents and keep their own steps
+            # for planning + assembly.
+            system_prompt += (
+                "\n\nYou can spawn sub-agents with SpawnAgent and run several in"
+                " parallel, then collect their replies with CheckAgent. Your turn"
+                " has a limited step budget, and every tool call you make"
+                " yourself — each WebSearch, WebFetch, or file read — uses one"
+                " step. So DELEGATE the heavy work: give each research thread or"
+                " multi-step subtask to its own sub-agent with a clear,"
+                " self-contained brief, then poll with CheckAgent. Spend your own"
+                " steps on planning, delegating, and assembling the final answer"
+                " rather than doing the legwork inline, so you don't run out of"
+                " steps before the job is done."
+            )
         if children:
             allowed_tools.append("mcp__orchestra__DelegateToSubagent")
             roster = ", ".join(f'"{c.name}" ({c.id})' for c in children)
@@ -2475,8 +2494,12 @@ def _session_to_dict(sess: "_AgentSession") -> dict:
         "depth": sess.depth,
         "job_name": sess.job_name,
         "model": sess.model,
-        # a session caught mid-turn reloads idle: there is no live client to resume
-        "status": "error" if sess.status == "error" else "idle",
+        # Persist the REAL status. A "running" value on disk means the backend
+        # died with this turn in flight — a normal turn-end persist would have
+        # overwritten it with idle/error. _load_sessions turns that into a usable
+        # idle card plus a one-time "interrupted" note (there is no live client to
+        # resume, so the next turn rebuilds + replays the transcript instead).
+        "status": sess.status,
         "messages": list(sess.messages),
     }
 
@@ -2504,6 +2527,7 @@ def _load_sessions() -> None:
         return
     if not isinstance(data, dict):
         return
+    interrupted_any = False
     for rec in data.get("sessions") or []:
         if not isinstance(rec, dict) or not rec.get("id"):
             continue
@@ -2516,13 +2540,31 @@ def _load_sessions() -> None:
             )
             sess.job_name = rec.get("job_name")
             sess.model = rec.get("model")
-            sess.status = "error" if rec.get("status") == "error" else "idle"
+            raw_status = rec.get("status")
             msgs = rec.get("messages")
             if isinstance(msgs, list):
                 sess.messages = [m for m in msgs if isinstance(m, dict)][-_MAX_SESSION_MESSAGES:]
+            # A session persisted as "running" was caught mid-turn by a restart
+            # (a completed turn would have persisted idle/error). Reload it idle so
+            # the card is usable again, and drop a one-time breadcrumb so the run's
+            # abrupt end is not a silent mystery.
+            if raw_status == "running":
+                sess.status = "idle"
+                interrupted_any = True
+                _append_session_message(
+                    sess, "assistant",
+                    "This run was interrupted when the app or backend restarted. "
+                    "Send your last message again to continue.",
+                )
+            else:
+                sess.status = "error" if raw_status == "error" else "idle"
             _sessions[sess.id] = sess
         except Exception:  # noqa: BLE001 - skip a corrupt record, keep the rest
             continue
+    # Normalize the file to the loaded (coerced) state so a second restart before
+    # any turn does not append the interrupt note again.
+    if interrupted_any:
+        _persist_sessions()
 
 
 def _max_sessions() -> int:
@@ -2646,6 +2688,12 @@ async def _start_turn(sess: _AgentSession, message: str) -> None:
     _append_session_message(sess, "user", message)
     sess.status = "running"
     _touch_session(sess)
+    # Persist the in-flight message NOW, not just at turn-end: if the backend is
+    # killed mid-turn (app quit / relaunch / stale-port cleanup), the user's
+    # just-sent message would otherwise be lost and the card would reload at its
+    # previous completed turn. The persisted "running" status is the signal
+    # _load_sessions uses to mark the run interrupted on reload.
+    _persist_sessions()
     await _spawn_session_turn(_run_session_turn(sess, message))
 
 

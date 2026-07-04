@@ -74,6 +74,31 @@ def test_error_status_is_preserved():
     assert lite_server._sessions["b" * 32].status == "error"
 
 
+def test_interrupted_run_reloads_with_breadcrumb():
+    # A turn caught mid-flight persists status "running" (a completed turn would
+    # have overwritten it with idle/error). On reload it becomes an idle card
+    # that keeps the user's in-flight message and gains a one-time note.
+    s = _sess("d" * 32, "Agent")
+    lite_server._append_session_message(s, "user", "research kitchen gadgets")
+    s.status = "running"
+    lite_server._persist_sessions()
+
+    lite_server._sessions.clear()
+    lite_server._load_sessions()
+    r = lite_server._sessions["d" * 32]
+    assert r.status == "idle"
+    assert r.messages[0]["text"] == "research kitchen gadgets"   # in-flight msg kept
+    assert "interrupted" in r.messages[-1]["text"].lower()
+    assert r.messages[-1]["role"] == "assistant"
+
+    # A SECOND restart before any new turn must NOT append the note again:
+    # _load_sessions re-persisted the coerced idle status.
+    lite_server._sessions.clear()
+    lite_server._load_sessions()
+    r2 = lite_server._sessions["d" * 32]
+    assert sum("interrupted" in m["text"].lower() for m in r2.messages) == 1
+
+
 def test_load_missing_file_is_a_noop():
     lite_server._load_sessions()            # file does not exist yet
     assert lite_server._sessions == {}
