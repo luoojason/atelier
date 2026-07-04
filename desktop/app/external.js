@@ -64,8 +64,9 @@
     together: { label: 'Together AI', base: 'https://api.together.xyz/v1', model: '' },
     openrouter: { label: 'OpenRouter (any model)', base: 'https://openrouter.ai/api/v1', model: '' },
     perplexity: { label: 'Perplexity', base: 'https://api.perplexity.ai', model: 'sonar' },
-    // ── local / self-hosted ──
-    ollama: { label: 'Ollama (local)', base: 'http://127.0.0.1:11434/v1', model: 'llama3' },
+    // ── local / self-hosted ── (a tool-capable model so the Tools toggle works;
+    // the base 'llama3' template can't do tool calls)
+    ollama: { label: 'Ollama (local)', base: 'http://127.0.0.1:11434/v1', model: 'llama3.1' },
     lmstudio: { label: 'LM Studio (local)', base: 'http://127.0.0.1:1234/v1', model: '' },
     // ── your own agents ──
     iris: { label: 'Iris', base: 'http://HOST:PORT/v1', model: '' },
@@ -111,6 +112,18 @@
       .atl-ext-empty { padding: 16px; font-size: 12.5px; color: var(--ink-dim); text-align: center;
         line-height: 1.5; }
       .atl-ext-empty button { margin-top: 8px; }
+      .atl-ext-tools { display: inline-flex; align-items: center; gap: 4px; font-size: 11px;
+        color: var(--ink-dim); cursor: pointer; user-select: none; white-space: nowrap; }
+      .atl-ext-tools.disabled { opacity: .45; cursor: not-allowed; }
+      .atl-ext-tools input { margin: 0; cursor: inherit; }
+      .atl-ext-steps { display: flex; flex-direction: column; gap: 3px; margin: 2px 0 6px 34px; }
+      .atl-ext-step { display: flex; align-items: baseline; gap: 6px; font-size: 11px;
+        color: var(--ink-dim); background: #faf7f1; border: 1px solid var(--border-soft);
+        border-radius: 7px; padding: 3px 8px; }
+      .atl-ext-step-ic { opacity: .7; }
+      .atl-ext-step-nm { font-weight: 600; color: var(--ink-mid); white-space: nowrap; }
+      .atl-ext-step-res { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+        white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; opacity: .8; }
 
       .atl-xm-wrap { display: flex; flex-direction: column; gap: 16px; width: 360px; }
       .atl-xm-title { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
@@ -159,6 +172,20 @@
       instances.forEach((inst) => populatePicker(inst));
       A.bus.emit('external:agents-changed');
     });
+  }
+
+  // Persist an agent's tools_enabled flag (a blank api_key keeps the stored key).
+  // tools_enabled lives ON the agent, not the card, so every card bound to the
+  // same agent shares the setting. Returns true on success.
+  async function setAgentTools(agent, on) {
+    const payload = {
+      id: agent.id, name: agent.name, base_url: agent.base_url,
+      model: agent.model || '', adapter: agent.adapter || 'openai',
+      tools_enabled: !!on,
+    };
+    const r = await api('/external/agents', { method: 'POST', body: JSON.stringify(payload) });
+    if (r.ok) await fetchAgents(true);
+    return r.ok;
   }
 
   /* =========================================================================
@@ -338,10 +365,29 @@
     inst.msgs.scrollTop = inst.msgs.scrollHeight;
     return row;
   }
-  function addThinking(inst) {
-    const row = addBubble(inst, 'assistant', 'thinking…');
+  function addThinking(inst, label) {
+    const row = addBubble(inst, 'assistant', label || 'thinking…');
     row.querySelector('.atl-agent-bubble').classList.add('thinking');
     return row;
+  }
+
+  // A muted transcript of the tools the agent ran this turn (name + a one-line
+  // result), rendered above the final assistant bubble. server-derived strings
+  // enter via textContent (el()).
+  function renderSteps(inst, steps) {
+    const box = el('div', 'atl-ext-steps');
+    steps.forEach((s) => {
+      const row = el('div', 'atl-ext-step');
+      row.appendChild(el('span', 'atl-ext-step-ic', '⚙'));
+      row.appendChild(el('span', 'atl-ext-step-nm', String((s && s.tool) || 'tool')));
+      const resText = String((s && s.result) || '').replace(/\s+/g, ' ').trim();
+      const res = el('span', 'atl-ext-step-res', resText);
+      res.title = resText;
+      row.appendChild(res);
+      box.appendChild(row);
+    });
+    inst.msgs.appendChild(box);
+    inst.msgs.scrollTop = inst.msgs.scrollHeight;
   }
 
   function currentAgent(inst) {
@@ -381,6 +427,28 @@
     inst.ta.placeholder = hasAgent
       ? 'Message ' + (currentAgent(inst) ? currentAgent(inst).name : 'agent') + '…'
       : 'Pick an agent above to start…';
+    updateToolsToggle(inst);
+  }
+
+  // Reflect the bound agent's tools_enabled + capability onto the Tools toggle.
+  // Hidden with no agent; greyed for a known-incapable model (e.g. Perplexity
+  // sonar) or mid-turn. inst.toolsOn is the send() gate.
+  function updateToolsToggle(inst) {
+    if (!inst.toolsCb) return;
+    const a = currentAgent(inst);
+    // The tools lane needs a model (the backend 400s a blank-model tools turn),
+    // so a missing model disables the toggle just like a known-incapable model.
+    const hasModel = !!(a && a.model && String(a.model).trim());
+    const capable = !!(a && a.tools_capable !== false && hasModel);
+    inst.toolsLabel.style.display = a ? '' : 'none';
+    inst.toolsCb.disabled = !a || !capable || inst.running;
+    inst.toolsCb.checked = !!(a && a.tools_enabled && capable);
+    inst.toolsOn = inst.toolsCb.checked;
+    inst.toolsLabel.classList.toggle('disabled', inst.toolsCb.disabled && !inst.running);
+    inst.toolsLabel.title = !a ? ''
+      : !hasModel ? 'Set a model on this agent (in Manage agents) to use tools.'
+      : (a.tools_capable === false) ? "This model can't use tools — it will answer as plain chat."
+      : 'Let this agent use Atelier tools: write files, read/write the vault, search the web.';
   }
 
   // hand the failed message back ONLY if the composer is still empty — the user
@@ -402,6 +470,9 @@
     if (!text || inst.running) return;
     if (!inst.agentId) { setNote(inst, 'Pick an agent to connect to first.', true); return; }
     const boundAgent = inst.agentId; // pin the target for this whole turn
+    // Tools ON routes to the LiteLLM tool-loop lane; OFF stays on plain forward().
+    // Captured before the turn mutates state (the toggle greys out mid-run).
+    const useTools = !!inst.toolsOn && inst.toolsCb && !inst.toolsCb.disabled;
     inst.ta.value = '';
     growComposer(inst.ta); // collapse back to one row after sending
     setNote(inst, '');
@@ -409,10 +480,11 @@
     inst.history.push({ role: 'user', content: text });
     inst.running = true;
     updateComposerState(inst); // also disables the picker for the turn
-    const thinking = addThinking(inst);
+    const thinking = addThinking(inst, useTools ? 'working…' : 'thinking…');
     // server appends `message` itself, so send the PRIOR turns as history.
     const priorHistory = inst.history.slice(0, -1);
-    const r = await api('/external/agents/' + encodeURIComponent(boundAgent) + '/message', {
+    const route = useTools ? '/agent_message' : '/message';
+    const r = await api('/external/agents/' + encodeURIComponent(boundAgent) + route, {
       method: 'POST',
       body: JSON.stringify({ message: text, history: priorHistory }),
     });
@@ -434,8 +506,12 @@
       inst.history.pop(); refillOnFailure(inst, text);
       return;
     }
+    if (useTools && Array.isArray(r.data.steps) && r.data.steps.length) renderSteps(inst, r.data.steps);
     addBubble(inst, 'assistant', r.data.response);
     inst.history.push({ role: 'assistant', content: r.data.response });
+    // collapse-to-final-text: only the assistant TEXT re-enters history, so a
+    // follow-up turn never resends a dangling tool_calls message.
+    if (r.data.note) setNote(inst, r.data.note, false);
   }
 
   function render(inst) {
@@ -446,7 +522,13 @@
     const picker = document.createElement('select');
     picker.className = 'atl-ext-sel';
     picker.setAttribute('aria-label', 'Choose an assistant');
+    const toolsLabel = el('label', 'atl-ext-tools');
+    const toolsCb = document.createElement('input');
+    toolsCb.type = 'checkbox';
+    toolsCb.setAttribute('aria-label', 'Let this agent use Atelier tools');
+    toolsLabel.append(toolsCb, el('span', null, 'Tools'));
     pick.appendChild(picker);
+    pick.appendChild(toolsLabel);
     pick.appendChild(el('span', 'atl-ext-badge', 'external'));
 
     const msgs = el('div', 'atl-agent-msgs');
@@ -461,6 +543,25 @@
     body.append(pick, msgs, note, composer);
 
     inst.picker = picker; inst.msgs = msgs; inst.note = note; inst.ta = ta; inst.sendBtn = sendBtn;
+    inst.toolsCb = toolsCb; inst.toolsLabel = toolsLabel;
+
+    toolsCb.addEventListener('change', async () => {
+      const a = currentAgent(inst);
+      if (!a) { toolsCb.checked = false; return; }
+      const on = toolsCb.checked;
+      toolsCb.disabled = true;
+      const ok = await setAgentTools(a, on);
+      toolsCb.disabled = false;
+      if (!ok) {
+        toolsCb.checked = !on;
+        setNote(inst, 'Could not save the tools setting.', true);
+        updateToolsToggle(inst);
+        return;
+      }
+      // tools_enabled lives on the AGENT, so refresh every card bound to it —
+      // otherwise a sibling card would route its next turn on a stale toggle.
+      instances.forEach((i) => updateToolsToggle(i));
+    });
 
     picker.addEventListener('change', () => {
       if (picker.value === MANAGE) {

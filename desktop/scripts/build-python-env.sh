@@ -25,14 +25,15 @@ uv pip install --python "$ENV_DIR/bin/python3" \
   "claude-agent-sdk==0.2.110" \
   "apscheduler==3.11.3" "httpx==0.28.1" "pyyaml"
 
-echo "==> diet: drop the never-imported heavy stack (~79M)"
-# Verified by execution: importing lite_server + the scheduler daemon + even
-# bare agency_swarm loads NONE of these (they back agency-swarm's LiteLLM
-# routing, which the lite backend no longer uses since the claude-agent-sdk
-# migration). The smoke test below imports the REAL lite_server graph, so a
-# future dependency change that re-needs them fails the build loudly.
+echo "==> diet: drop the unused HuggingFace hub download bits"
+# litellm + tokenizers now STAY: the external tool lane (external_loop.py) drives
+# non-Claude OpenAI-compatible providers through litellm, and `import litellm`
+# loads tokenizers at import time. hf-xet + huggingface_hub are only the hub
+# DOWNLOAD helpers (not imported by litellm at runtime for OpenAI-shaped calls),
+# so they still go. The smoke test below imports external_loop + litellm under
+# the dieted env, so a missing dep fails the build loudly.
 uv pip uninstall --python "$ENV_DIR/bin/python3" \
-  litellm tokenizers hf-xet huggingface_hub 2>/dev/null || true
+  hf-xet huggingface_hub 2>/dev/null || true
 
 echo "==> diet: strip interpreter baggage the backend never touches"
 rm -rf "$ENV_DIR/include" \
@@ -52,7 +53,7 @@ echo "==> ad-hoc signing Mach-O files (arm64 requires a signature after modifica
 find "$ENV_DIR" \( -name '*.so' -o -name '*.dylib' \) -exec codesign --force -s - {} \; 2>/dev/null
 codesign --force -s - "$ENV_DIR/bin/python3.13"
 
-echo "==> smoke test: the REAL backend import graph under the dieted env"
-(cd "$REPO_DIR" && "$ENV_DIR/bin/python3" -c "import lite_server; import scheduler.scheduler; print('lite_server + scheduler import ok')")
+echo "==> smoke test: the REAL backend import graph + the external tool lane under the dieted env"
+(cd "$REPO_DIR" && "$ENV_DIR/bin/python3" -c "import lite_server; import scheduler.scheduler; import external_tools; import external_loop; import litellm; print('lite_server + scheduler + external tool lane import ok')")
 du -sh "$ENV_DIR"
 echo "done"
