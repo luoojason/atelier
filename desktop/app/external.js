@@ -52,14 +52,16 @@
   // sends, so all of these "just work" once you add your key. The preset only
   // PREFILLS the base_url + a sensible default model; edit the model freely
   // (provider model names change often). Cloud providers need YOUR api_key
-  // (a paid API key / subscription for that service); local ones usually don't.
+  // (a paid DEVELOPER API key for that service, billed per token — NOT a
+  // consumer chat subscription like ChatGPT Plus, which has no API); local
+  // ones (Ollama/LM Studio) usually need no key.
   // Each preset prefills base_url + a default `model`, and `models` seeds the
   // model field's suggestion list so you pick THAT provider's models (a GPT
   // connection can't run Claude models, so it offers gpt-* etc.). The field
   // stays free text — provider model names change often and local models vary,
   // so any string is still allowed; the list is guidance, not a lock.
   const PRESETS = {
-    // ── cloud subscriptions (bring your own API key) ──
+    // ── cloud providers (bring your own developer API key, billed per token) ──
     openai: { label: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-4o',
       models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini', 'o3'] },
     gemini: { label: 'Google Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash',
@@ -237,7 +239,7 @@
     list.textContent = '';
     const agents = agentCache || [];
     if (!agents.length) {
-      list.appendChild(el('div', 'atl-xm-hint', 'No outside assistants yet. Add one below to run on a different subscription — OpenAI, Gemini, Groq, your own Iris, or any OpenAI-compatible service.'));
+      list.appendChild(el('div', 'atl-xm-hint', 'No outside assistants yet. Add one below to run a card on another provider — OpenAI, Gemini, Groq, a local model, your own Iris, or any OpenAI-compatible service.'));
       return;
     }
     agents.forEach((a) => {
@@ -337,7 +339,7 @@
     key.className = 'atl-xm-in'; key.type = 'password'; key.placeholder = 'API key (optional)'; key.maxLength = 4000;
     key.autocomplete = 'off';
 
-    const hint = el('div', 'atl-xm-hint', 'Connect a different subscription: OpenAI, Google Gemini, Groq, xAI, DeepSeek, Mistral, OpenRouter, your own Iris/Hermes, or any OpenAI-compatible service. Pick a preset, add your API key, Save.');
+    const hint = el('div', 'atl-xm-hint', 'Connect another provider — OpenAI, Google Gemini, Groq, xAI, DeepSeek, Mistral, OpenRouter, a local model (Ollama or LM Studio), or your own Iris/Hermes. Cloud providers need that provider’s own developer API key (billed per token), NOT your chat subscription like ChatGPT Plus; local models are free. Pick a preset, add the key, Save.');
     const note = el('div', 'atl-xm-note');
     const actions = el('div', 'atl-xm-actions');
     const clearBtn = el('button', 'atl-xm-btn', 'Clear form');
