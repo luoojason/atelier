@@ -53,27 +53,51 @@
   // PREFILLS the base_url + a sensible default model; edit the model freely
   // (provider model names change often). Cloud providers need YOUR api_key
   // (a paid API key / subscription for that service); local ones usually don't.
+  // Each preset prefills base_url + a default `model`, and `models` seeds the
+  // model field's suggestion list so you pick THAT provider's models (a GPT
+  // connection can't run Claude models, so it offers gpt-* etc.). The field
+  // stays free text — provider model names change often and local models vary,
+  // so any string is still allowed; the list is guidance, not a lock.
   const PRESETS = {
     // ── cloud subscriptions (bring your own API key) ──
-    openai: { label: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-4o' },
-    gemini: { label: 'Google Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash' },
-    xai: { label: 'xAI (Grok)', base: 'https://api.x.ai/v1', model: 'grok-2-latest' },
-    deepseek: { label: 'DeepSeek', base: 'https://api.deepseek.com', model: 'deepseek-chat' },
-    mistral: { label: 'Mistral', base: 'https://api.mistral.ai/v1', model: 'mistral-large-latest' },
-    groq: { label: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
-    together: { label: 'Together AI', base: 'https://api.together.xyz/v1', model: '' },
-    openrouter: { label: 'OpenRouter (any model)', base: 'https://openrouter.ai/api/v1', model: '' },
-    perplexity: { label: 'Perplexity', base: 'https://api.perplexity.ai', model: 'sonar' },
+    openai: { label: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-4o',
+      models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini', 'o3'] },
+    gemini: { label: 'Google Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash',
+      models: ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-pro', 'gemini-1.5-flash'] },
+    xai: { label: 'xAI (Grok)', base: 'https://api.x.ai/v1', model: 'grok-2-latest',
+      models: ['grok-2-latest', 'grok-2-vision-latest', 'grok-beta'] },
+    deepseek: { label: 'DeepSeek', base: 'https://api.deepseek.com', model: 'deepseek-chat',
+      models: ['deepseek-chat', 'deepseek-reasoner'] },
+    mistral: { label: 'Mistral', base: 'https://api.mistral.ai/v1', model: 'mistral-large-latest',
+      models: ['mistral-large-latest', 'mistral-small-latest', 'open-mistral-nemo'] },
+    groq: { label: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile',
+      models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'gemma2-9b-it'] },
+    together: { label: 'Together AI', base: 'https://api.together.xyz/v1', model: '',
+      models: ['meta-llama/Llama-3.3-70B-Instruct-Turbo', 'Qwen/Qwen2.5-72B-Instruct-Turbo', 'mistralai/Mistral-Nemo-Instruct-2407'] },
+    openrouter: { label: 'OpenRouter (any model)', base: 'https://openrouter.ai/api/v1', model: '',
+      models: ['openai/gpt-4o', 'google/gemini-2.0-flash-001', 'meta-llama/llama-3.3-70b-instruct', 'deepseek/deepseek-chat'] },
+    perplexity: { label: 'Perplexity', base: 'https://api.perplexity.ai', model: 'sonar',
+      models: ['sonar', 'sonar-pro', 'sonar-reasoning'] },
     // ── local / self-hosted ── (a tool-capable model so the Tools toggle works;
     // the base 'llama3' template can't do tool calls)
-    ollama: { label: 'Ollama (local)', base: 'http://127.0.0.1:11434/v1', model: 'llama3.1' },
-    lmstudio: { label: 'LM Studio (local)', base: 'http://127.0.0.1:1234/v1', model: '' },
-    // ── your own agents ──
-    iris: { label: 'Iris', base: 'http://HOST:PORT/v1', model: '' },
-    hermes: { label: 'Hermes', base: 'http://HOST:PORT/v1', model: '' },
-    openclaw: { label: 'OpenClaw', base: 'http://HOST:PORT/v1', model: '' },
-    openaicompat: { label: 'Other OpenAI-compatible…', base: 'https://', model: '' },
+    ollama: { label: 'Ollama (local)', base: 'http://127.0.0.1:11434/v1', model: 'llama3.1',
+      models: ['llama3.1', 'llama3.2', 'qwen2.5', 'mistral-nemo'] },
+    lmstudio: { label: 'LM Studio (local)', base: 'http://127.0.0.1:1234/v1', model: '',
+      models: ['qwen2.5-7b-instruct', 'llama-3.1-8b-instruct'] },
+    // ── your own agents ── (model is whatever your endpoint serves)
+    iris: { label: 'Iris', base: 'http://HOST:PORT/v1', model: '', models: [] },
+    hermes: { label: 'Hermes', base: 'http://HOST:PORT/v1', model: '', models: [] },
+    openclaw: { label: 'OpenClaw', base: 'http://HOST:PORT/v1', model: '', models: [] },
+    openaicompat: { label: 'Other OpenAI-compatible…', base: 'https://', model: '', models: [] },
   };
+
+  // A preset whose base_url matches this one (so an EDIT of an existing agent
+  // can also show that provider's model suggestions). Trailing slashes ignored.
+  function presetForBase(url) {
+    const u = String(url || '').trim().replace(/\/+$/, '');
+    if (!u) return null;
+    return Object.values(PRESETS).find((p) => p.base.replace(/\/+$/, '') === u) || null;
+  }
 
   function el(tag, cls, text) {
     const n = document.createElement(tag);
@@ -200,6 +224,13 @@
     mgr.note.classList.toggle('err', !!isErr);
   }
 
+  // Repopulate the model field's suggestion list with a provider's models.
+  function setModelSuggestions(models) {
+    if (!mgr || !mgr.modelList) return;
+    mgr.modelList.textContent = '';
+    (models || []).forEach((m) => mgr.modelList.appendChild(new Option(m)));
+  }
+
   function renderMgrList() {
     if (!mgr) return;
     const list = mgr.list;
@@ -237,6 +268,7 @@
     mgr.name.value = a ? a.name : '';
     mgr.url.value = a ? a.base_url : '';
     mgr.model.value = a && a.model ? a.model : '';
+    setModelSuggestions((presetForBase(a && a.base_url) || {}).models || []);
     mgr.key.value = '';
     mgr.key.placeholder = a && a.key_present ? 'key set (' + a.key_hint + ') — leave blank to keep' : 'API key (optional)';
     setMgrNote(a ? 'Editing ' + a.name + '.' : '', false);
@@ -269,9 +301,10 @@
   function syncPreset() {
     if (!mgr) return;
     const p = PRESETS[mgr.preset.value];
-    if (!p) return;
+    if (!p) { setModelSuggestions([]); return; }
     if (!mgr.url.value.trim()) mgr.url.value = p.base;
     if (!mgr.model.value.trim() && p.model) mgr.model.value = p.model;
+    setModelSuggestions(p.models || []);
   }
 
   function buildManagerBody() {
@@ -290,8 +323,12 @@
     const name = document.createElement('input');
     name.className = 'atl-xm-in'; name.type = 'text'; name.placeholder = 'Name (e.g. Iris)'; name.maxLength = 80;
     const model = document.createElement('input');
-    model.className = 'atl-xm-in'; model.type = 'text'; model.placeholder = 'model (optional)'; model.maxLength = 120;
-    row1.append(name, model);
+    model.className = 'atl-xm-in'; model.type = 'text'; model.placeholder = 'model (pick a preset, or type)'; model.maxLength = 120;
+    model.setAttribute('list', 'atl-xm-models');
+    model.autocomplete = 'off';
+    const modelList = document.createElement('datalist');
+    modelList.id = 'atl-xm-models';
+    row1.append(name, model, modelList);
 
     const url = document.createElement('input');
     url.className = 'atl-xm-in'; url.type = 'text'; url.placeholder = 'Base URL, e.g. http://127.0.0.1:5000/v1'; url.maxLength = 2000;
@@ -310,7 +347,7 @@
     form.append(preset, row1, url, key, hint, note, actions);
     wrap.append(list, form);
 
-    mgr = { list, note, preset, name, url, model, key, saveBtn, editing: null };
+    mgr = { list, note, preset, name, url, model, modelList, key, saveBtn, editing: null };
     preset.addEventListener('change', syncPreset);
     clearBtn.addEventListener('click', () => loadIntoForm(null));
     saveBtn.addEventListener('click', saveForm);
