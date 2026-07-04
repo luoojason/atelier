@@ -11,14 +11,14 @@
     <header class="topbar">
       <div class="tb-left">
         <span class="traffic-space"></span>
-        <button class="icon-btn" title="Toggle sidebar">▨</button>
-        <button class="icon-btn" title="Back">‹</button>
-        <button class="icon-btn" title="Forward">›</button>
+        <button class="icon-btn" title="Toggle sidebar" aria-label="Toggle sidebar">▨</button>
+        <button class="icon-btn" title="Back" aria-label="Back">‹</button>
+        <button class="icon-btn" title="Forward" aria-label="Forward">›</button>
       </div>
       <div class="tb-center">
         <div class="search">
           <span class="search-ic">⌕</span>
-          <input placeholder="Search…" />
+          <input placeholder="Search…" aria-label="Search apps, cards, and boards" />
           <span class="kbd">⌘K</span>
         </div>
       </div>
@@ -55,7 +55,7 @@
             <div class="card-bar">
               <span class="card-dot"></span>
               <span class="card-title">Atelier · metrics</span>
-              <span class="card-x">×</span>
+              <button type="button" class="card-x" aria-label="Close">×</button>
             </div>
             <div class="metrics-body">
               <div class="stat"><div class="num">10</div><div class="lab">deliverables</div></div>
@@ -75,9 +75,9 @@
           <section class="card chat-card" data-card="chat" style="left: 230px; top: 336px;">
             <div class="card-bar">
               <span class="card-dot"></span>
-              <span class="card-title">Atelier — session</span>
+              <span class="card-title">Atelier · chat</span>
               <span class="card-badge">Claude Max</span>
-              <span class="card-x">×</span>
+              <button type="button" class="card-x" aria-label="Close">×</button>
             </div>
             <div class="chat-body" id="messages">
               <div class="empty" id="empty-state">
@@ -87,7 +87,7 @@
             </div>
             <div class="composer">
               <textarea id="input" rows="1" placeholder="Message Atelier…"></textarea>
-              <button id="send" class="send">➤</button>
+              <button id="send" class="send" aria-label="Send message">➤</button>
             </div>
           </section>
 
@@ -95,12 +95,12 @@
 
         <!-- Bottom dock -->
         <div class="dock">
-          <button class="dock-btn active" title="Chat">💬</button>
-          <button class="dock-btn" title="Apps">▦</button>
-          <button class="dock-btn" title="Browser">🌐</button>
-          <button class="dock-btn accent-btn" title="Campaign">↺</button>
-          <button class="dock-btn" title="Notes">🗒</button>
-          <button class="dock-btn" title="History">🕘</button>
+          <button class="dock-btn active" title="Chat" aria-label="Chat">💬</button>
+          <button class="dock-btn" title="Apps" aria-label="Apps">▦</button>
+          <button class="dock-btn" title="Browser" aria-label="Browser">🌐</button>
+          <button class="dock-btn accent-btn" title="Campaign" aria-label="Campaign">↺</button>
+          <button class="dock-btn" title="Notes" aria-label="Notes">🗒</button>
+          <button class="dock-btn" title="History" aria-label="History">🕘</button>
         </div>
 
         <!-- Minimap -->
@@ -113,12 +113,12 @@
 
         <!-- Zoom -->
         <div class="zoombar">
-          <button id="zoom-out">−</button>
+          <button id="zoom-out" aria-label="Zoom out">−</button>
           <span id="zoom-level">100%</span>
-          <button id="zoom-in">+</button>
-          <button title="Fit">⤢</button>
-          <button class="accent-ic" title="Auto-arrange">✦</button>
-          <button title="Minimap">▣</button>
+          <button id="zoom-in" aria-label="Zoom in">+</button>
+          <button title="Fit" aria-label="Fit">⤢</button>
+          <button class="accent-ic" title="Auto-arrange" aria-label="Auto-arrange">✦</button>
+          <button title="Minimap" aria-label="Minimap">▣</button>
         </div>
       </main>
 
@@ -208,6 +208,10 @@
     <script defer src="app/views.js"></script>
     <script defer src="app/analytics.js"></script>
     <script defer src="app/graph.js"></script>
+    <!-- Phase 1 safety + trust surfaces: a live usage/STOP HUD and a
+         hold-for-approval lane over what agents produce. Self-contained modules. -->
+    <script defer src="app/cost.js"></script>
+    <script defer src="app/approvals.js"></script>
     <!-- recipes.js loads last: a full-canvas "front door" that greets an empty
          board with a gallery of ready-to-run recipes, spawns an orchestrator
          agent card for the chosen one, and narrates the run. Its board:switched

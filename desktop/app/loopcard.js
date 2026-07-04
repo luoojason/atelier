@@ -370,7 +370,7 @@
     delBtn.addEventListener('click', () => remove(inst));
 
     const layerHint = el('div', 'atl-loop-lbl',
-      'Tip: marquee this Loop + an orchestrator chat to run that whole layer on schedule.');
+      'Tip: select this Loop and a lead chat together to run the whole team on a schedule.');
     layerHint.style.opacity = '0.8';
     wrap.append(nameRow, seg, intRow, wkRow, timeWrap, preview,
       el('span', 'atl-loop-lbl', 'Task'), prompt, layerHint, statusRow, note, actions);
@@ -413,7 +413,7 @@
       return;
     }
     if (r.status === 409) {
-      setNote(inst, 'No jobs file is configured on the backend — cannot schedule.', true);
+      setNote(inst, "Scheduling isn't set up yet, so this can't run on a timer.", true);
       return;
     }
     if (!r.ok) {

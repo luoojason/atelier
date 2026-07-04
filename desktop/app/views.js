@@ -670,7 +670,7 @@
           else setNote(provNote, (r.data && r.data.error) ||
             ('provider switch failed (HTTP ' + r.status + ')'), 'err');
         } catch {
-          if (!disposed) setNote(provNote, 'backend unreachable', 'err');
+          if (!disposed) setNote(provNote, "can't reach Atelier", 'err');
         }
       });
     }
@@ -695,7 +695,7 @@
             ('save failed (HTTP ' + r.status + ')'), 'err');
         }
       } catch {
-        if (!disposed) setNote(keyNote, 'backend unreachable', 'err');
+        if (!disposed) setNote(keyNote, "can't reach Atelier", 'err');
       }
     }));
 
@@ -708,7 +708,7 @@
         else setNote(keyNote, (r.data && r.data.error) ||
           ('remove failed (HTTP ' + r.status + ')'), 'err');
       } catch {
-        if (!disposed) setNote(keyNote, 'backend unreachable', 'err');
+        if (!disposed) setNote(keyNote, "can't reach Atelier", 'err');
       }
     }));
 
@@ -725,7 +725,7 @@
         if (d.valid === true) setNote(keyNote, '✓ key accepted', 'ok');
         else setNote(keyNote, '✗ ' + String(d.detail || 'validation failed'), 'err');
       } catch {
-        if (!disposed) setNote(keyNote, 'backend unreachable', 'err');
+        if (!disposed) setNote(keyNote, "can't reach Atelier", 'err');
       }
     }));
 
@@ -1127,7 +1127,7 @@
       backendCard,
       appearCard,
       card('Connection', [
-        ['Backend status', 'status', 'connecting…'],
+        ['Connection', 'status', 'connecting…'],
       ]),
       card('Security', [
         ['Token', 'token', '—'],
@@ -1153,7 +1153,7 @@
     // the server, not the renderer bridge, decides whether mutating routes
     // are enforced. The preload token is only the pre-fetch hint.
     val.token.textContent = (window.atelier && window.atelier.token)
-      ? 'minted — mutating routes protected'
+      ? 'on (your changes are protected)'
       : 'checking…';
 
     // Backend status — live off the bus (core polls /health every 4s), seeded
@@ -1205,7 +1205,7 @@
           val.jobs_file.textContent = fmt(cfg.jobs_file);
           val.auth_mode.textContent = fmt(cfg.auth_mode);
           val.token.textContent = cfg.token_present
-            ? 'minted — mutating routes protected'
+            ? 'on (your changes are protected)'
             : 'not enforced (dev)';
           applyProviderCfg(cfg);
           applyModelCfg(cfg);

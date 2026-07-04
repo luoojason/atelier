@@ -1144,6 +1144,39 @@ def _workspace_dir_str() -> str:
         return ""
 
 
+@app.get("/workspace/files")
+async def workspace_files():
+    """List the files agents have written to the sandboxed workspace, for the
+    approvals lane (path + size + mtime). Best-effort; never 500s."""
+    try:
+        from shared_tools.workspace_core import workspace_root, list_files
+
+        root = workspace_root()
+        out = []
+        for rel in list_files():
+            try:
+                st = (root / rel).stat()
+                out.append({"path": rel, "size": st.st_size, "mtime": st.st_mtime})
+            except OSError:
+                out.append({"path": rel, "size": 0, "mtime": 0})
+        return {"files": out}
+    except Exception:  # noqa: BLE001 - read endpoint must never 500
+        return {"files": []}
+
+
+@app.get("/workspace/file")
+async def workspace_file(path: str = ""):
+    """Read one workspace file's text for a preview. Path containment is enforced
+    by workspace_core._resolve_in_workspace (traversal/symlink/absolute escapes
+    raise), so a bad path returns an error string rather than leaking outside."""
+    try:
+        from shared_tools.workspace_core import read_file
+
+        return {"path": path, "text": read_file(path)}
+    except Exception as exc:  # noqa: BLE001 - surface as an explicit, contained error
+        return {"path": path, "text": "", "error": str(exc)}
+
+
 class ProviderRequest(BaseModel):
     provider: str
 

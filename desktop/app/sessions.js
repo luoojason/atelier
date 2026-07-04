@@ -219,12 +219,12 @@
   const SWEEP_MS = 2500; // child-discovery sweep cadence (GET /sessions list)
   const CHILD_DX = 70;   // revealed child sits this far right of its parent
   const CHILD_DY = 210;  // vertical step per already-revealed sibling
-  const CHILD_GONE_NOTE = 'This sub-agent session expired on the backend — '
-    + 'it cannot be restarted from this card.';
+  const CHILD_GONE_NOTE = "This helper's chat has ended and can't be restarted "
+    + 'from this card.';
   // r24: a finished job card whose session was LRU-reclaimed shows THIS instead
   // of the sub-agent note (it was never a sub-agent).
-  const JOB_GONE_NOTE = 'This job run was reclaimed to free resources — its '
-    + 'transcript is no longer available.';
+  const JOB_GONE_NOTE = 'This run was cleared to free up space, so its history '
+    + 'is no longer available.';
 
   let agentSeq = 0; // 'Agent N' naming for cards spawned this page-load
 
@@ -437,7 +437,7 @@
         };
         const childEl = createAgentCard(pos, {
           id: String(item.id),
-          name: String(item.name || 'Sub-agent'),
+          name: String(item.name || 'Helper'),
           parentEl,
           // r24: inherit keepAlive down the tree — a running JOB's delegated
           // sub-agents must survive a board switch / close like the job card
@@ -489,7 +489,7 @@
     const noBaseline = !!(attach && attach.noBaseline);
     let name;
     if (attached) {
-      name = attach.name || 'Sub-agent';
+      name = attach.name || 'Helper';
     } else {
       agentSeq += 1;
       name = 'Agent ' + agentSeq;
@@ -516,7 +516,7 @@
     if (attached) {
       // sub-agent hint: hollow dot + tooltip; .card-bar structure untouched
       dot.classList.add('atl-agent-subdot');
-      bar.title = 'Sub-agent — spawned by another agent card';
+      bar.title = 'Helper (started by another chat)';
     }
 
     const body = document.createElement('div');
@@ -534,6 +534,7 @@
     sendBtn.className = 'atl-agent-send';
     sendBtn.textContent = '➤';
     sendBtn.title = 'Send';
+    sendBtn.setAttribute('aria-label', 'Send message');
     composer.append(ta, sendBtn);
     // link-status note sits UNDER the composer (dedicated element so it never
     // fights the error note above — see refreshLinkNote)
@@ -971,7 +972,7 @@
         // evicted server-side (LRU cap / restart) — next send starts fresh
         untrackSession(sessionId);
         sessionId = null;
-        setNote('This session expired on the backend — the next message starts a fresh one.');
+        setNote('This chat has ended. Your next message starts a fresh one.');
         return;
       }
       if (!r.ok || !r.data) { schedulePoll(); return; }
@@ -1099,7 +1100,7 @@
               ? 'Session limit reached — close an Agent card or wait for a turn to finish, then try again.'
               : err && err.full
                 ? 'This conversation is full — close this card and start a fresh Agent.'
-                : 'Could not reach the Atelier backend. It may still be starting — try again in a moment.');
+                : 'Could not reach Atelier. It may still be starting, so try again in a moment.');
       }
     }
 

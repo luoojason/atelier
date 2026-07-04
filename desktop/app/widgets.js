@@ -394,7 +394,7 @@
 
     status: {
       label: 'Status', icon: '◉', size: { w: 220, h: 130 },
-      defaultConfig: { title: 'Backend', label: 'Operational', state: 'ok', source: '', field: '' },
+      defaultConfig: { title: 'Connection', label: 'Working', state: 'ok', source: '', field: '' },
       fields: [
         TITLE_FIELD,
         { name: 'label', label: 'Text', type: 'text' },

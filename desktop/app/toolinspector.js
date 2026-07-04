@@ -264,7 +264,7 @@
       if (tools.length === 0) {
         const empty = document.createElement('div');
         empty.className = 'atl-tools-empty';
-        empty.textContent = 'No tools reported by the backend.';
+        empty.textContent = 'No tools available yet.';
         list.appendChild(empty);
         return;
       }

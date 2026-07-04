@@ -114,10 +114,10 @@
     h.append(el('span', 'atl-prem-lock', '🔒'), document.createTextNode('Workflow AI'));
     body.appendChild(h);
     body.appendChild(el('div', 'atl-prem-p',
-      'A paid assistant that designs multi-step agent workflows for you — describe a goal and it drafts the orchestrator, the sub-agents, the tools, and the loop.'));
+      'A paid assistant that builds step-by-step teams for you. Describe a goal and it sets up the lead, the helpers, their tools, and the schedule.'));
     const list = el('ul', 'atl-prem-list');
-    ['Turns a plain-English goal into a runnable workflow',
-      'Wires orchestrator, sub-agents, tools and schedule',
+    ['Turns a plain-English goal into a team that runs itself',
+      'Sets up the lead, the helpers, their tools, and the schedule',
       'Editable on the canvas before you run it'].forEach((t) => {
       const li = document.createElement('li'); li.textContent = t; list.appendChild(li);
     });

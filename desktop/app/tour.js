@@ -82,14 +82,14 @@
   // group, which is also a .sb-group and gets its own step below.
   const STEPS = [
     { sel: '#canvas', title: 'Canvas', body: 'Your studio canvas — pan, zoom, arrange cards' },
-    { sel: '.dock', title: 'Dock', body: 'Spawn chat, browser, notes, agents' },
+    { sel: '.dock', title: 'Dock', body: 'Open a chat, browser, notes, or a helper' },
     { sel: '.topbar .search', title: 'Search', body: '⌘K — search apps, cards, boards' },
     { sel: '.sidebar .sb-group:not(.vw-nav)', title: 'Boards', body: 'Boards — separate studios, switched in place' },
     { sel: '.wgt-add-btn', title: 'Widgets', body: 'Live widgets — metrics, charts, and (soon) living dials' },
     { sel: '.zoombar', title: 'Zoombar', body: 'Fit ⤢, tidy ✦, minimap ▣' },
-    { sel: '[title="Chat"]', title: 'Agents', body: 'Chat — each press spawns a new agent conversation card; agents can spawn sub-agents that appear beside them' },
-    { sel: '.vw-nav', title: 'Analytics', body: 'Claude Code usage and cost' },
-    { sel: '.sb-foot .sb-row', title: 'Settings', body: 'Provider (subscription or API key), model, credentials' },
+    { sel: '[title="Chat"]', title: 'Agents', body: 'Chat: each press opens a new chat, and a chat can create helpers that appear beside it' },
+    { sel: '.vw-nav', title: 'Analytics', body: "How much of your Claude plan you've used" },
+    { sel: '.sb-foot .sb-row', title: 'Settings', body: 'Choose subscription or API key, pick an AI, and sign in' },
     { sel: null, title: 'Ready', body: 'That is the studio — build something.' },
   ];
 

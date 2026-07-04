@@ -162,7 +162,7 @@
     list.textContent = '';
     const agents = agentCache || [];
     if (!agents.length) {
-      list.appendChild(el('div', 'atl-xm-hint', 'No external agents yet. Add one below — e.g. your Iris or an OpenAI-compatible endpoint.'));
+      list.appendChild(el('div', 'atl-xm-hint', 'No outside assistants yet. Add one below, e.g. your Iris or any OpenAI-compatible service.'));
       return;
     }
     agents.forEach((a) => {
@@ -256,7 +256,7 @@
     key.className = 'atl-xm-in'; key.type = 'password'; key.placeholder = 'API key (optional)'; key.maxLength = 4000;
     key.autocomplete = 'off';
 
-    const hint = el('div', 'atl-xm-hint', 'Speaks the OpenAI chat-completions shape (POST {base}/chat/completions). Works with Iris, Hermes, OpenClaw, Ollama, or any OpenAI-compatible server.');
+    const hint = el('div', 'atl-xm-hint', 'Connects to any OpenAI-compatible assistant: Iris, Hermes, OpenClaw, Ollama, and more.');
     const note = el('div', 'atl-xm-note');
     const actions = el('div', 'atl-xm-actions');
     const clearBtn = el('button', 'atl-xm-btn', 'Clear form');
@@ -407,7 +407,7 @@
     // this reply into the new thread.
     if (inst.agentId !== boundAgent) return;
     if (r.status === 0) {
-      setNote(inst, 'Backend unreachable — is Atelier running?', true);
+      setNote(inst, 'Can\'t reach Atelier. Is it running?', true);
       inst.history.pop(); refillOnFailure(inst, text);
       return;
     }
@@ -428,6 +428,7 @@
     const pick = el('div', 'atl-ext-pick');
     const picker = document.createElement('select');
     picker.className = 'atl-ext-sel';
+    picker.setAttribute('aria-label', 'Choose an assistant');
     pick.appendChild(picker);
     pick.appendChild(el('span', 'atl-ext-badge', 'external'));
 
@@ -437,7 +438,7 @@
     const ta = document.createElement('textarea');
     ta.rows = 1;
     const sendBtn = el('button', 'atl-agent-send', '➤');
-    sendBtn.type = 'button'; sendBtn.title = 'Send';
+    sendBtn.type = 'button'; sendBtn.title = 'Send'; sendBtn.setAttribute('aria-label', 'Send message');
     composer.append(ta, sendBtn);
 
     body.append(pick, msgs, note, composer);

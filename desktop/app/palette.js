@@ -154,9 +154,9 @@
 
     // New session
     cmds.push({
-      id: 'session.new', label: 'New session', icon: '✦', section: 'Session',
+      id: 'session.new', label: 'New chat', icon: '✦', section: 'Session',
       keywords: 'session new start reset chat',
-      run() { A.bus.emit('session:new'); if (PALETTE_DIRECT_ACTIONS) A.ui.toast('New session'); },
+      run() { A.bus.emit('session:new'); if (PALETTE_DIRECT_ACTIONS) A.ui.toast('New chat'); },
     });
 
     // Toggle grid

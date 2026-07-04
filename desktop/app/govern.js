@@ -159,15 +159,15 @@
 
   async function govern(parentEl, childEl) {
     const pid = sidOf(parentEl), cid = sidOf(childEl);
-    if (!pid || !cid) { A.ui.toast('Cannot govern — a card has no session yet.'); return false; }
-    if (parentEl === childEl || pid === cid) { A.ui.toast('A chat cannot govern itself.'); return false; }
+    if (!pid || !cid) { A.ui.toast("Can't link these chats yet. One hasn't started."); return false; }
+    if (parentEl === childEl || pid === cid) { A.ui.toast("A chat can't be put in charge of itself."); return false; }
     const r = await apiJson('/sessions/' + pid + '/govern', {
       method: 'POST',
       body: JSON.stringify({ child_id: cid }),
     });
     if (!r.ok) {
       const msg = (r.data && r.data.error) ? r.data.error : 'backend unreachable';
-      A.ui.toast('Could not govern: ' + msg);
+      A.ui.toast("Couldn't link the chats: " + msg);
       return false;
     }
     // move: drop the old parent's arrow first — detachChild also clears any
@@ -181,7 +181,7 @@
     let m = govs.get(parentEl);
     if (!m) { m = new Map(); govs.set(parentEl, m); }
     m.set(childEl, { unlink });
-    A.ui.toast('Now governing ' + titleOf(childEl));
+    A.ui.toast('Now directing ' + titleOf(childEl));
     A.bus.emit('govern:changed', { parentEl });
     return true;
   }

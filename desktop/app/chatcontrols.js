@@ -114,7 +114,8 @@
   function buildModelPicker(ctx) {
     const sel = document.createElement('select');
     sel.className = 'atl-model-picker';
-    sel.title = 'Model for this chat';
+    sel.title = 'Which AI to use for this chat';
+    sel.setAttribute('aria-label', 'Which AI to use for this chat');
     for (const m of MODELS) {
       const opt = document.createElement('option');
       opt.value = m.value;
@@ -202,8 +203,8 @@
     btn.type = 'button';
     btn.className = 'atl-govern-btn';
     btn.textContent = '◎';
-    btn.title = 'Govern mode — click another agent card to delegate to it '
-      + '(drag still moves cards; Esc exits)';
+    btn.title = 'Put this chat in charge. Click another chat card to hand it '
+      + 'work (drag still moves cards, Esc exits).';
     controlsBar.appendChild(btn);
 
     // chip strip: one chip per governed child, ✕ to ungovern. Sits just ABOVE
@@ -228,8 +229,14 @@
         const x = document.createElement('span');
         x.className = 'atl-govern-chip-x';
         x.textContent = '×';
-        x.title = 'Stop governing';
+        x.title = 'Stop directing';
+        x.setAttribute('role', 'button');
+        x.setAttribute('tabindex', '0');
+        x.setAttribute('aria-label', 'Stop directing this chat');
         x.addEventListener('click', () => { g.unlink(cardEl, childEl); });
+        x.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); g.unlink(cardEl, childEl); }
+        });
         chip.append(label, x);
         chips.appendChild(chip);
       });

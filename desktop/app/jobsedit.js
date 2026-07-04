@@ -463,7 +463,7 @@
 
       const promptArea = document.createElement('textarea');
       promptArea.className = 'atl-jobs-area';
-      promptArea.placeholder = 'Prompt sent to the agency on each fire…';
+      promptArea.placeholder = 'What should run each time…';
       if (mode === 'edit') promptArea.value = String(job.prompt || '');
       const promptField = field('Prompt', promptArea);
 
@@ -529,7 +529,7 @@
         }
         saveBtn.disabled = false;
         if (res === null) {
-          err.textContent = 'Backend unreachable — job not saved.';
+          err.textContent = "Can't reach Atelier. Not saved.";
           return;
         }
         // 400 validation / 409 no-user-jobs-file / 403 token — the server's

@@ -924,7 +924,7 @@
           bus.emit('chat:reply', { data });
         } catch {
           t.classList.remove('thinking');
-          t.textContent = 'Could not reach the Atelier backend. It may still be starting — try again in a moment.';
+          t.textContent = 'Could not reach Atelier. It may still be starting, so try again in a moment.';
         }
       }
     } finally {
@@ -954,7 +954,7 @@
   function setStatus(ok) {
     dotEl.classList.remove('ok', 'bad');
     if (ok === true) { dotEl.classList.add('ok'); statusTextEl.textContent = 'on subscription'; }
-    else if (ok === false) { dotEl.classList.add('bad'); statusTextEl.textContent = 'backend offline'; }
+    else if (ok === false) { dotEl.classList.add('bad'); statusTextEl.textContent = 'Atelier offline'; }
     else { statusTextEl.textContent = 'connecting…'; }
     bus.emit('backend:status', { ok });
   }
