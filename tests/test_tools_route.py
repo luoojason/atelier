@@ -38,6 +38,7 @@ ORCHESTRA_NAMES = {
     "ReadPage",
     "Click",
     "Type",
+    "UploadFile",
 }
 
 
@@ -109,6 +110,9 @@ def test_orchestra_entries_present(client):
     assert orchestra["Click"]["input_schema"]["required"] == ["selector"]
     assert orchestra["Type"]["availability"] == "all agent sessions"
     assert orchestra["Type"]["input_schema"]["required"] == ["selector", "text"]
+    assert orchestra["UploadFile"]["availability"] == "all agent sessions"
+    assert orchestra["UploadFile"]["input_schema"]["required"] == ["selector", "path"]
+    assert "workspace" in orchestra["UploadFile"]["description"]
     assert orchestra["DelegateToSubagent"]["availability"] == "sessions governing sub-agents"
     assert orchestra["SpawnAgent"]["input_schema"]["required"] == ["task"]
     assert orchestra["CheckAgent"]["input_schema"]["required"] == ["agent_id"]

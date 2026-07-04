@@ -332,6 +332,7 @@ def build_options(
             "mcp__orchestra__ReadPage",
             "mcp__orchestra__Click",
             "mcp__orchestra__Type",
+            "mcp__orchestra__UploadFile",
         ]
         if spawner_session_id is not None:
             allowed_tools += [
@@ -2449,6 +2450,13 @@ class _AgentSession:
         # instead of reading it. Single slot for the same reason: the tool blocks
         # until its ack lands, so a turn holds at most one act outstanding.
         self.browser_act: dict | None = None
+        # Latest UploadFile request {"req", "seq", "action", "selector", "path"}
+        # or None. Same ROUND-TRIP shape as browser_act but it attaches a
+        # workspace file to a file <input> on the linked page. The path is
+        # already workspace-resolved (absolute, contained) by the tool; the card
+        # hands it to the main process, which sets it on the input via CDP
+        # DOM.setFileInputFiles (renderer JS cannot set a file input to a path).
+        self.browser_upload: dict | None = None
         # QUEUE of agent-driven "spawn a card on the canvas, arrow-link it to
         # me, then fill/drive it" ops (OpenBrowser -> {"kind":"browser","url"},
         # CreateCard -> {"kind":"note"|"document","title","content"}), each with
@@ -2912,6 +2920,7 @@ async def get_session(session_id: str):
         "browser_nav": sess.browser_nav,
         "browser_read": sess.browser_read,
         "browser_act": sess.browser_act,
+        "browser_upload": sess.browser_upload,
         "canvas_ops": list(sess.canvas_ops),
     }
 
@@ -3182,6 +3191,7 @@ _browser_read_req = itertools.count(1)
 # and one waiter map keep them from ever colliding.
 _browser_read_waiters: dict[int, "asyncio.Future"] = {}
 _browser_act_seq = itertools.count(1)  # Click/Type request seq (own poll field)
+_browser_upload_seq = itertools.count(1)  # UploadFile request seq (own poll field)
 _READ_PAGE_TIMEOUT = 25.0  # seconds to await the card's read (its poll is 1.5s)
 _READ_PAGE_MAX = 12_000    # chars of page text handed back to the model
 _BROWSER_ACT_TIMEOUT = 25.0  # seconds to await a Click/Type ack (poll is 1.5s)
@@ -3858,9 +3868,71 @@ def _orchestra_tools(parent_id: str) -> list:
         )
         return _act_result_text(result, f'type into "{selector}"')
 
+    @tool(
+        "UploadFile",
+        "Attach a file from YOUR workspace to a file-upload control (an <input"
+        " type=\"file\">) on the page loaded in the browser card linked to this"
+        " conversation, selected by a CSS selector (e.g. 'input[type=file]')."
+        " Use it to post media or attachments: create the file in your workspace"
+        " first (WriteFile or a render), then Click the compose control,"
+        " UploadFile the media, and Click submit. The path is RELATIVE to your"
+        " workspace — you can only upload files you created there. Call ReadPage"
+        " first to pick the selector. Works once a browser card is linked and has"
+        " loaded a page.",
+        {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "A CSS selector for the file <input> to attach"
+                    " the file to; the first match is used.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path to the file to upload"
+                    " (no leading '/', no '..').",
+                },
+            },
+            "required": ["selector", "path"],
+        },
+    )
+    async def _upload_file(args):
+        selector = str(args.get("selector") or "").strip()
+        if not selector:
+            return _tool_text("selector is required — a CSS selector for the file <input>.")
+        rel = str(args.get("path") or "").strip()
+        if not rel:
+            return _tool_text("path is required — a workspace-relative path to the file to upload.")
+        # Contain the path to the agent's own workspace, exactly like WriteFile/
+        # ReadFile: resolve() collapses '..' and symlinks BEFORE the containment
+        # check, so an absolute path, a traversal, or a planted symlink is
+        # rejected — the agent can only upload files it actually wrote. The
+        # resolved ABSOLUTE path is what the main process feeds to CDP.
+        try:
+            from shared_tools.workspace_core import workspace_root, _resolve_in_workspace
+            abs_path = _resolve_in_workspace(workspace_root(), rel)
+        except ValueError as exc:
+            return _tool_text(f"Cannot upload that path ({exc}). Use a path inside your workspace.")
+        except Exception:  # noqa: BLE001 - workspace unavailable
+            return _tool_text("Your workspace is unavailable, so the file cannot be uploaded.")
+        if not abs_path.is_file():
+            return _tool_text(
+                f"No file at workspace path '{rel}'. Create it first (e.g. WriteFile or a"
+                " render) and check the name."
+            )
+        parent = _sessions.get(parent_id)
+        if parent is None:
+            return _tool_text("Your session is gone; cannot upload.")
+        result = await _browser_roundtrip(
+            parent, "browser_upload",
+            {"action": "upload", "selector": selector, "path": str(abs_path)},
+            _browser_upload_seq, _BROWSER_ACT_TIMEOUT,
+        )
+        return _act_result_text(result, f'upload "{rel}" to "{selector}"')
+
     # NOTE: _delegate_agent stays at index 3 (tests unpack it by index); new
     # tools append to the END (open_browser [4], create_card [5], read_page [6],
-    # click [7], type [8]).
+    # click [7], type [8], upload_file [9]).
     return [
         _spawn_agent,
         _check_agent,
@@ -3871,6 +3943,7 @@ def _orchestra_tools(parent_id: str) -> list:
         _read_page,
         _click,
         _type,
+        _upload_file,
     ]
 
 

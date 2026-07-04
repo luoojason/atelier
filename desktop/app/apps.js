@@ -931,6 +931,30 @@
         } catch { return { ok: false, error: 'the page rejected the action' }; }
       });
 
+    // UploadFile (agent): attach a workspace file to a file <input> on this
+    // card's ACTIVE tab. Renderer/page JS cannot set a file input to a local
+    // path, so the actual attach happens in the MAIN process via CDP
+    // (DOM.setFileInputFiles). We hand main the webview's webContents id + the
+    // selector + the backend-resolved ABSOLUTE workspace path. Returns the
+    // {ok, text|error} ack, or null if no webview becomes ready.
+    cardApi.upload = (selector, filePath) =>
+      withReadyWebview(async (frame) => {
+        let wcId = 0;
+        try { wcId = frame.getWebContentsId(); } catch { wcId = 0; }
+        if (!wcId) return { ok: false, error: 'the browser view is not ready' };
+        if (!window.atelier || typeof window.atelier.uploadToWebview !== 'function') {
+          return { ok: false, error: 'file upload is not available in this build' };
+        }
+        try {
+          const out = await window.atelier.uploadToWebview({
+            webContentsId: wcId,
+            selector: String(selector || ''),
+            path: String(filePath || ''),
+          });
+          return (out && typeof out === 'object') ? out : { ok: false, error: 'the upload failed' };
+        } catch { return { ok: false, error: 'the upload was rejected' }; }
+      });
+
     // Wait (bounded 15s < the backend's 25s tool timeout) for the active tab to
     // be a live, attached, not-loading webview, then run fn(frame). fn returns a
     // truthy result to finish or null to keep waiting (readActiveTab uses null to
@@ -1321,7 +1345,22 @@
     }
     return Promise.resolve(null);
   }
-  window.AtelierApps = { browserInfo, browserNavigate, browserReadPage, browserAct, spawnNote };
+  // browserUpload(cardEl, selector, path) -> Promise<{ok,text|error}|null>
+  // Attach a workspace file to a file <input> on a browser card's active tab.
+  // `path` is a backend-resolved ABSOLUTE workspace path; the main process sets
+  // it on the input via CDP. sessions.js calls this for a browser_upload request
+  // and POSTs the ack back to the awaiting agent tool. null = non-browser/removed
+  // card or no webview.
+  function browserUpload(cardEl, selector, filePath) {
+    if (!cardEl) return Promise.resolve(null);
+    for (const c of browserCards) {
+      if (c.el === cardEl && typeof c.upload === 'function') {
+        return c.upload(String(selector || ''), String(filePath || ''));
+      }
+    }
+    return Promise.resolve(null);
+  }
+  window.AtelierApps = { browserInfo, browserNavigate, browserReadPage, browserAct, browserUpload, spawnNote };
 
   // ── self-check ────────────────────────────────────────────────────────────
   (function selfCheck() {

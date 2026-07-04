@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, dialog, ipcMain, powerSaveBlocker, screen, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, powerSaveBlocker, screen, shell, webContents } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -580,6 +580,111 @@ ipcMain.handle('atelier:reveal-folder', async (event, dirPath) => {
     return err ? { error: err } : { ok: true };
   } catch (err) {
     return { error: String((err && err.message) || err) };
+  }
+});
+
+// True if `resolvedRoot` must NOT be trusted as the workspace root — the
+// filesystem root, the home dir, ~/.atelier (the app's config dir), or any
+// ANCESTOR of ~/.atelier — because that would pull the app's own secrets
+// (settings.json's API key, claude-home's OAuth, jobs.yaml) into the upload
+// sandbox. Mirrors shared_tools/workspace_core._unsafe_root, so this guard trusts
+// EXACTLY the root the backend contained the file to (a configured workspace_dir
+// the backend rejected must not be honored here either — that was the bypass).
+function unsafeWorkspaceRoot(resolvedRoot) {
+  if (resolvedRoot === path.dirname(resolvedRoot)) return true; // filesystem root '/'
+  const home = path.resolve(os.homedir());
+  const atelier = path.join(home, '.atelier');
+  // resolvedRoot IS ~/.atelier, or an ANCESTOR of it (home, /Users, / …) — an
+  // ancestor is a strict path prefix of ~/.atelier. (home is caught this way.)
+  return resolvedRoot === atelier || atelier.startsWith(resolvedRoot + path.sep);
+}
+
+// The agent's file-write workspace root, mirroring shared_tools/workspace_core:
+// settings `workspace_dir` -> env ATELIER_WORKSPACE -> ~/.atelier/workspace, with
+// each configured candidate IGNORED (fall through) when unsafeWorkspaceRoot flags
+// it — same fall-through as workspace_root(). Used to CONTAIN uploads
+// independently of the backend (see the handler below).
+function atelierWorkspaceRoot() {
+  const home = os.homedir();
+  const expand = (p) => {
+    if (!p || typeof p !== 'string') return null;
+    return path.resolve(p.startsWith('~') ? path.join(home, p.slice(1)) : p);
+  };
+  let settingsDir = null;
+  try {
+    const sp = process.env.ATELIER_SETTINGS_PATH || path.join(home, '.atelier', 'settings.json');
+    settingsDir = expand(JSON.parse(fs.readFileSync(sp, 'utf8')).workspace_dir);
+  } catch { /* no/invalid settings — fall through */ }
+  for (const cand of [settingsDir, expand(process.env.ATELIER_WORKSPACE)]) {
+    if (cand && !unsafeWorkspaceRoot(cand)) return cand;
+  }
+  return path.join(home, '.atelier', 'workspace');
+}
+
+// atelier:upload-to-webview — attach a file to a file <input> on a browser
+// card's webview via CDP DOM.setFileInputFiles. Renderer/page JS cannot set a
+// file input to a local path, so this is the only way to drive an upload. The
+// backend already resolved the path INSIDE the agent's workspace, but this
+// handler RE-CHECKS containment against the workspace root, because a compromised
+// renderer could call this bridge directly — home-containment alone would let it
+// exfiltrate any readable file (e.g. ~/.ssh keys) to a logged-in site. Returns
+// { ok, text } | { ok:false, error }; never rejects.
+ipcMain.handle('atelier:upload-to-webview', async (_event, arg) => {
+  try {
+    const webContentsId = arg && arg.webContentsId;
+    const selector = arg && arg.selector;
+    const filePath = arg && arg.path;
+    if (typeof webContentsId !== 'number' || typeof selector !== 'string' || !selector.trim()
+        || typeof filePath !== 'string' || !filePath.trim()) {
+      return { ok: false, error: 'bad upload request' };
+    }
+    // Resolve symlinks on BOTH sides before comparing, so a symlink inside the
+    // workspace pointing out (or vice-versa) can't slip the containment check.
+    let resolved;
+    try { resolved = fs.realpathSync(path.resolve(filePath)); }
+    catch { return { ok: false, error: 'file not found' }; }
+    let rootReal;
+    try { rootReal = fs.realpathSync(atelierWorkspaceRoot()); }
+    catch { rootReal = path.resolve(atelierWorkspaceRoot()); }
+    if (resolved !== rootReal && !resolved.startsWith(rootReal + path.sep)) {
+      return { ok: false, error: 'refusing to upload a file outside the workspace' };
+    }
+    let st;
+    try { st = fs.statSync(resolved); } catch { return { ok: false, error: 'file not found' }; }
+    if (!st.isFile()) return { ok: false, error: 'not a regular file' };
+
+    const wc = webContents.fromId(webContentsId);
+    if (!wc || wc.isDestroyed()) return { ok: false, error: 'the browser view is gone' };
+    // Only ever drive a guest <webview> (a browser card), never the app window.
+    if (wc.getType() !== 'webview') return { ok: false, error: 'not a browser view' };
+
+    const dbg = wc.debugger;
+    try { dbg.attach('1.3'); } catch { /* already attached by attachUaMetadata — reuse it */ }
+    await dbg.sendCommand('DOM.enable').catch(() => {});
+    // 1) Verify the selector matches a file <input> (friendly errors).
+    const check = await dbg.sendCommand('Runtime.evaluate', {
+      expression: '(() => { const el = document.querySelector(' + JSON.stringify(selector) + ');'
+        + ' if (!el) return "none";'
+        + ' if (!(el.tagName === "INPUT" && el.type === "file")) return "nofile";'
+        + ' return "ok"; })()',
+      returnByValue: true,
+    });
+    const verdict = check && check.result && check.result.value;
+    if (verdict === 'none') return { ok: false, error: 'no element matches ' + selector };
+    if (verdict === 'nofile') return { ok: false, error: 'that element is not a file <input>' };
+    if (verdict !== 'ok') return { ok: false, error: 'could not find the file input' };
+    // 2) Get the element's objectId (returnByValue omitted -> RemoteObject).
+    const nodeRes = await dbg.sendCommand('Runtime.evaluate', {
+      expression: 'document.querySelector(' + JSON.stringify(selector) + ')',
+    });
+    const objectId = nodeRes && nodeRes.result && nodeRes.result.objectId;
+    if (!objectId) return { ok: false, error: 'could not resolve the file input' };
+    // 3) Attach the file. Do NOT detach the debugger — attachUaMetadata's live
+    //    UA-override session runs on it.
+    await dbg.sendCommand('DOM.setFileInputFiles', { files: [resolved], objectId });
+    return { ok: true, text: 'Attached ' + path.basename(resolved) + ' to ' + selector + '.' };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
   }
 });
 
