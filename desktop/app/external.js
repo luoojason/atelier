@@ -47,14 +47,31 @@
   const CARD_H = 460;
   const MANAGE = '__manage';
 
-  // Preset hints for the manager form — all speak the 'openai' adapter today;
-  // the preset only PREFILLS empty base_url/model fields as a convenience.
+  // Preset hints for the manager form — every one speaks the OpenAI-compatible
+  // /chat/completions protocol with a Bearer api_key, which is what forward()
+  // sends, so all of these "just work" once you add your key. The preset only
+  // PREFILLS the base_url + a sensible default model; edit the model freely
+  // (provider model names change often). Cloud providers need YOUR api_key
+  // (a paid API key / subscription for that service); local ones usually don't.
   const PRESETS = {
+    // ── cloud subscriptions (bring your own API key) ──
+    openai: { label: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-4o' },
+    gemini: { label: 'Google Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash' },
+    xai: { label: 'xAI (Grok)', base: 'https://api.x.ai/v1', model: 'grok-2-latest' },
+    deepseek: { label: 'DeepSeek', base: 'https://api.deepseek.com', model: 'deepseek-chat' },
+    mistral: { label: 'Mistral', base: 'https://api.mistral.ai/v1', model: 'mistral-large-latest' },
+    groq: { label: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
+    together: { label: 'Together AI', base: 'https://api.together.xyz/v1', model: '' },
+    openrouter: { label: 'OpenRouter (any model)', base: 'https://openrouter.ai/api/v1', model: '' },
+    perplexity: { label: 'Perplexity', base: 'https://api.perplexity.ai', model: 'sonar' },
+    // ── local / self-hosted ──
+    ollama: { label: 'Ollama (local)', base: 'http://127.0.0.1:11434/v1', model: 'llama3' },
+    lmstudio: { label: 'LM Studio (local)', base: 'http://127.0.0.1:1234/v1', model: '' },
+    // ── your own agents ──
     iris: { label: 'Iris', base: 'http://HOST:PORT/v1', model: '' },
     hermes: { label: 'Hermes', base: 'http://HOST:PORT/v1', model: '' },
     openclaw: { label: 'OpenClaw', base: 'http://HOST:PORT/v1', model: '' },
-    openai: { label: 'OpenAI-compatible', base: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
-    ollama: { label: 'Ollama (local)', base: 'http://127.0.0.1:11434/v1', model: 'llama3' },
+    openaicompat: { label: 'Other OpenAI-compatible…', base: 'https://', model: '' },
   };
 
   function el(tag, cls, text) {
@@ -162,7 +179,7 @@
     list.textContent = '';
     const agents = agentCache || [];
     if (!agents.length) {
-      list.appendChild(el('div', 'atl-xm-hint', 'No outside assistants yet. Add one below, e.g. your Iris or any OpenAI-compatible service.'));
+      list.appendChild(el('div', 'atl-xm-hint', 'No outside assistants yet. Add one below to run on a different subscription — OpenAI, Gemini, Groq, your own Iris, or any OpenAI-compatible service.'));
       return;
     }
     agents.forEach((a) => {
@@ -256,7 +273,7 @@
     key.className = 'atl-xm-in'; key.type = 'password'; key.placeholder = 'API key (optional)'; key.maxLength = 4000;
     key.autocomplete = 'off';
 
-    const hint = el('div', 'atl-xm-hint', 'Connects to any OpenAI-compatible assistant: Iris, Hermes, OpenClaw, Ollama, and more.');
+    const hint = el('div', 'atl-xm-hint', 'Connect a different subscription: OpenAI, Google Gemini, Groq, xAI, DeepSeek, Mistral, OpenRouter, your own Iris/Hermes, or any OpenAI-compatible service. Pick a preset, add your API key, Save.');
     const note = el('div', 'atl-xm-note');
     const actions = el('div', 'atl-xm-actions');
     const clearBtn = el('button', 'atl-xm-btn', 'Clear form');
