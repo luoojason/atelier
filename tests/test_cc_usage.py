@@ -408,7 +408,7 @@ def test_config_shape_defaults(monkeypatch, tmp_path, client):
     body.pop("workspace_dir")
     assert body == {
         "model": lite_server._resolved_model(),
-        "max_turns": 40,
+        "max_turns": 60,
         "scheduler": {"running": None},  # honestly unknowable from lite_server
         "jobs_file": "",
         "auth_mode": "origin-gate",
@@ -426,7 +426,7 @@ def test_config_max_turns_env(monkeypatch, client):
     monkeypatch.setenv("ATELIER_MAX_TURNS", "12")
     assert client.get("/config").json()["max_turns"] == 12
     monkeypatch.setenv("ATELIER_MAX_TURNS", "not-a-number")
-    assert client.get("/config").json()["max_turns"] == 40
+    assert client.get("/config").json()["max_turns"] == 60
 
 
 def test_config_and_cc_never_leak_token(seeded, monkeypatch, client):

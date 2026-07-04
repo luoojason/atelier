@@ -77,6 +77,8 @@
   const CAP_KEY = 'hud.max-agents';     // user-chosen concurrent-agent cap
   const BUDGET_KEY = 'hud.weekly-budget'; // user-chosen weekly comfort limit (tokens)
   const COLLAPSED_KEY = 'hud.collapsed';  // remember the minimized state
+  const LIMIT_ON_KEY = 'hud.limit-on';    // is the weekly comfort limit tracked at all?
+  const HIDDEN_KEY = 'hud.hidden';        // whole panel hidden (reopen via ⌘K)
 
   const CAP_MIN = 1;
   const CAP_MAX = 24;
@@ -126,6 +128,13 @@
     const n = Number(tokens);
     if (isFinite(n) && n > 0) A.store.set(BUDGET_KEY, Math.round(n));
   }
+  // Weekly comfort limit tracking — on by default; off hides the headroom bar,
+  // the limit editor and the "past your limit" nudge (the plain "Work this week"
+  // figure stays). Stored as a real boolean so a legacy string never lingers.
+  function getLimitOn() { return A.store.get(LIMIT_ON_KEY, true) !== false; }
+  function setLimitOn(on) { A.store.set(LIMIT_ON_KEY, !!on); }
+  function getHidden() { return A.store.get(HIDDEN_KEY, false) === true; }
+  function setHiddenPref(v) { A.store.set(HIDDEN_KEY, !!v); }
 
   // ── guarded backend helper (token header; never throws) ────────────────────
   async function api(path, opts) {
@@ -151,12 +160,16 @@
   (function injectStyles() {
     if (document.getElementById('atl-hud-style')) return;
     const css = `
-      .atl-hud { position: fixed; top: 62px; right: 16px; z-index: ${HUD_Z};
+      /* top:104 clears the fixed "+ widget" button (widgets.js, top:64 h:31,
+         bottom ~95): both live top-right, so the HUD sits BELOW it instead of
+         under it. Robust at any window width and if either element is hidden. */
+      .atl-hud { position: fixed; top: 104px; right: 16px; z-index: ${HUD_Z};
         width: 248px; box-sizing: border-box; background: var(--panel);
         border: 1px solid var(--border); border-radius: var(--radius);
         box-shadow: var(--shadow); color: var(--ink); overflow: hidden;
         font-size: 13px; }
       .atl-hud.is-offline { opacity: .72; }
+      .atl-hud.is-hidden { display: none; }
 
       .atl-hud-head { display: flex; align-items: center; gap: 8px;
         padding: 9px 10px 9px 12px; border-bottom: 1px solid var(--border-soft);
@@ -174,6 +187,37 @@
         border-radius: 7px; }
       .atl-hud-toggle:hover { background: var(--active); color: var(--ink); }
       .atl-hud-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+      /* header ⚙ settings button + its dropdown (what to show / hide) */
+      .atl-hud-gear { border: none; background: transparent; color: var(--ink-dim);
+        cursor: pointer; font: inherit; font-size: 13px; line-height: 1; padding: 3px 5px;
+        border-radius: 7px; }
+      .atl-hud-gear:hover { background: var(--active); color: var(--ink); }
+      .atl-hud-gear:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+      .atl-hud.menu-open .atl-hud-gear { background: var(--active); color: var(--ink); }
+
+      /* the dropdown escapes the panel's overflow:hidden via .menu-open below */
+      .atl-hud-menu { position: absolute; top: 40px; right: 8px; z-index: 2;
+        min-width: 196px; background: var(--panel); border: 1px solid var(--border);
+        border-radius: 11px; box-shadow: var(--shadow); padding: 5px; display: none;
+        flex-direction: column; gap: 1px; }
+      .atl-hud.menu-open { overflow: visible; }
+      .atl-hud.menu-open .atl-hud-menu { display: flex; }
+      .atl-hud-mrow { display: flex; align-items: center; gap: 10px; width: 100%;
+        text-align: left; border: none; background: transparent; cursor: pointer;
+        padding: 8px 9px; border-radius: 8px; color: var(--ink); font: inherit; font-size: 12.5px; }
+      .atl-hud-mrow:hover { background: var(--active); }
+      .atl-hud-mrow:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+      .atl-hud-mrow .mlab { flex: 1; }
+      /* mini switch, reads on/off at a glance */
+      .atl-hud-sw { width: 30px; height: 18px; flex: 0 0 30px; border-radius: 999px;
+        background: var(--border); position: relative; transition: background-color .18s ease; }
+      .atl-hud-sw::after { content: ''; position: absolute; top: 2px; left: 2px;
+        width: 14px; height: 14px; border-radius: 50%; background: #fff;
+        transition: transform .18s ease; }
+      .atl-hud-mrow.on .atl-hud-sw { background: var(--accent); }
+      .atl-hud-mrow.on .atl-hud-sw::after { transform: translateX(12px); }
+      .atl-hud-mdiv { height: 1px; background: var(--border-soft); margin: 3px 2px; }
 
       .atl-hud-body { padding: 12px; display: flex; flex-direction: column; gap: 13px; }
       .atl-hud.collapsed .atl-hud-body { display: none; }
@@ -216,12 +260,14 @@
         font-size: 15px; color: var(--ink); }
 
       .atl-hud-limit { display: flex; align-items: center; gap: 6px; }
-      .atl-hud-limit label { font-size: 11.5px; color: var(--ink-dim); flex: 1; }
-      .atl-hud-limit input { width: 58px; border: 1px solid var(--border); border-radius: 7px;
+      .atl-hud-limit label { font-size: 11.5px; color: var(--ink-dim); flex: 1 1 auto;
+        min-width: 0; }
+      .atl-hud-limit input { width: 50px; flex: 0 0 50px; box-sizing: border-box;
+        border: 1px solid var(--border); border-radius: 7px;
         padding: 4px 6px; font: inherit; font-size: 12px; color: var(--ink);
         background: #faf7f1; outline: none; text-align: right; }
       .atl-hud-limit input:focus { border-color: var(--accent); }
-      .atl-hud-limit .unit { font-size: 11.5px; color: var(--ink-dim); }
+      .atl-hud-limit .unit { font-size: 11.5px; color: var(--ink-dim); flex: 0 0 auto; }
 
       .atl-hud-stop { width: 100%; border: 1px solid transparent; border-radius: 10px;
         background: var(--accent); color: #fff; padding: 9px 12px; cursor: pointer;
@@ -244,6 +290,7 @@
       @media (prefers-reduced-motion: reduce) {
         .atl-hud-live.on { animation: none; }
         .atl-hud-bar > i { transition: none; }
+        .atl-hud-sw, .atl-hud-sw::after { transition: none; }
       }
     `;
     const style = el('style');
@@ -256,6 +303,8 @@
   let rootEl = null;
   let refs = {};
   let collapsed = A.store.get(COLLAPSED_KEY, false) === true;
+  let hidden = getHidden();
+  let menuOpen = false;
   let online = null;              // null unknown, true up, false down
   let confirmOpen = false;
   let lastRunning = 0;
@@ -271,12 +320,21 @@
     live.setAttribute('aria-hidden', 'true');
     const title = el('span', 'atl-hud-title', 'Studio load');
     const sp = el('div', 'atl-hud-sp');
+    const gear = el('button', 'atl-hud-gear', '⚙');
+    gear.type = 'button';
+    gear.setAttribute('aria-haspopup', 'true');
+    gear.setAttribute('aria-expanded', 'false');
+    gear.setAttribute('aria-label', 'Studio load settings — show or hide parts of this panel');
+    gear.addEventListener('click', (e) => { e.stopPropagation(); toggleMenu(); });
     const toggle = el('button', 'atl-hud-toggle', collapsed ? '▸' : '▾');
     toggle.type = 'button';
     toggle.setAttribute('aria-expanded', String(!collapsed));
     toggle.setAttribute('aria-label', collapsed ? 'Expand studio load panel' : 'Collapse studio load panel');
     toggle.addEventListener('click', () => setCollapsed(!collapsed));
-    head.append(live, title, sp, toggle);
+    head.append(live, title, sp, gear, toggle);
+
+    // settings dropdown (absolute inside root; shown via .menu-open)
+    const menu = buildMenu();
 
     // body
     const body = el('div', 'atl-hud-body');
@@ -362,12 +420,85 @@
     stopWrap.appendChild(stopBtn);
 
     body.append(now, hrBlock, limit, div1, cap, capNote, div2, stopWrap);
-    root.append(head, body);
+    root.append(head, menu, body);
+    if (hidden) root.classList.add('is-hidden');
 
-    refs = { root, live, title, toggle, nowN, nowL, hrV: hrRow.querySelector('.atl-hud-hr-v'),
-      bar, fill, hrNote, weekV: weekRow.querySelector('.atl-hud-week-v'), limIn,
+    refs = { root, live, title, gear, menu, toggle, nowN, nowL,
+      hrRow, hrV: hrRow.querySelector('.atl-hud-hr-v'),
+      bar, fill, hrNote, weekV: weekRow.querySelector('.atl-hud-week-v'), limIn, limitBox: limit,
       capVal, minus, plus, capNote, stopWrap, stopBtn };
     return root;
+  }
+
+  // ── settings dropdown: choose what this panel shows ────────────────────────
+  function buildMenu() {
+    const menu = el('div', 'atl-hud-menu');
+    menu.setAttribute('role', 'menu');
+
+    // toggle: track the weekly comfort limit
+    const limRow = el('button', 'atl-hud-mrow');
+    limRow.type = 'button';
+    limRow.setAttribute('role', 'menuitemcheckbox');
+    limRow.append(el('span', 'mlab', 'Weekly comfort limit'));
+    const sw = el('span', 'atl-hud-sw');
+    sw.setAttribute('aria-hidden', 'true');
+    limRow.appendChild(sw);
+    const syncLimRow = () => {
+      const on = getLimitOn();
+      limRow.classList.toggle('on', on);
+      limRow.setAttribute('aria-checked', String(on));
+    };
+    syncLimRow();
+    limRow.addEventListener('click', () => { setLimitOn(!getLimitOn()); syncLimRow(); render(); });
+
+    const div = el('div', 'atl-hud-mdiv');
+
+    // action: hide the whole panel (reopen from the command palette)
+    const hideRow = el('button', 'atl-hud-mrow');
+    hideRow.type = 'button';
+    hideRow.setAttribute('role', 'menuitem');
+    hideRow.append(el('span', 'mlab', 'Hide this panel'));
+    hideRow.addEventListener('click', () => { closeMenu(); setHidden(true); });
+
+    menu.append(limRow, div, hideRow);
+    return menu;
+  }
+
+  function openMenu() {
+    if (menuOpen || !refs.root) return;
+    menuOpen = true;
+    refs.root.classList.add('menu-open');
+    if (refs.gear) refs.gear.setAttribute('aria-expanded', 'true');
+    setTimeout(() => {
+      document.addEventListener('mousedown', onMenuOutside, true);
+      document.addEventListener('keydown', onMenuKey, true);
+    }, 0);
+  }
+  function closeMenu() {
+    if (!menuOpen) return;
+    menuOpen = false;
+    if (refs.root) refs.root.classList.remove('menu-open');
+    if (refs.gear) refs.gear.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('mousedown', onMenuOutside, true);
+    document.removeEventListener('keydown', onMenuKey, true);
+  }
+  function toggleMenu() { menuOpen ? closeMenu() : openMenu(); }
+  function onMenuOutside(e) { if (refs.root && !refs.root.contains(e.target)) closeMenu(); }
+  function onMenuKey(e) {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation();
+    closeMenu();
+  }
+
+  // Hide / show the whole HUD (reversible via the ⌘K "Studio load" command).
+  function setHidden(v) {
+    hidden = !!v;
+    setHiddenPref(hidden);
+    if (!refs.root) return;
+    if (hidden) closeMenu();
+    refs.root.classList.toggle('is-hidden', hidden);
+    if (hidden) toast('Studio load hidden — reopen it from ⌘K → “Studio load”.');
   }
 
   function setCollapsed(v) {
@@ -463,37 +594,50 @@
     refs.nowN.classList.toggle('busy', running > 0);
     refs.nowL.textContent = running === 1 ? 'agent working now' : 'agents working now';
 
-    // (2) headroom
+    // (2) headroom / weekly work.  When the comfort limit is turned off we hide
+    // the "Room left" row, the bar, the limit editor and the nudge — leaving the
+    // plain "Work this week" figure, which carries no judgement.
+    const limitOn = getLimitOn();
+    const showLimit = limitOn ? '' : 'none';
+    refs.hrRow.style.display = showLimit;
+    refs.bar.style.display = showLimit;
+    refs.hrNote.style.display = showLimit;
+    if (refs.limitBox) refs.limitBox.style.display = showLimit;
+
     const budget = getBudget();
     if (weekTokens == null) {
-      refs.hrV.textContent = '—';
-      refs.fill.style.width = '0%';
-      refs.bar.removeAttribute('aria-valuenow');
-      refs.bar.setAttribute('aria-valuetext', 'Usage not available yet');
-      refs.hrNote.textContent = online === false ? 'Offline — showing the last known load.' : 'Waiting for usage…';
-      refs.hrNote.className = 'atl-hud-note';
       refs.weekV.textContent = '—';
-    } else {
-      const usedPct = Math.max(0, Math.min(100, Math.round((weekTokens / budget) * 100)));
-      const leftPct = 100 - usedPct;
-      refs.hrV.textContent = leftPct + '%';
-      refs.fill.style.width = usedPct + '%';
-      refs.fill.className = usedPct >= 90 ? 'danger' : usedPct >= 70 ? 'warn' : '';
-      refs.bar.setAttribute('aria-valuenow', String(leftPct));
-      refs.bar.setAttribute('aria-valuetext', leftPct + ' percent of your weekly comfort limit left');
-      refs.weekV.textContent = fmtNum(weekTokens);
-      if (usedPct >= 100) {
-        refs.hrNote.textContent = 'Past your comfort limit for the week.';
-        refs.hrNote.className = 'atl-hud-note danger';
-      } else if (usedPct >= 90) {
-        refs.hrNote.textContent = 'Almost out of room for the week.';
-        refs.hrNote.className = 'atl-hud-note warn';
-      } else if (usedPct >= 70) {
-        refs.hrNote.textContent = 'Getting busy this week.';
-        refs.hrNote.className = 'atl-hud-note warn';
-      } else {
-        refs.hrNote.textContent = 'Plenty of room this week.';
+      if (limitOn) {
+        refs.hrV.textContent = '—';
+        refs.fill.style.width = '0%';
+        refs.bar.removeAttribute('aria-valuenow');
+        refs.bar.setAttribute('aria-valuetext', 'Usage not available yet');
+        refs.hrNote.textContent = online === false ? 'Offline — showing the last known load.' : 'Waiting for usage…';
         refs.hrNote.className = 'atl-hud-note';
+      }
+    } else {
+      refs.weekV.textContent = fmtNum(weekTokens);
+      if (limitOn) {
+        const usedPct = Math.max(0, Math.min(100, Math.round((weekTokens / budget) * 100)));
+        const leftPct = 100 - usedPct;
+        refs.hrV.textContent = leftPct + '%';
+        refs.fill.style.width = usedPct + '%';
+        refs.fill.className = usedPct >= 90 ? 'danger' : usedPct >= 70 ? 'warn' : '';
+        refs.bar.setAttribute('aria-valuenow', String(leftPct));
+        refs.bar.setAttribute('aria-valuetext', leftPct + ' percent of your weekly comfort limit left');
+        if (usedPct >= 100) {
+          refs.hrNote.textContent = 'Past your comfort limit for the week.';
+          refs.hrNote.className = 'atl-hud-note danger';
+        } else if (usedPct >= 90) {
+          refs.hrNote.textContent = 'Almost out of room for the week.';
+          refs.hrNote.className = 'atl-hud-note warn';
+        } else if (usedPct >= 70) {
+          refs.hrNote.textContent = 'Getting busy this week.';
+          refs.hrNote.className = 'atl-hud-note warn';
+        } else {
+          refs.hrNote.textContent = 'Plenty of room this week.';
+          refs.hrNote.className = 'atl-hud-note';
+        }
       }
     }
 
@@ -552,8 +696,12 @@
   function registerPaletteCommand() {
     A.bus.emit('palette:add', {
       id: 'hud.toggle', label: 'Studio load HUD', icon: '◧', section: 'Studio',
-      keywords: 'load usage tokens stop agents cap limit safety headroom rate',
-      run() { if (collapsed) setCollapsed(false); if (rootEl) rootEl.scrollIntoView({ block: 'nearest' }); },
+      keywords: 'load usage tokens stop agents cap limit safety headroom rate show hide reopen',
+      run() {
+        if (hidden) setHidden(false);
+        if (collapsed) setCollapsed(false);
+        if (rootEl) rootEl.scrollIntoView({ block: 'nearest' });
+      },
     });
   }
   registerPaletteCommand();
@@ -573,6 +721,11 @@
     running: () => lastRunning,
     collapse: () => setCollapsed(true),
     expand: () => setCollapsed(false),
+    hide: () => setHidden(true),
+    show: () => setHidden(false),
+    isHidden: () => hidden,
+    limitOn: getLimitOn,
+    setLimitOn: (v) => { setLimitOn(v); render(); return getLimitOn(); },
     el: () => rootEl,
   };
 

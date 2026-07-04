@@ -359,11 +359,51 @@ def build_options(
         env=env,
         # Ceiling learned live: the weekly project-rollup job (VaultSearch +
         # reading dozens of Projects/ pages + VaultWrite) blew through 12 with
-        # "Reached maximum number of turns". 40 fits the heaviest real job;
-        # env knob for tuning without a rebuild.
-        max_turns=int(os.getenv("ATELIER_MAX_TURNS", "40")),
+        # "Reached maximum number of turns". 60 gives an orchestrator that
+        # delegates to several sub-agents (every SpawnAgent/CheckAgent is a turn)
+        # real headroom; and hitting it is now a soft, resumable pause rather
+        # than a dead end (see _friendly_turn_error). env knob, no rebuild.
+        max_turns=int(os.getenv("ATELIER_MAX_TURNS", "60")),
         include_partial_messages=stream,
     )
+
+
+# Signal-exit markers for the claude CLI subprocess: 143=SIGTERM, 137=SIGKILL,
+# 130=SIGINT. When the app quits / relaunches (or the stale-port cleanup fires)
+# with a turn in flight, the SDK transport dies with one of these and raises a
+# "Command failed with exit code 143 / Fatal error in message reader" — that is
+# an INTERRUPTION (the backend went away under the run), not an agent failure.
+_INTERRUPT_MARKERS = (
+    "exit code 143", "exit code 137", "exit code 130",
+    "message reader", "clidisconnect", "cliconnectionerror",
+)
+
+
+def _friendly_turn_error(detail: str) -> str:
+    """Turn a raw SDK/CLI failure string into a clear, non-alarming card message.
+
+    Two common cases get plain language instead of leaking "exit code 143 / check
+    stderr" or a bare "Reached maximum number of turns (40)":
+      • step-limit  -> the turn paused at max_turns; the live client still holds
+                       the conversation, so "continue" resumes it.
+      • interrupted -> the CLI was signal-killed because the app/backend restarted
+                       mid-run; resend to retry.
+    Anything else keeps the original wording so genuine errors stay visible.
+    """
+    raw = (detail or "run failed").strip()
+    low = raw.lower()
+    if "maximum number of turns" in low or "max_turns" in low:
+        return (
+            "I reached my step limit for this turn, so I paused here rather than "
+            "stopping for good. Your progress is kept — send “continue” "
+            "and I’ll pick up where I left off."
+        )
+    if any(marker in low for marker in _INTERRUPT_MARKERS):
+        return (
+            "This run was interrupted — the app or backend restarted while the "
+            "agent was still working. Send your last message again to continue."
+        )
+    return f"Atelier hit an error and could not finish that turn: {raw}"
 
 
 async def _collect_response(client: ClaudeSDKClient) -> dict:
@@ -385,9 +425,7 @@ async def _collect_response(client: ClaudeSDKClient) -> dict:
                     "; ".join(msg.errors) if msg.errors else "run failed"
                 )
                 return {
-                    "response": (
-                        f"Atelier hit an error and could not finish that turn: {detail}"
-                    ),
+                    "response": _friendly_turn_error(detail),
                     "error": True,
                 }
     return {"response": "".join(texts).strip()}
@@ -1110,9 +1148,9 @@ async def config():
     """
     token_present = bool(os.getenv("ATELIER_TOKEN", ""))
     try:
-        max_turns = int(os.getenv("ATELIER_MAX_TURNS", "40"))
+        max_turns = int(os.getenv("ATELIER_MAX_TURNS", "60"))
     except ValueError:
-        max_turns = 40
+        max_turns = 60
     settings = load_settings()
     key = settings.get("anthropic_api_key") or ""
     return {
@@ -1758,7 +1796,7 @@ async def chat(req: ChatRequest):
         # reconnects instead of re-raising forever.
         await _reset_chat_client()
         return {
-            "response": f"Atelier hit an error and could not finish that turn: {exc}",
+            "response": _friendly_turn_error(str(exc)),
             "error": True,
         }
 
@@ -1819,10 +1857,7 @@ async def _stream_turn(message: str):
                             {
                                 "done": True,
                                 "error": True,
-                                "response": (
-                                    "Atelier hit an error and could not finish "
-                                    f"that turn: {detail}"
-                                ),
+                                "response": _friendly_turn_error(detail),
                             }
                         )
                         return
@@ -1833,9 +1868,7 @@ async def _stream_turn(message: str):
             {
                 "done": True,
                 "error": True,
-                "response": (
-                    f"Atelier hit an error and could not finish that turn: {exc}"
-                ),
+                "response": _friendly_turn_error(str(exc)),
             }
         )
     finally:
@@ -1875,7 +1908,7 @@ async def get_response_compat(req: AgencyResponseRequest):
             return await _collect_response(client)
     except Exception as exc:  # noqa: BLE001 - mirror /chat: never 500 the caller
         return {
-            "response": f"Atelier hit an error and could not finish that turn: {exc}",
+            "response": _friendly_turn_error(str(exc)),
             "error": True,
         }
 
@@ -2672,7 +2705,7 @@ async def _run_session_turn(sess: _AgentSession, message: str) -> None:
             # wraps this coroutine in a task and never reads its result).
             return result
         except Exception as exc:  # noqa: BLE001 - surface in-band, never crash the task
-            err = f"Atelier hit an error and could not finish that turn: {exc}"
+            err = _friendly_turn_error(str(exc))
             _append_session_message(sess, "assistant", err)
             sess.status = "error"
             # The transport may be wedged (dead CLI subprocess); drop the client
