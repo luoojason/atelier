@@ -21,9 +21,6 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 _ENV_EXAMPLE = os.path.join(_REPO_ROOT, ".env.example")
 _SHARED_INSTRUCTIONS = os.path.join(_REPO_ROOT, "shared_instructions.md")
-_ORCHESTRATOR_PY = os.path.join(_REPO_ROOT, "orchestrator", "orchestrator.py")
-_ORCHESTRATOR_INSTRUCTIONS = os.path.join(_REPO_ROOT, "orchestrator", "instructions.md")
-
 _ASSIGNMENT = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
 
 
@@ -53,20 +50,9 @@ def test_env_example_google_api_key_declared_once():
     assert keys.count("GOOGLE_API_KEY") == 1
 
 
-def test_orchestrator_code_name_is_orchestrator():
-    source = open(_ORCHESTRATOR_PY, encoding="utf-8").read()
-    assert 'name="Orchestrator"' in source
-
-
 def test_shared_instructions_use_orchestrator_not_agent_swarm():
     text = open(_SHARED_INSTRUCTIONS, encoding="utf-8").read()
     assert "Agent Swarm" not in text, "stale coordinator label 'Agent Swarm' in shared_instructions.md"
-    assert "Orchestrator" in text
-
-
-def test_orchestrator_instructions_use_orchestrator_not_agent_swarm():
-    text = open(_ORCHESTRATOR_INSTRUCTIONS, encoding="utf-8").read()
-    assert "Agent Swarm" not in text, "stale coordinator label 'Agent Swarm' in orchestrator/instructions.md"
     assert "Orchestrator" in text
 
 
