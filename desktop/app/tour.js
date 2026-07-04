@@ -88,7 +88,7 @@
     { sel: '.wgt-add-btn', title: 'Widgets', body: 'Live widgets — metrics, charts, and (soon) living dials' },
     { sel: '.zoombar', title: 'Zoombar', body: 'Fit ⤢, tidy ✦, minimap ▣' },
     { sel: '[title="Chat"]', title: 'Agents', body: 'Chat: each press opens a new chat, and a chat can create helpers that appear beside it' },
-    { sel: '.vw-nav', title: 'Analytics', body: "How much of your Claude plan you've used" },
+    { sel: '.vw-nav', title: 'Analytics', body: 'Your token usage and cost over time' },
     { sel: '.sb-foot .sb-row', title: 'Settings', body: 'Choose subscription or API key, pick an AI, and sign in' },
     { sel: null, title: 'Ready', body: 'That is the studio — build something.' },
   ];
