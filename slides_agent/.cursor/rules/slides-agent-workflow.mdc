@@ -1,9 +1,0 @@
----
-alwaysApply: true
----
-
-# Slides Agent Workflow Rules
-
-- Always run the integration test after any change:
-  `python -m unittest slides_agent.tests.test_claude_cowork_prompt`
-- Ask use for feedback on presentation after its implemented.

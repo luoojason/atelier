@@ -1,1 +1,0 @@
-from .virtual_assistant import create_virtual_assistant
