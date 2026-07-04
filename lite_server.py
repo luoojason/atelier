@@ -75,6 +75,7 @@ from shared_tools.sdk_tools import build_atelier_server
 # Pure stdlib vault path helpers: the /versions* routes validate note paths
 # against the vault root without touching the heavier tool wrappers.
 from shared_tools import vault_core
+from shared_tools.state_migrate import migrate_legacy_state
 from campaign_agent.tools.StartCampaign import StartCampaign
 from campaign_agent.tools.RecordDeliverable import RecordDeliverable
 from campaign_agent.tools.CampaignStatus import CampaignStatus
@@ -490,7 +491,12 @@ async def _reset_chat_client() -> None:
 
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
-    # Nothing to warm up; the chat client connects lazily on first /chat.
+    # Copy any legacy ~/.openswarm state (memory / runs ledger / notifications)
+    # forward into ~/.atelier before anything reads those paths, so the rename of
+    # the default state dir never orphans a returning user's data. Idempotent +
+    # best-effort; the scheduler runs the same migration at its own startup.
+    migrate_legacy_state()
+    # Nothing else to warm up; the chat client connects lazily on first /chat.
     yield
     # Final flush on graceful shutdown. The desktop app SIGTERMs the backend on
     # window close, which unwinds this lifespan; persisting here guarantees a
@@ -629,7 +635,7 @@ def _jobs_file() -> str:
 def _memory_entries() -> list:
     """The swarm memory entry list, or [] when missing/unreadable/non-list."""
     path = Path(
-        os.getenv("SWARM_MEMORY_PATH", "~/.openswarm/swarm_memory.json")
+        os.getenv("SWARM_MEMORY_PATH", "~/.atelier/swarm_memory.json")
     ).expanduser()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))

@@ -6,7 +6,7 @@ human log. All the logic here is plain functions over stdlib types (json / os /
 pathlib) so it imports and unit-tests under a bare ``python3`` with no
 agency_swarm / apscheduler / pydantic.
 
-The ledger path comes from ``SWARM_RUNS_JSONL`` (default ``~/.openswarm/runs.jsonl``).
+The ledger path comes from ``SWARM_RUNS_JSONL`` (default ``~/.atelier/runs.jsonl``).
 ``build_record`` is deterministic: the caller passes the ISO timestamp in, so
 the function never touches the clock.
 """
@@ -19,7 +19,7 @@ import threading
 from pathlib import Path
 from typing import Any, Optional
 
-DEFAULT_RUNS_JSONL = "~/.openswarm/runs.jsonl"
+DEFAULT_RUNS_JSONL = "~/.atelier/runs.jsonl"
 
 # Redaction: cap the stored response excerpt so a giant agent reply cannot bloat
 # the ledger (or leak an unbounded amount of text into it).

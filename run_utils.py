@@ -13,8 +13,8 @@ def _openswarm_state_root() -> Path:
     if override:
         return Path(override).expanduser().resolve()
     if sys.platform == "win32":
-        return Path(os.getenv("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "OpenSwarm"
-    return Path.home() / ".openswarm"
+        return Path(os.getenv("APPDATA") or (Path.home() / "AppData" / "Roaming")) / "Atelier"
+    return Path.home() / ".atelier"
 
 
 def _load_openswarm_dotenv(*, override: bool = False) -> bool:
