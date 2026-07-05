@@ -317,6 +317,8 @@
         cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 4px; }
       .atl-recipes-strip .close:hover { color: var(--ink); }
 
+      .atl-recipes-sample { display: flex; justify-content: center; margin: 2px 0 6px; }
+
       @media (prefers-reduced-motion: reduce) {
         .atl-recipes-overlay, .atl-recipes-strip { animation: none; }
         .atl-recipe-card { transition: none; }
@@ -377,6 +379,20 @@
       const pick = RECIPES[Math.floor(Math.random() * RECIPES.length)];
       openForm(pick);
     });
+
+    // The zero-cost first win (sample.js): visible before any auth or spend,
+    // so a newcomer can see a full run before connecting anything.
+    if (window.AtelierSample && typeof window.AtelierSample.play === 'function') {
+      const sampleRow = el('div', 'atl-recipes-sample');
+      const sampleBtn = el('button', 'atl-recipes-btn ghost', '▶ Watch a sample run first — free, nothing is sent');
+      sampleBtn.type = 'button';
+      sampleBtn.addEventListener('click', () => {
+        closeOverlay({ remember: false });
+        window.AtelierSample.play();
+      });
+      sampleRow.appendChild(sampleBtn);
+      inner.appendChild(sampleRow);
+    }
 
     // grouped recipe grids
     categoriesInOrder().forEach((cat) => {

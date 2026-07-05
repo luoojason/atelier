@@ -1257,6 +1257,62 @@ async def workspace_files():
         return {"files": []}
 
 
+# ── The zero-cost sample run (Round-2 P1: the guaranteed first win) ─────────────
+#
+# The sample card (desktop/app/sample.js) plays a canned research->make->publish
+# run with NO model call, NO network, NO spend — but the deliverable at the end
+# is REAL: this route writes the bundled fixture into the workspace so "open the
+# file it made" is true. Content is embedded (not a packaged fixture file) so
+# there is no extraResources risk. POST = token-gated by the middleware.
+
+_SAMPLE_RUN_PATH = "sample-run/five-desk-plants.md"
+_SAMPLE_RUN_CONTENT = """# Five desk plants that survive a dark office
+
+*A sample deliverable made by Atelier's demo run. No agents, models, or web
+requests were involved — this exact file ships with the app so you can see
+what a finished deliverable looks like before connecting anything.*
+
+## The picks
+
+1. **Snake plant (Sansevieria)** — tolerates weeks of neglect and almost no
+   light; water every 3-4 weeks.
+2. **ZZ plant (Zamioculcas)** — glossy leaves, thrives on fluorescent light
+   alone; water monthly.
+3. **Pothos** — trails nicely off a shelf; forgiving of missed waterings and
+   dim corners.
+4. **Peace lily** — droops dramatically to TELL you it wants water, then
+   bounces back within hours.
+5. **Cast iron plant (Aspidistra)** — the name is the review: nearly
+   indestructible in low light.
+
+## Care card
+
+| Plant | Light | Water |
+|-------|-------|-------|
+| Snake plant | any | every 3-4 weeks |
+| ZZ plant | low-medium | monthly |
+| Pothos | low-bright indirect | when soil dries |
+| Peace lily | medium indirect | when it droops |
+| Cast iron | low | every 2 weeks |
+
+*In a real run, a Researcher agent gathers checkable facts, a Maker writes the
+piece, and a Publisher holds anything outbound for your approval.*
+"""
+
+
+@app.post("/demo/sample")
+async def demo_sample():
+    """Write the sample deliverable into the workspace and return its path.
+    Idempotent: re-running the demo overwrites the same file."""
+    try:
+        from shared_tools.workspace_core import write_file
+
+        write_file(_SAMPLE_RUN_PATH, _SAMPLE_RUN_CONTENT)
+        return {"ok": True, "path": _SAMPLE_RUN_PATH}
+    except Exception as exc:  # noqa: BLE001 - the demo must fail soft, never 500
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
 @app.get("/workspace/file")
 async def workspace_file(path: str = ""):
     """Read one workspace file's text for a preview. Path containment is enforced
