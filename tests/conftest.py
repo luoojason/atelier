@@ -22,7 +22,7 @@ import os
 import pytest
 
 _ISOLATED_KEYS = ("ATELIER_VERSIONS_DIR", "OBSIDIAN_VAULT", "ATELIER_SETTINGS_PATH",
-                  "ATELIER_SESSIONS_PATH")
+                  "ATELIER_SESSIONS_PATH", "ATELIER_SPEND_PATH")
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +33,9 @@ def _isolate_versions_env(tmp_path):
     # Session persistence (_persist_sessions) fires on every create/turn/delete;
     # point it at a tmp file so no test writes the user's real ~/.atelier/sessions.json.
     os.environ["ATELIER_SESSIONS_PATH"] = str(tmp_path / "atelier-sessions.json")
+    # The spend ledger (#20/#25) records real dollars; no test may read or
+    # write the user's actual ~/.atelier/spend.json.
+    os.environ["ATELIER_SPEND_PATH"] = str(tmp_path / "atelier-spend.json")
     try:
         yield
     finally:

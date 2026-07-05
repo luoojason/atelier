@@ -420,6 +420,7 @@ def test_config_shape_defaults(monkeypatch, tmp_path, client):
         "notion_token_hint": "",
         "obsidian_vault": "",
         "spend_cap_usd": 5.0,  # the mandatory default cap
+        "api_spend_today_usd": 0.0,
     }
 
 

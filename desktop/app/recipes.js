@@ -318,6 +318,9 @@
       .atl-recipes-strip .close:hover { color: var(--ink); }
 
       .atl-recipes-sample { display: flex; justify-content: center; margin: 2px 0 6px; }
+      .atl-recipes-cost { display: flex; flex-direction: column; gap: 10px; width: 380px; }
+      .atl-recipes-cost p { margin: 0; font-size: 13px; color: var(--ink-mid); line-height: 1.55; }
+      .atl-recipes-cost-row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 
       @media (prefers-reduced-motion: reduce) {
         .atl-recipes-overlay, .atl-recipes-strip { animation: none; }
@@ -569,7 +572,45 @@
     return set;
   }
 
+  // ── pre-run cost sheet (Round-2 P2): metered runs ask before spending ──────
+  // Subscription runs are plan-included and launch immediately; the api-key
+  // path is real dollars, so the first thing a run does is say so. Fail-open:
+  // an unreachable /config must never block making.
+  let costSheetPanel = null;
+  async function confirmMeteredRun() {
+    const cfg = await apiGet('/config');
+    if (!cfg || cfg.provider !== 'api') return true;
+    return new Promise((resolve) => {
+      if (costSheetPanel) { try { costSheetPanel.close(); } catch { /* gone */ } }
+      const wrap = el('div', 'atl-recipes-cost');
+      const cap = typeof cfg.spend_cap_usd === 'number' ? cfg.spend_cap_usd : 0;
+      const spent = typeof cfg.api_spend_today_usd === 'number' ? cfg.api_spend_today_usd : 0;
+      wrap.appendChild(el('p', null,
+        'This run is metered on your Anthropic API key. Simple asks usually cost cents; research or video runs cost more.'));
+      wrap.appendChild(el('p', null, cap > 0
+        ? 'Today so far: $' + spent.toFixed(2) + ' of your $' + cap.toFixed(2) + ' daily cap. Atelier pauses at the cap.'
+        : 'Your daily spend cap is turned off, so nothing will stop a long run — you can set a cap in Settings.'));
+      const row = el('div', 'atl-recipes-cost-row');
+      const cancel = el('button', 'atl-recipes-btn ghost', 'Not now');
+      const go = el('button', 'atl-recipes-btn', 'Start the run');
+      cancel.type = 'button'; go.type = 'button';
+      row.append(cancel, go);
+      wrap.appendChild(row);
+      const done = (val) => {
+        if (costSheetPanel) { try { costSheetPanel.close(); } catch { /* gone */ } }
+        costSheetPanel = null;
+        resolve(val);
+      };
+      cancel.addEventListener('click', () => done(false));
+      go.addEventListener('click', () => done(true));
+      costSheetPanel = A.ui.openPanel('Before this run spends', wrap, { backdrop: true });
+    });
+  }
+
   async function launch(job) {
+    // 0) metered runs say what they cost before anything spawns
+    if (!(await confirmMeteredRun())) return;
+
     // 1) make sure there is a board to spawn onto (there always is one, but be safe)
     if (A.boards && typeof A.boards.active === 'function' && typeof A.boards.create === 'function') {
       if (!A.boards.active()) {
