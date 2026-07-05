@@ -14,7 +14,9 @@ or spending until you approve.
 
 ## What it is
 
-Atelier is a Mac desktop app (Electron + a local FastAPI backend). You work on an
+Atelier is a **macOS-only** desktop app for now (Apple Silicon; Electron + a local
+FastAPI backend). Windows and Linux are on the roadmap once the headless core is
+split out — watch the repo to hear when that lands. You work on an
 infinite canvas of boards. Start from a plain-named **recipe** ("Make a Top-5
 video", "Turn my notes into a newsletter") or just type *"make me a ___"*, and an
 orchestrator spawns a small team of specialist agents you can watch work live.

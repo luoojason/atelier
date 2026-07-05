@@ -62,29 +62,29 @@
   // so any string is still allowed; the list is guidance, not a lock.
   const PRESETS = {
     // ── cloud providers (bring your own developer API key, billed per token) ──
-    openai: { label: 'OpenAI', base: 'https://api.openai.com/v1', model: 'gpt-4o',
+    openai: { label: 'OpenAI · metered (your key)', base: 'https://api.openai.com/v1', model: 'gpt-4o',
       models: ['gpt-4o', 'gpt-4o-mini', 'gpt-4.1', 'gpt-4.1-mini', 'o4-mini', 'o3'] },
-    gemini: { label: 'Google Gemini', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash',
+    gemini: { label: 'Google Gemini · metered (your key)', base: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.0-flash',
       models: ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-pro', 'gemini-1.5-flash'] },
-    xai: { label: 'xAI (Grok)', base: 'https://api.x.ai/v1', model: 'grok-2-latest',
+    xai: { label: 'xAI (Grok) · metered (your key)', base: 'https://api.x.ai/v1', model: 'grok-2-latest',
       models: ['grok-2-latest', 'grok-2-vision-latest', 'grok-beta'] },
-    deepseek: { label: 'DeepSeek', base: 'https://api.deepseek.com', model: 'deepseek-chat',
+    deepseek: { label: 'DeepSeek · metered (your key)', base: 'https://api.deepseek.com', model: 'deepseek-chat',
       models: ['deepseek-chat', 'deepseek-reasoner'] },
-    mistral: { label: 'Mistral', base: 'https://api.mistral.ai/v1', model: 'mistral-large-latest',
+    mistral: { label: 'Mistral · metered (your key)', base: 'https://api.mistral.ai/v1', model: 'mistral-large-latest',
       models: ['mistral-large-latest', 'mistral-small-latest', 'open-mistral-nemo'] },
-    groq: { label: 'Groq', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile',
+    groq: { label: 'Groq · metered (your key)', base: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile',
       models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'gemma2-9b-it'] },
-    together: { label: 'Together AI', base: 'https://api.together.xyz/v1', model: '',
+    together: { label: 'Together AI · metered (your key)', base: 'https://api.together.xyz/v1', model: '',
       models: ['meta-llama/Llama-3.3-70B-Instruct-Turbo', 'Qwen/Qwen2.5-72B-Instruct-Turbo', 'mistralai/Mistral-Nemo-Instruct-2407'] },
-    openrouter: { label: 'OpenRouter (any model)', base: 'https://openrouter.ai/api/v1', model: '',
+    openrouter: { label: 'OpenRouter (any model) · metered (your key)', base: 'https://openrouter.ai/api/v1', model: '',
       models: ['openai/gpt-4o', 'google/gemini-2.0-flash-001', 'meta-llama/llama-3.3-70b-instruct', 'deepseek/deepseek-chat'] },
-    perplexity: { label: 'Perplexity', base: 'https://api.perplexity.ai', model: 'sonar',
+    perplexity: { label: 'Perplexity · metered (your key)', base: 'https://api.perplexity.ai', model: 'sonar',
       models: ['sonar', 'sonar-pro', 'sonar-reasoning'] },
     // ── local / self-hosted ── (a tool-capable model so the Tools toggle works;
     // the base 'llama3' template can't do tool calls)
-    ollama: { label: 'Ollama (local)', base: 'http://127.0.0.1:11434/v1', model: 'llama3.1',
+    ollama: { label: 'Ollama (local) · free', base: 'http://127.0.0.1:11434/v1', model: 'llama3.1',
       models: ['llama3.1', 'llama3.2', 'qwen2.5', 'mistral-nemo'] },
-    lmstudio: { label: 'LM Studio (local)', base: 'http://127.0.0.1:1234/v1', model: '',
+    lmstudio: { label: 'LM Studio (local) · free', base: 'http://127.0.0.1:1234/v1', model: '',
       models: ['qwen2.5-7b-instruct', 'llama-3.1-8b-instruct'] },
     // ── your own agents ── (model is whatever your endpoint serves)
     iris: { label: 'Iris', base: 'http://HOST:PORT/v1', model: '', models: [] },
@@ -178,6 +178,10 @@
       .atl-xm-note.err { color: var(--accent); }
       .atl-xm-note:empty { display: none; }
       .atl-xm-hint { font-size: 11px; color: var(--ink-dim); line-height: 1.4; }
+      .atl-xm-chip { font-size: 10px; text-transform: uppercase; letter-spacing: .04em;
+        color: var(--accent-2); border: 1px solid var(--accent-soft); background: var(--accent-soft);
+        border-radius: 6px; padding: 1px 6px; white-space: nowrap; font-weight: 700; }
+      .atl-xm-chip.free { color: var(--ok); border-color: rgba(63, 166, 106, .25); background: rgba(63, 166, 106, .12); }
 
       .atl-ext-consent { display: flex; flex-direction: column; gap: 10px; width: 380px; }
       .atl-ext-consent p { margin: 0; font-size: 13px; color: var(--ink-mid); line-height: 1.5; }
@@ -336,6 +340,13 @@
     agents.forEach((a) => {
       const row = el('div', 'atl-xm-row');
       row.appendChild(el('span', 'nm', a.name));
+      // cost-class chip (review quick win): who pays when this card runs.
+      // Same loopback rule as the backend's spend meter (spend.is_metered).
+      let chipHost = '';
+      try { chipHost = new URL(a.base_url).hostname.toLowerCase(); } catch { /* odd URL -> metered */ }
+      const isLocal = chipHost === 'localhost' || chipHost === '::1' || /^127\./.test(chipHost);
+      const chip = el('span', 'atl-xm-chip' + (isLocal ? ' free' : ''), isLocal ? 'Free · local' : 'Metered · your key');
+      row.appendChild(chip);
       const meta = a.base_url + (a.model ? ' · ' + a.model : '') + (a.key_present ? ' · key ' + a.key_hint : '');
       row.appendChild(el('span', 'meta', meta));
       const edit = el('button', 'atl-xm-btn', 'Edit');
