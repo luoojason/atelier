@@ -326,7 +326,15 @@
     if (armed) return;
     armed = true;
     if (isDone()) return;
-    setTimeout(() => { if (!isDone() && !active()) start(); }, 1500);
+    setTimeout(() => {
+      // The first-run egress notice (egress.js) owns the very first slot: it
+      // states what leaves the Mac, then hands off to the tour on ack. Stand
+      // down while it is pending; if egress.js is absent the check is false
+      // and the tour autostarts exactly as before.
+      const eg = window.AtelierEgress;
+      if (eg && typeof eg.pending === 'function' && eg.pending()) return;
+      if (!isDone() && !active()) start();
+    }, 1500);
   }
   // core.js emits 'core:ready' synchronously at the end of its IIFE — before
   // this deferred module even loads — so the bus event alone would never fire
