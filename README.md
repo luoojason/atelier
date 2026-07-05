@@ -30,6 +30,12 @@ The recipe a beginner runs *is* the graph a pro reveals — accessibility is the
 front door to the same machine, not a dumbed-down mode. It runs entirely on your
 **Claude subscription**: zero API keys, zero per-token billing.
 
+**Local UI, cloud model.** The canvas, boards, and files live on your Mac, and the
+backend answers only this Mac (loopback, token-gated). The intelligence is a cloud
+model: prompts and anything a tool reads for a run (vault notes, workspace files,
+web pages) are sent to the model provider you choose — Anthropic on your
+subscription, or a provider you connect. The app states this on first launch.
+
 ## Highlights
 
 - **Recipe front door** — a gallery of ready-to-run starting points; pick one,
