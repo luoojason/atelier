@@ -292,3 +292,42 @@ def test_routes_token_gated(tmp_path, monkeypatch):
         headers={"X-Atelier-Token": "tok"},
     )
     assert ok.status_code == 200
+
+
+# ── granular tool grants (Round-2 P2) ─────────────────────────────────────────
+
+
+def test_grants_default_all_true(monkeypatch, tmp_path):
+    monkeypatch.setenv("ATELIER_EXTERNAL_AGENTS_PATH", str(tmp_path / "a.json"))
+    ok, agent = ea.upsert({"name": "G", "base_url": "https://api.openai.com/v1"})
+    assert ok
+    assert agent["tool_grants"] == {"files": True, "vault": True, "web": True, "memory": True}
+
+
+def test_grants_persist_and_survive_unrelated_updates(monkeypatch, tmp_path):
+    monkeypatch.setenv("ATELIER_EXTERNAL_AGENTS_PATH", str(tmp_path / "a.json"))
+    ok, agent = ea.upsert({"name": "G", "base_url": "https://api.openai.com/v1",
+                           "tool_grants": {"files": False, "web": True}})
+    assert ok
+    aid = agent["id"]
+    stored = next(a for a in ea.load_agents() if a["id"] == aid)
+    assert stored["tool_grants"] == {"files": False, "vault": True, "web": True, "memory": True}
+    # an update that omits tool_grants keeps the stored values
+    ok, _ = ea.upsert({"id": aid, "name": "G2", "base_url": "https://api.openai.com/v1"})
+    assert ok
+    stored = next(a for a in ea.load_agents() if a["id"] == aid)
+    assert stored["tool_grants"]["files"] is False
+    assert stored["name"] == "G2"
+
+
+def test_grants_in_public_view(monkeypatch, tmp_path):
+    monkeypatch.setenv("ATELIER_EXTERNAL_AGENTS_PATH", str(tmp_path / "a.json"))
+    ea.upsert({"name": "G", "base_url": "https://api.openai.com/v1",
+               "tool_grants": {"vault": False}})
+    pub = ea.list_public()[0]
+    assert pub["tool_grants"]["vault"] is False and pub["tool_grants"]["files"] is True
+
+
+def test_normalize_grants_drops_unknown_keys():
+    out = ea.normalize_grants({"files": 0, "bogus": True})
+    assert out == {"files": False, "vault": True, "web": True, "memory": True}

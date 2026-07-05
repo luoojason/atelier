@@ -193,6 +193,14 @@
       .atl-ext-consent-cancel { border: 1px solid var(--border); border-radius: 9px; background: #faf7f1;
         color: var(--ink-mid); font: inherit; font-size: 13px; padding: 7px 14px; cursor: pointer; }
       .atl-ext-consent-cancel:hover { border-color: var(--accent); }
+      .atl-ext-grants { display: flex; flex-direction: column; gap: 6px; }
+      .atl-ext-grant { display: flex; align-items: baseline; gap: 8px; cursor: pointer; }
+      .atl-ext-grant input { margin: 0; cursor: inherit; }
+      .atl-ext-grant-txt { display: flex; gap: 6px; align-items: baseline; font-size: 12.5px; }
+      .atl-ext-grant-nm { font-weight: 600; color: var(--ink); }
+      .atl-ext-grant-what { color: var(--ink-mid); font-size: 11.5px; }
+      .atl-xm-grants-title { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+        color: var(--ink-dim); font-weight: 700; margin-top: 2px; }
     `;
     const style = el('style');
     style.id = 'atl-ext-styles';
@@ -222,12 +230,13 @@
   // Persist an agent's tools_enabled flag (a blank api_key keeps the stored key).
   // tools_enabled lives ON the agent, not the card, so every card bound to the
   // same agent shares the setting. Returns true on success.
-  async function setAgentTools(agent, on) {
+  async function setAgentTools(agent, on, grants) {
     const payload = {
       id: agent.id, name: agent.name, base_url: agent.base_url,
       model: agent.model || '', adapter: agent.adapter || 'openai',
       tools_enabled: !!on,
     };
+    if (grants) payload.tool_grants = grants; // omitted -> stored grants kept
     const r = await api('/external/agents', { method: 'POST', body: JSON.stringify(payload) });
     if (r.ok) await fetchAgents(true);
     return r.ok;
@@ -256,6 +265,45 @@
     A.store.set(TOOLS_CONSENT_KEY, next);
   }
 
+  // The grantable tool families (mirrors external_agents.GRANT_KEYS). What a
+  // family can DO is spelled out so the consent is informed, not a label.
+  const GRANT_FAMILIES = [
+    ['files', 'Files', 'write and read files in the workspace'],
+    ['vault', 'Vault & Notion', 'read and write your notes'],
+    ['web', 'Web', 'search and fetch pages'],
+    ['memory', 'Memory', 'remember facts and track campaigns'],
+  ];
+
+  function grantCheckboxes(current) {
+    const wrap = el('div', 'atl-ext-grants');
+    const boxes = {};
+    GRANT_FAMILIES.forEach(([key, label, what]) => {
+      const lab = el('label', 'atl-ext-grant');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = !current || current[key] !== false;
+      cb.setAttribute('aria-label', label + ': ' + what);
+      boxes[key] = cb;
+      const txt = el('span', 'atl-ext-grant-txt');
+      txt.append(el('span', 'atl-ext-grant-nm', label), el('span', 'atl-ext-grant-what', what));
+      lab.append(cb, txt);
+      wrap.appendChild(lab);
+    });
+    return {
+      el: wrap,
+      read: () => {
+        const out = {};
+        GRANT_FAMILIES.forEach(([key]) => { out[key] = !!boxes[key].checked; });
+        return out;
+      },
+      set: (grants) => {
+        GRANT_FAMILIES.forEach(([key]) => {
+          boxes[key].checked = !grants || grants[key] !== false;
+        });
+      },
+    };
+  }
+
   // Consent panel. XSS rule: host + agent name enter the DOM via textContent
   // only (el() sets textContent). Closing any way other than "Allow" leaves
   // tools OFF — the toggle was already reset before the panel opened.
@@ -274,12 +322,13 @@
       el('span', 'host', host),
       document.createTextNode(' as part of the conversation, under that provider\'s terms.')
     );
+    const grants = grantCheckboxes(agent.tool_grants);
     const row = el('div', 'atl-ext-consent-row');
     const cancel = el('button', 'atl-ext-consent-cancel', 'Not now');
     const allow = el('button', 'atl-ext-consent-allow', 'Allow and turn on');
     cancel.type = 'button'; allow.type = 'button';
     row.append(cancel, allow);
-    wrap.append(p1, p2, row);
+    wrap.append(p1, p2, grants.el, row);
     const panel = A.ui.openPanel('Send data to ' + host + '?', wrap, { backdrop: true });
     consentPanel = panel;
     cancel.addEventListener('click', () => { panel.close(); consentPanel = null; });
@@ -287,16 +336,16 @@
       recordToolsConsent(host);
       panel.close();
       consentPanel = null;
-      onAllow();
+      onAllow(grants.read());
     });
   }
 
   // Persist + reflect a tools_enabled change (shared by the direct toggle path
   // and the consent panel's Allow).
-  async function applyToolsSetting(inst, agent, on) {
+  async function applyToolsSetting(inst, agent, on, grants) {
     const cb = inst.toolsCb;
     if (cb) { cb.checked = on; cb.disabled = true; }
-    const ok = await setAgentTools(agent, on);
+    const ok = await setAgentTools(agent, on, grants);
     if (cb) cb.disabled = false;
     if (!ok) {
       if (cb) cb.checked = !on;
@@ -372,6 +421,7 @@
     mgr.name.value = a ? a.name : '';
     mgr.url.value = a ? a.base_url : '';
     mgr.model.value = a && a.model ? a.model : '';
+    mgr.grants.set(a ? a.tool_grants : null);
     setModelSuggestions((presetForBase(a && a.base_url) || {}).models || []);
     mgr.key.value = '';
     mgr.key.placeholder = a && a.key_present ? 'key set (' + a.key_hint + ') — leave blank to keep' : 'API key (optional)';
@@ -420,6 +470,7 @@
     const url = String(mgr.url.value || '').trim();
     if (!/^https?:\/\/.+/i.test(url)) { setMgrNote('Base URL must start with http:// or https://', true); return; }
     const payload = { name, base_url: url, model: String(mgr.model.value || '').trim(), adapter: 'openai' };
+    payload.tool_grants = mgr.grants.read();
     if (mgr.editing) payload.id = mgr.editing;
     const key = String(mgr.key.value || '');
     if (key) {
@@ -484,6 +535,11 @@
     key.className = 'atl-xm-in'; key.type = 'password'; key.placeholder = 'API key (optional)'; key.maxLength = 4000;
     key.autocomplete = 'off';
 
+    // granular tool grants: editable here after the first consent (the consent
+    // sheet sets them on first enable; this is the change-your-mind surface)
+    const grantsTitle = el('div', 'atl-xm-grants-title', 'Tool access (when Tools is on)');
+    const grantsCtl = grantCheckboxes(null);
+
     const hint = el('div', 'atl-xm-hint', 'Connect another provider — OpenAI, Google Gemini, Groq, xAI, DeepSeek, Mistral, OpenRouter, a local model (Ollama or LM Studio), or your own Iris/Hermes. Cloud providers need that provider’s own developer API key (billed per token), NOT your chat subscription like ChatGPT Plus; local models are free. Pick a preset, add the key, Save.');
     const note = el('div', 'atl-xm-note');
     const actions = el('div', 'atl-xm-actions');
@@ -491,10 +547,10 @@
     const saveBtn = el('button', 'atl-xm-save', 'Save connection');
     actions.append(clearBtn, saveBtn);
 
-    form.append(preset, row1, url, key, hint, note, actions);
+    form.append(preset, row1, url, key, grantsTitle, grantsCtl.el, hint, note, actions);
     wrap.append(list, form);
 
-    mgr = { list, note, preset, name, url, model, modelList, key, saveBtn, editing: null, warnedKey: null };
+    mgr = { list, note, preset, name, url, model, modelList, key, saveBtn, editing: null, warnedKey: null, grants: grantsCtl };
     preset.addEventListener('change', syncPreset);
     key.addEventListener('input', () => { mgr.warnedKey = null; });
     clearBtn.addEventListener('click', () => loadIntoForm(null));
@@ -738,7 +794,7 @@
         // First enable for this host: keep the toggle OFF until the user
         // explicitly allows sending tool output to the named provider.
         toolsCb.checked = false;
-        openToolsConsent(a, () => applyToolsSetting(inst, a, true));
+        openToolsConsent(a, (grants) => applyToolsSetting(inst, a, true, grants));
         return;
       }
       await applyToolsSetting(inst, a, on);
