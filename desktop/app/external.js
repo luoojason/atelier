@@ -368,6 +368,40 @@
     mgr.name.focus();
   }
 
+  // Wrong-paste detection: the review's day-one failure mode is pasting a
+  // chat login, email, URL, or the WRONG provider's key into the key field
+  // and then hitting a baffling 401 later. Warn at save time on confident
+  // mismatches only; a second Save with the same value keeps it anyway
+  // (proxies exist, so nothing is hard-blocked).
+  function keyPasteWarning(key, baseUrl) {
+    const k = key.trim();
+    if (!k) return null;
+    let host = '';
+    try { host = new URL(baseUrl).hostname.toLowerCase(); } catch { /* checked later */ }
+    if (k.split(/\s+/).length > 1) {
+      return 'That looks like more than one value (it has spaces or line breaks). Paste just the key.';
+    }
+    if (k.includes('@')) return 'That looks like an email address, not an API key.';
+    if (/^https?:\/\//i.test(k)) return 'That looks like a URL, not an API key.';
+    const mismatches = [
+      [/^sk-ant-/, /anthropic\./, 'an Anthropic key (sk-ant-…)'],
+      [/^AIza/, /googleapis\./, 'a Google key (AIza…)'],
+      [/^gsk_/, /groq\./, 'a Groq key (gsk_…)'],
+      [/^xai-/, /(^|\.)x\.ai$/, 'an xAI key (xai-…)'],
+      [/^pplx-/, /perplexity\./, 'a Perplexity key (pplx-…)'],
+      [/^sk-or-/, /openrouter\./, 'an OpenRouter key (sk-or-…)'],
+    ];
+    for (const [keyRe, hostRe, label] of mismatches) {
+      if (keyRe.test(k) && host && !hostRe.test(host)) {
+        return 'That looks like ' + label + ', but this connection points at ' + host + '.';
+      }
+    }
+    if (k.length < 20) {
+      return 'That looks too short to be an API key. Keys come from the provider\'s developer console, not your chat login.';
+    }
+    return null;
+  }
+
   async function saveForm() {
     if (!mgr) return;
     const name = String(mgr.name.value || '').trim();
@@ -377,7 +411,16 @@
     const payload = { name, base_url: url, model: String(mgr.model.value || '').trim(), adapter: 'openai' };
     if (mgr.editing) payload.id = mgr.editing;
     const key = String(mgr.key.value || '');
-    if (key) payload.api_key = key;
+    if (key) {
+      const warning = keyPasteWarning(key, url);
+      if (warning && mgr.warnedKey !== key) {
+        mgr.warnedKey = key; // a second Save with the same value proceeds
+        setMgrNote(warning + ' Click Save again to keep it anyway.', true);
+        return;
+      }
+      payload.api_key = key;
+    }
+    mgr.warnedKey = null;
     mgr.saveBtn.disabled = true;
     const r = await api('/external/agents', { method: 'POST', body: JSON.stringify(payload) });
     mgr.saveBtn.disabled = false;
@@ -440,8 +483,9 @@
     form.append(preset, row1, url, key, hint, note, actions);
     wrap.append(list, form);
 
-    mgr = { list, note, preset, name, url, model, modelList, key, saveBtn, editing: null };
+    mgr = { list, note, preset, name, url, model, modelList, key, saveBtn, editing: null, warnedKey: null };
     preset.addEventListener('change', syncPreset);
+    key.addEventListener('input', () => { mgr.warnedKey = null; });
     clearBtn.addEventListener('click', () => loadIntoForm(null));
     saveBtn.addEventListener('click', saveForm);
 
