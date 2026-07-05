@@ -569,8 +569,11 @@
     const provHelp = document.createElement('div');
     provHelp.className = 'vw-help';
     provHelp.textContent =
-      "Atelier's built-in agent runs on Claude. OpenAI, Gemini, and local models "
-      + 'run as external agent cards (Manage external agents).';
+      "Atelier's built-in agent runs on Claude. Subscription uses your Claude "
+      + 'Max/Pro plan through the Claude CLI — sign it in once with '
+      + '`claude login` in Terminal (⌘K → "Set up your model" for a guided '
+      + 'path). API key bills per token. OpenAI, Gemini, and local models run '
+      + 'as external agent cards (Manage external agents).';
 
     const provRow = document.createElement('div');
     provRow.className = 'vw-kv vw-ctl';

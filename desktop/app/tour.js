@@ -89,7 +89,7 @@
     { sel: '.zoombar', title: 'Zoombar', body: 'Fit ⤢, tidy ✦, minimap ▣' },
     { sel: '[title="Chat"]', title: 'Agents', body: 'Chat: each press opens a new chat, and a chat can create helpers that appear beside it' },
     { sel: '.vw-nav', title: 'Analytics', body: 'Your token usage and cost over time' },
-    { sel: '.sb-foot .sb-row', title: 'Settings', body: 'Choose subscription or API key, pick an AI, and sign in' },
+    { sel: '.sb-foot .sb-row', title: 'Settings', body: 'Choose Subscription (a signed-in Claude CLI) or an API key, and pick an AI' },
     { sel: null, title: 'Ready', body: 'That is the studio — build something.' },
   ];
 
