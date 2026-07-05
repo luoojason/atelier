@@ -420,6 +420,16 @@ _INTERRUPT_MARKERS = (
     "message reader", "clidisconnect", "cliconnectionerror",
 )
 
+# Raw CLI/SDK strings that mean "not signed in", not "the agent failed":
+# an unauthenticated CLI prints /login guidance or an invalid-key complaint,
+# and the API-key path 401s. These get a setup-pointing message instead of
+# the generic "Atelier hit an error" passthrough.
+_AUTH_MARKERS = (
+    "invalid api key", "please run /login", "not logged in",
+    "authentication_error", "authentication failed", "401", "unauthorized",
+    "oauth token has expired", "credential",
+)
+
 
 def _friendly_turn_error(detail: str) -> str:
     """Turn a raw SDK/CLI failure string into a clear, non-alarming card message.
@@ -444,6 +454,14 @@ def _friendly_turn_error(detail: str) -> str:
         return (
             "This run was interrupted — the app or backend restarted while the "
             "agent was still working. Send your last message again to continue."
+        )
+    if any(marker in low for marker in _AUTH_MARKERS):
+        return (
+            "The core agent is not signed in yet, so this turn could not run. "
+            "Open Settings and either use Subscription (sign the Claude CLI "
+            "into your Claude plan first: run `claude login` in Terminal) or "
+            "paste an Anthropic API key. Press ⌘K and pick “Set up your model” "
+            "for a guided path — or watch the free sample run first."
         )
     return f"Atelier hit an error and could not finish that turn: {raw}"
 
@@ -621,6 +639,49 @@ class AgencyResponseRequest(BaseModel):
     # job runs as a tracked, revealable session (see get_response_compat). Absent
     # (a direct/legacy caller) -> the untracked one-shot path, unchanged.
     job_name: str | None = None
+
+
+def _subscription_login_present() -> bool:
+    """Best-effort probe for a prior `claude login`, without spending a token
+    or spawning the CLI. The Claude Code CLI stores its Max/Pro OAuth token in
+    the macOS Keychain (service "Claude Code-credentials"); older/Linux-style
+    installs use ~/.claude/.credentials.json. Either one present -> the
+    subscription path can authenticate. A false positive (expired token) still
+    fails softly at chat time with the friendly auth message; a false negative
+    just shows the wizard, which the user can dismiss."""
+    try:
+        probe = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials"],
+            capture_output=True,
+            timeout=5,
+        )
+        if probe.returncode == 0:
+            return True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        return (Path.home() / ".claude" / ".credentials.json").is_file()
+    except OSError:
+        return False
+
+
+@app.get("/readiness")
+async def readiness():
+    """Can the CORE agent actually run a turn? (Round-2 P1: the front door must
+    not silently assume a logged-in CLI.) /health reports the CONFIGURED
+    provider; this reports whether that provider can authenticate right now."""
+    settings = load_settings()
+    provider = _effective_provider(settings)
+    if provider == "api":
+        # effective "api" ALREADY implies a stored key (_effective_provider
+        # falls back to subscription otherwise — the no-dead-state rule), so
+        # this path is ready by construction; a bad key still fails softly at
+        # chat time with the friendly auth message.
+        ready, reason = True, "ok"
+    else:
+        ready = await asyncio.to_thread(_subscription_login_present)
+        reason = "ok" if ready else "no-subscription-login"
+    return {"provider": provider, "ready": ready, "reason": reason}
 
 
 @app.get("/health")
