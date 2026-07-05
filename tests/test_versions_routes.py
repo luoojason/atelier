@@ -328,8 +328,9 @@ def test_restore_is_token_gated(vault, store, client, monkeypatch):
     assert store.calls == [("restore", note, VID)]
 
 
-def test_version_reads_stay_open_with_token_set(vault, store, client, monkeypatch):
+def test_version_reads_gated_with_token_set(vault, store, client, monkeypatch):
     monkeypatch.setenv("ATELIER_TOKEN", "sekret")
-    assert client.get("/versions").status_code == 200
-    assert client.get("/versions/list").status_code == 200
-    assert client.get("/versions/content").status_code == 200
+    hdr = {"X-Atelier-Token": "sekret"}
+    for path in ("/versions", "/versions/list", "/versions/content"):
+        assert client.get(path).status_code == 403
+        assert client.get(path, headers=hdr).status_code == 200

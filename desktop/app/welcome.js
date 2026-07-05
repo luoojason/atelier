@@ -367,7 +367,10 @@
 
   // Open a workspace file (video) in a new tab via the raw endpoint.
   function openFile(path) {
-    const url = BASE + '/workspace/raw?path=' + encodeURIComponent(path);
+    // window.open cannot carry headers -> `atk` query-param carrier.
+    const url = BASE + '/workspace/raw?path=' + encodeURIComponent(path)
+      + (window.atelier && window.atelier.token
+        ? '&atk=' + encodeURIComponent(window.atelier.token) : '');
     try { window.open(url, '_blank'); } catch { /* popup blocked — ignore */ }
   }
 

@@ -341,7 +341,10 @@ def test_token_gates_post_and_delete(env, client, monkeypatch):
         == 403
     )
     assert client.delete("/jobs/daily-brief").status_code == 403
-    assert _job_names(client) == ["daily-brief", "often"]  # GETs stay open
+    assert client.get("/jobs").status_code == 403  # GETs are gated too now
+    hdr = {"X-Atelier-Token": "sekret"}
+    names = [j["name"] for j in client.get("/jobs", headers=hdr).json()["jobs"]]
+    assert names == ["daily-brief", "often"]  # nothing mutated by the 403s
 
     ok = client.post("/jobs", json=body, headers={"X-Atelier-Token": "sekret"})
     assert ok.status_code == 200 and ok.json()["ok"] is True

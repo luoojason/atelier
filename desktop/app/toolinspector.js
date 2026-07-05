@@ -307,7 +307,9 @@
       setNote('');
       let tools = null;
       try {
-        const res = await fetch(BASE + '/tools');
+        const headers = {};
+        if (window.atelier && window.atelier.token) headers['X-Atelier-Token'] = window.atelier.token;
+        const res = await fetch(BASE + '/tools', { headers });
         const data = await res.json();
         if (res.ok && data && Array.isArray(data.tools)) tools = data.tools;
       } catch { /* backend unreachable — handled below */ }
