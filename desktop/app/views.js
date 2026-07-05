@@ -611,9 +611,30 @@
     hintRow.append(hintText, removeBtn);
     const keyNote = noteLine();
 
-    provCard.append(provTitle, provHelp, provRow, provNote, keyRow, hintRow, keyNote);
+    // ── Daily spend cap (per metered provider; 0 disables) ────────────────
+    // The mandatory-default guardrail from the launch review: external
+    // bring-your-own-key providers stop at this many dollars per day each.
+    const capRow = document.createElement('div');
+    capRow.className = 'vw-kv vw-ctl';
+    const capLabel = document.createElement('span');
+    capLabel.className = 'k';
+    capLabel.textContent = 'Daily spend cap';
+    const capCtl = document.createElement('span');
+    capCtl.className = 'vw-key-ctl';
+    const capInput = document.createElement('input');
+    capInput.type = 'number';
+    capInput.className = 'vw-key-input';
+    capInput.min = '0'; capInput.max = '10000'; capInput.step = '1';
+    capInput.style.maxWidth = '90px';
+    capInput.setAttribute('aria-label', 'Daily spend cap in dollars per metered provider');
+    const capSaveBtn = btn('Save', 'vw-btn');
+    capCtl.append(capInput, capSaveBtn);
+    capRow.append(capLabel, capCtl);
+    const capNote = noteLine();
 
-    const provControls = [segSub, segApi, keyInput, saveBtn, validateBtn, removeBtn];
+    provCard.append(provTitle, provHelp, provRow, provNote, keyRow, hintRow, keyNote, capRow, capNote);
+
+    const provControls = [segSub, segApi, keyInput, saveBtn, validateBtn, removeBtn, capInput, capSaveBtn];
     function setProvEnabled(on) {
       provControls.forEach((el) => { el.disabled = !on; });
     }
@@ -630,6 +651,10 @@
       const present = !!cfg.api_key_present;
       hintText.textContent = present ? 'Saved key: ' + String(cfg.api_key_hint || '') : '';
       hintRow.style.display = present ? '' : 'none';
+      // reflect the EFFECTIVE cap; don't clobber an edit in progress
+      if (document.activeElement !== capInput && typeof cfg.spend_cap_usd === 'number') {
+        capInput.value = String(cfg.spend_cap_usd);
+      }
       // clear only the degrade text — action errors stay visible until acted on
       if (provNote.textContent === 'unavailable') setNote(provNote, '');
       // the header ↻ can land a /config response while a provider request is
@@ -659,6 +684,25 @@
         if (!disposed) setProvEnabled(provReachable);
       }
     }
+
+    capSaveBtn.addEventListener('click', () => provAction(async () => {
+      setNote(capNote, '');
+      const v = parseFloat(capInput.value);
+      if (!isFinite(v) || v < 0 || v > 10000) {
+        setNote(capNote, 'enter a number between 0 and 10000', 'err');
+        return;
+      }
+      try {
+        const r = await api('/config/spend-cap', {
+          method: 'POST', body: JSON.stringify({ cap: v }),
+        });
+        if (disposed) return;
+        if (r.ok) { setNote(capNote, v === 0 ? 'cap disabled' : 'saved', 'ok'); loadConfig(); }
+        else setNote(capNote, (r.data && r.data.error) || ('save failed (HTTP ' + r.status + ')'), 'err');
+      } catch {
+        if (!disposed) setNote(capNote, 'backend unreachable', 'err');
+      }
+    }));
 
     function pickProvider(p) {
       // skip the no-op click: re-POSTing the active provider would only cost

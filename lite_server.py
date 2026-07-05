@@ -87,6 +87,7 @@ from scheduler import notify as swarm_notify
 # Pure stdlib Claude Code transcript readers backing /config + /cc/*.
 import cc_usage
 import external_agents
+import spend
 import external_tools
 
 from fastapi import FastAPI, Request
@@ -213,6 +214,13 @@ def load_settings() -> dict:
     vault = data.get("obsidian_vault")
     if isinstance(vault, str) and vault:
         settings["obsidian_vault"] = vault
+    # spend_cap_usd must ride along for the same reason as "model" above: every
+    # mutating route merges via load_settings() -> save_settings(), so a cap
+    # filtered out on load would be wiped by the next unrelated settings write.
+    # 0 is meaningful (cap disabled), hence the explicit None/bool checks.
+    cap = data.get("spend_cap_usd")
+    if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap >= 0:
+        settings["spend_cap_usd"] = float(cap)
     return settings
 
 
@@ -1212,6 +1220,9 @@ async def config():
         "notion_token_hint": _notion_token_hint(settings.get("notion_token") or ""),
         "obsidian_vault": settings.get("obsidian_vault") or "",
         "workspace_dir": _workspace_dir_str(),
+        # the EFFECTIVE per-provider daily cap (default applies when unset);
+        # 0.0 = disabled
+        "spend_cap_usd": spend.cap_usd(settings),
     }
 
 
@@ -1619,6 +1630,22 @@ async def validate_notion_token(req: NotionTokenValidateRequest | None = None):
     if resp.status_code in (401, 403):
         return {"valid": False, "detail": "token rejected by Notion"}
     return {"valid": False, "detail": f"unexpected response {resp.status_code}"}
+
+
+class SpendCapRequest(BaseModel):
+    cap: float
+
+
+@app.post("/config/spend-cap")
+async def set_spend_cap(req: SpendCapRequest):
+    """Set the per-provider daily spend cap. 0 disables it (an explicit user
+    choice); the mandatory default ($5) applies while the key is absent."""
+    if not (0 <= req.cap <= 10_000):
+        return JSONResponse({"error": "cap must be between 0 and 10000"}, status_code=400)
+    settings = load_settings()
+    settings["spend_cap_usd"] = float(req.cap)
+    save_settings(settings)
+    return {"ok": True, "spend_cap_usd": float(req.cap)}
 
 
 @app.post("/config/vault")
@@ -3133,6 +3160,12 @@ async def external_agents_agent_message(agent_id: str, req: ExternalMessageReque
     if err == "tools-unsupported":
         # The endpoint rejected the tools field at runtime — fall back to chat.
         return await _external_chat_fallback(agent_id, req)
+    if err == "spend-cap":
+        host = spend.provider_host(agent.get("base_url") or "")
+        _ok, spent_now, cap_now = spend.allowed(host)
+        return JSONResponse(
+            {"error": spend.cap_message(host, spent_now, cap_now)}, status_code=429
+        )
     if result.get("response") is None:
         reason = err if err not in (None, "no-model") else (
             "The external agent could not complete the turn."
