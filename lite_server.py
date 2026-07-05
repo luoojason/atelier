@@ -547,29 +547,25 @@ app = FastAPI(title="Atelier Lite", lifespan=_lifespan)
 # and to both sidecars via spawn env. Token unset (dev uvicorn, plain-browser
 # testing, TestClient) -> the token gate is off and origin gating is the wall.
 #
-# ACCEPTED RISK (security review 2026-07): because "null" is CORS-allowed and
-# read-only GETs are deliberately not token-gated (frozen contract), a hostile
-# page in a browser without strict Private Network Access enforcement
-# (Firefox/Safari today; Chrome blocks via PNA preflight) can READ /config and
-# /cc/* cross-origin via a sandboxed iframe: monthly spend, per-session cost,
-# session ids, and munged project directory names. If that ever becomes
-# unacceptable, token-gate /cc/*+/config when ATELIER_TOKEN is set (the
-# renderer already has the token via preload), or stop returning project
-# directory names from /cc/usage.
+# Launch-readiness review 2026-07: the old "read-only GETs stay ungated"
+# accepted risk is CLOSED. When ATELIER_TOKEN is set (the packaged app),
+# EVERY route now requires the token — a hostile "null"-origin page in a
+# browser without strict Private Network Access enforcement (Firefox/Safari
+# today) could otherwise READ /config, /cc/* spend + session ids, /tools,
+# /logs/backend, and /workspace/raw file contents cross-origin via a
+# sandboxed iframe. Single deliberate exemption: /health, the readiness
+# probe main.js polls before the renderer (and packaging smoke checks curl)
+# — it returns only coarse booleans + the model name, never secrets.
+#
+# Carrier: the X-Atelier-Token header, or — for loads that cannot set
+# headers (<video src>, anchor downloads, window.open) — an `atk` query
+# param. The param can land in the local uvicorn access log; that log is
+# only reachable via the (now token-gated) /logs/backend, and the token is
+# minted fresh per launch, so the exposure is bounded to the local machine
+# and the current run.
 _ORIGIN_RE = r"^(null|file://|https?://(localhost|127\.0\.0\.1)(:\d+)?)$"
 _origin_ok = re.compile(_ORIGIN_RE).match
-_MUTATING_METHODS = ("POST", "PUT", "PATCH", "DELETE")
-
-# The vault GETs are the one read surface that's NOT safe to leave open like
-# the rest of the read-only GETs above: /vault/graph + /vault/note expose the
-# whole Obsidian vault's link graph and note contents, so a hostile "null"
-# origin page (CORS-allowed for the Electron renderer) could exfiltrate it
-# cross-origin. Every other GET stays ungated per the accepted-risk note
-# above; these get the same token gate the mutating methods use.
-# /external/agents joins them: it lists each configured agent's base_url
-# (internal/LAN endpoints = recon) plus the api_key's last-4 hint, which is the
-# same "semi-sensitive, don't hand to a null-origin page" class as the vault.
-_TOKEN_GATED_GET_PATHS = ("/vault/graph", "/vault/note", "/external/agents")
+_TOKEN_EXEMPT_PATHS = ("/health",)
 
 app.add_middleware(
     CORSMiddleware,
@@ -586,13 +582,13 @@ async def _reject_foreign_origins(request: Request, call_next):
     if origin is not None and not _origin_ok(origin):
         return JSONResponse({"detail": "origin not allowed"}, status_code=403)
     token = os.getenv("ATELIER_TOKEN", "")  # call-time read so tests can tune it
-    needs_token = (
-        request.method in _MUTATING_METHODS
-        or request.url.path in _TOKEN_GATED_GET_PATHS
-    )
-    if token and needs_token:
-        supplied = request.headers.get("x-atelier-token", "")
-        if not secrets.compare_digest(supplied, token):
+    if token and request.url.path not in _TOKEN_EXEMPT_PATHS:
+        supplied = request.headers.get("x-atelier-token", "") or request.query_params.get(
+            "atk", ""
+        )
+        # bytes compare: compare_digest(str, str) raises on non-ASCII input,
+        # which would turn a hostile ?atk=%C3%A9 probe into a 500.
+        if not secrets.compare_digest(supplied.encode(), token.encode()):
             return JSONResponse({"detail": "missing or bad token"}, status_code=403)
     return await call_next(request)
 

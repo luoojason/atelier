@@ -159,7 +159,9 @@
   // to the caller through the returned promise's reject path being unhandled —
   // callers await inside try/catch.
   async function fileToBase64(path) {
-    const res = await fetch(BASE + '/workspace/raw?path=' + encodeURIComponent(path));
+    const headers = {};
+    if (window.atelier && window.atelier.token) headers['X-Atelier-Token'] = window.atelier.token;
+    const res = await fetch(BASE + '/workspace/raw?path=' + encodeURIComponent(path), { headers });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const blob = await res.blob();
     return await new Promise((resolve, reject) => {
@@ -429,7 +431,10 @@
     // Plain-browser fallback: let the browser download the streamed bytes.
     try {
       const a = document.createElement('a');
-      a.href = BASE + '/workspace/raw?path=' + encodeURIComponent(path);
+      // Anchor downloads cannot carry headers -> `atk` query-param carrier.
+      a.href = BASE + '/workspace/raw?path=' + encodeURIComponent(path)
+        + (window.atelier && window.atelier.token
+          ? '&atk=' + encodeURIComponent(window.atelier.token) : '');
       a.download = baseName(path);
       document.body.appendChild(a);
       a.click();

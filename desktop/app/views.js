@@ -1197,7 +1197,9 @@
       return (v === null || v === undefined || v === '') ? 'unavailable' : String(v);
     }
     function loadConfig() {
-      fetch(CONFIG_URL)
+      const headers = {};
+      if (window.atelier && window.atelier.token) headers['X-Atelier-Token'] = window.atelier.token;
+      fetch(CONFIG_URL, { headers })
         .then((r) => { if (!r.ok) throw new Error('config HTTP ' + r.status); return r.json(); })
         .then((cfg) => {
           if (disposed || !cfg || typeof cfg !== 'object') return;

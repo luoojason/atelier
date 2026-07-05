@@ -148,15 +148,17 @@ def test_schemas_carry_properties_and_required(client):
 
 # ── no token + never 500 ─────────────────────────────────────────────────────
 
-def test_open_with_token_set_and_never_500(client, monkeypatch):
-    # read-only GET: stays open even when the token gate is armed
+def test_gated_with_token_set_and_never_500(client, monkeypatch):
+    # gated like every route when the token is armed; carries the header
     monkeypatch.setenv("ATELIER_TOKEN", "sekret")
-    assert client.get("/tools").status_code == 200
+    hdr = {"X-Atelier-Token": "sekret"}
+    assert client.get("/tools").status_code == 403
+    assert client.get("/tools", headers=hdr).status_code == 200
 
     def _boom(parent_id):
         raise RuntimeError("introspection broke")
 
     monkeypatch.setattr(lite_server, "_orchestra_tools", _boom)
-    resp = client.get("/tools")
+    resp = client.get("/tools", headers=hdr)
     assert resp.status_code == 200
     assert resp.json() == {"tools": []}

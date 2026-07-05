@@ -243,7 +243,9 @@
         : Object.prototype.hasOwnProperty.call(fx, key) ? fx[key] : undefined;
       if (hit !== undefined) return Promise.resolve(hit);
     }
-    return fetch(BASE + path, { signal }).then((r) => {
+    const headers = {};
+    if (window.atelier && window.atelier.token) headers['X-Atelier-Token'] = window.atelier.token;
+    return fetch(BASE + path, { signal, headers }).then((r) => {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.json();
     });

@@ -27,7 +27,8 @@
            validation/start failure (so check data.error before res.ok).
         Mutating -> carries X-Atelier-Token when the server sets ATELIER_TOKEN.
      GET  /render/{id} -> {id, status:"running"|"done"|"error", rel, tail}
-     GET  /workspace/raw?path=<rel> -> streams video/mp4 (bare <video src>, ok)
+     GET  /workspace/raw?path=<rel> -> streams video/mp4 (<video src> with the
+          `atk` query-param token, since media loads cannot carry headers)
 
    Contract: builds only against window.Atelier (+ fetch and the optional
    window.atelier token bridge). Injects its own CSS. XSS rule: every dynamic
@@ -336,7 +337,11 @@
     const wrap = el('div', 'atl-render');
     wrap.appendChild(el('div', 'atl-render-done-h', 'Your video is ready.'));
 
-    const src = BASE + '/workspace/raw?path=' + encodeURIComponent(rel);
+    // <video src> cannot carry headers, so the token rides the `atk` query
+    // param the backend accepts as an alternate carrier.
+    const src = BASE + '/workspace/raw?path=' + encodeURIComponent(rel)
+      + (window.atelier && window.atelier.token
+        ? '&atk=' + encodeURIComponent(window.atelier.token) : '');
     const video = document.createElement('video');
     video.className = 'atl-render-video';
     video.src = src;

@@ -175,7 +175,9 @@
     async function poll() {
       if (closed || paused) return;
       try {
-        const res = await fetch(BASE + '/logs/backend?tail=' + TAIL);
+        const headers = {};
+        if (window.atelier && window.atelier.token) headers['X-Atelier-Token'] = window.atelier.token;
+        const res = await fetch(BASE + '/logs/backend?tail=' + TAIL, { headers });
         const data = await res.json();
         if (res.ok && data) {
           setNote('');

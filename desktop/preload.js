@@ -30,11 +30,14 @@ contextBridge.exposeInMainWorld('atelier', {
   token: TOKEN,
   health: () => fetch(`${BASE}/health`).then((r) => r.json()),
   // GET http://127.0.0.1:8765<path> parsed as JSON. path must start with '/'.
+  // Carries the shared-secret header: the backend token-gates every route
+  // (except /health) when it was launched with ATELIER_TOKEN.
   get: (path) => {
     if (typeof path !== 'string' || path[0] !== '/') {
       return Promise.reject(new Error('atelier.get: path must be a string starting with "/"'));
     }
-    return fetch(BASE + path).then((r) => r.json());
+    return fetch(BASE + path, TOKEN ? { headers: { 'X-Atelier-Token': TOKEN } } : {})
+      .then((r) => r.json());
   },
   // Capture a window region (rect in PHYSICAL pixels, caller pre-multiplies by
   // devicePixelRatio) -> 480px-wide JPEG(70) data URL, or null on ANY failure.

@@ -434,8 +434,9 @@ def test_config_and_cc_never_leak_token(seeded, monkeypatch, client):
     monkeypatch.setenv("ATELIER_TOKEN", token)
     monkeypatch.setenv("SWARM_JOBS_FILE", "/tmp/jobs.yaml")
 
-    resp = client.get("/config")
-    assert resp.status_code == 200  # GETs are not token-gated
+    hdr = {"X-Atelier-Token": token}
+    resp = client.get("/config", headers=hdr)  # every GET is token-gated now
+    assert resp.status_code == 200
     body = resp.json()
     assert body["auth_mode"] == "token"
     assert body["token_present"] is True
@@ -444,6 +445,6 @@ def test_config_and_cc_never_leak_token(seeded, monkeypatch, client):
 
     for url in ("/cc/status", "/cc/usage", f"/cc/usage/{SESSION_A}",
                 "/cc/aggregate", "/cc/heatmap"):
-        r = client.get(url)
+        r = client.get(url, headers=hdr)
         assert r.status_code == 200
         assert token not in r.text

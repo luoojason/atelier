@@ -151,10 +151,11 @@ def test_vault_gets_token_gated_when_token_set(tmp_path, monkeypatch):
     assert "Hello" in ok_note.json()["markdown"]
 
 
-def test_other_gets_not_token_gated(tmp_path, monkeypatch):
-    """Sanity: the token gate is scoped to /vault/* only, not every GET."""
+def test_every_get_token_gated_except_health(tmp_path, monkeypatch):
+    """The 2026-07 gate covers every GET; /health is the one exemption."""
     monkeypatch.setenv("ATELIER_SETTINGS_PATH", str(tmp_path / "s.json"))
     monkeypatch.setenv("ATELIER_TOKEN", "tok")
     c = TestClient(lite_server.app)
-    assert c.get("/config").status_code == 200
+    assert c.get("/config").status_code == 403
+    assert c.get("/config", headers={"X-Atelier-Token": "tok"}).status_code == 200
     assert c.get("/health").status_code == 200
