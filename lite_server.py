@@ -582,7 +582,14 @@ async def _reject_foreign_origins(request: Request, call_next):
     if origin is not None and not _origin_ok(origin):
         return JSONResponse({"detail": "origin not allowed"}, status_code=403)
     token = os.getenv("ATELIER_TOKEN", "")  # call-time read so tests can tune it
-    if token and request.url.path not in _TOKEN_EXEMPT_PATHS:
+    # OPTIONS is exempt: CORS preflights are anonymous BY SPEC (the browser
+    # never attaches custom headers like X-Atelier-Token to them), and the
+    # renderer is file:// -> every authenticated fetch is cross-origin and
+    # preflighted. Gating OPTIONS 403'd the preflight before CORSMiddleware
+    # could answer it, which broke EVERY renderer call in the packaged app
+    # (caught by the dev-Electron live verify). The real request that follows
+    # a preflight is still token-gated; OPTIONS itself discloses nothing.
+    if token and request.method != "OPTIONS" and request.url.path not in _TOKEN_EXEMPT_PATHS:
         supplied = request.headers.get("x-atelier-token", "") or request.query_params.get(
             "atk", ""
         )
