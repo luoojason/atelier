@@ -79,6 +79,26 @@ def test_mutating_routes_still_gated(gated, client):
     assert client.post("/notify/read", json={}).status_code == 403
 
 
+def test_cors_preflight_is_exempt(gated, client):
+    """Preflights are anonymous by spec — the browser never attaches
+    X-Atelier-Token to an OPTIONS. Gating them 403'd the preflight before
+    CORSMiddleware could answer, breaking EVERY renderer fetch in the
+    packaged app (the renderer is file://, so authenticated requests are
+    always cross-origin + preflighted). Regression test for the hotfix."""
+    resp = client.options(
+        "/external/agents",
+        headers={
+            "Origin": "file://",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type,x-atelier-token",
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.headers.get("access-control-allow-origin") == "file://"
+    # the real request that follows the preflight is still gated
+    assert client.post("/external/agents", json={}).status_code == 403
+
+
 def test_vault_gets_still_gated(gated, client):
     # the pre-2026-07 gate covered these three; regression-pin them
     for path in ("/vault/graph", "/vault/note?path=x", "/external/agents"):
