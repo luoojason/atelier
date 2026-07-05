@@ -1315,6 +1315,9 @@ async def config():
         # the EFFECTIVE per-provider daily cap (default applies when unset);
         # 0.0 = disabled
         "spend_cap_usd": spend.cap_usd(settings),
+        # today's metered spend on the core agent's api path (0.0 on
+        # subscription, where nothing records) — the pre-run cost sheet's data
+        "api_spend_today_usd": spend.spent_today(_API_PROVIDER_HOST),
     }
 
 
