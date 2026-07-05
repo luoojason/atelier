@@ -271,6 +271,17 @@ async def forward(agent_id: str, message: str, history=None) -> tuple[bool, str]
     if not isinstance(message, str) or not message.strip():
         return False, "empty message"
 
+    # Daily spend cap (spend.py): plain chat on a metered provider is a paid
+    # call too, so it gets the same gate as the tools lane.
+    import spend
+
+    metered = spend.is_metered(agent.get("base_url") or "")
+    host = spend.provider_host(agent.get("base_url") or "")
+    if metered:
+        ok, spent, cap = spend.allowed(host)
+        if not ok:
+            return False, spend.cap_message(host, spent, cap)
+
     messages = _build_messages(history, message)
     headers = {"Content-Type": "application/json"}
     if agent.get("api_key"):
@@ -297,7 +308,30 @@ async def forward(agent_id: str, message: str, history=None) -> tuple[bool, str]
     text = _extract_openai_text(data)
     if text is None:
         return False, "The external agent's response had no message content."
+    if metered:
+        _record_usage_cost(host, agent.get("model"), data.get("usage"))
     return True, text
+
+
+def _record_usage_cost(host: str, model, usage) -> None:
+    """Price a plain-chat response from its OpenAI usage block and record it.
+    Unpriceable models record nothing (see spend.py). Never raises."""
+    if not isinstance(usage, dict) or not model:
+        return
+    try:
+        prompt = int(usage.get("prompt_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        if prompt <= 0 and completion <= 0:
+            return
+        import litellm  # lazy: only the priced path needs it
+        import spend
+
+        inp, out = litellm.cost_per_token(
+            model=str(model), prompt_tokens=prompt, completion_tokens=completion
+        )
+        spend.record(host, (inp or 0.0) + (out or 0.0))
+    except Exception:  # noqa: BLE001 - pricing failure must not affect the turn
+        pass
 
 
 def _extract_openai_text(data) -> str | None:

@@ -13,6 +13,8 @@ api_key. ``run_external_turn`` returns ``{"response", "error", "steps"}``:
     (the caller degrades to plain chat via external_agents.forward)
   * any other transport/provider failure -> {"response": None, "error": <reason>}
   * step cap hit -> {"response": <friendly stop text>, "error": "max-steps"}
+  * daily spend cap reached -> {"response": None, "error": "spend-cap"} (the
+    route surfaces the cap message; completed steps ride along)
 
 v1 collapses each completed turn to its final assistant TEXT (what the fire-once
 card stores as history), so a follow-up turn never resends a dangling
@@ -31,6 +33,8 @@ from litellm import (
     ContextWindowExceededError,
     UnsupportedParamsError,
 )
+
+import spend
 
 _MAX_STEPS = 8
 _TIMEOUT = 90.0
@@ -132,6 +136,7 @@ async def run_external_turn(
     oai_tools: list[dict],
     by_name: dict,
     *,
+    settings: dict | None = None,
     max_steps: int = _MAX_STEPS,
     timeout: float = _TIMEOUT,
 ) -> dict:
@@ -151,7 +156,18 @@ async def run_external_turn(
     msgs = _seed_messages(history, message)
     steps: list[dict] = []
 
+    # The daily spend cap (spend.py): metered = non-loopback host. Checked
+    # before EVERY provider call — each loop step is its own metered call, so
+    # a turn stops mid-loop the moment the provider's daily total crosses the
+    # cap, instead of finishing an arbitrarily expensive tail.
+    metered = spend.is_metered(agent.get("base_url") or "")
+    host = spend.provider_host(agent.get("base_url") or "")
+
     for _ in range(max_steps):
+        if metered:
+            ok, _spent, _cap = spend.allowed(host, settings)  # settings=None -> file
+            if not ok:
+                return {"response": None, "error": "spend-cap", "steps": steps}
         try:
             resp = await litellm.acompletion(
                 model=model_ref,
@@ -179,6 +195,15 @@ async def run_external_turn(
             return {"response": None, "error": "tools-unsupported", "steps": steps}
         except Exception as exc:  # noqa: BLE001 - never raise out of the lane
             return {"response": None, "error": _friendly(exc), "steps": steps}
+
+        if metered:
+            # Record what THIS call cost. Models LiteLLM cannot price (personal
+            # or exotic endpoints) raise here and record nothing — see spend.py
+            # for why that under-count is the accepted trade-off.
+            try:
+                spend.record(host, litellm.completion_cost(completion_response=resp))
+            except Exception:  # noqa: BLE001 - pricing failure must not kill the turn
+                pass
 
         try:
             msg = resp.choices[0].message
