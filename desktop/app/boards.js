@@ -102,6 +102,10 @@
     // premium.js -> Atelier.store 'atelier.premium.license' (Workflow AI unlock
     // token). GLOBAL so an unlock is not tied to the board it was entered on.
     'atelier:atelier.premium.license',
+    // external.js -> Atelier.store 'atelier.ext.tools.consent' (per-host
+    // tools-egress consent). GLOBAL so consenting to a provider once covers
+    // every card and board — the consent is about the host, not a board.
+    'atelier:atelier.ext.tools.consent',
   ];
 
   const stateKey = (id) => BOARD_PREFIX + id + '.state';

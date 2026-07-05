@@ -178,6 +178,17 @@
       .atl-xm-note.err { color: var(--accent); }
       .atl-xm-note:empty { display: none; }
       .atl-xm-hint { font-size: 11px; color: var(--ink-dim); line-height: 1.4; }
+
+      .atl-ext-consent { display: flex; flex-direction: column; gap: 10px; width: 380px; }
+      .atl-ext-consent p { margin: 0; font-size: 13px; color: var(--ink-mid); line-height: 1.5; }
+      .atl-ext-consent .host { font-weight: 700; color: var(--ink); }
+      .atl-ext-consent-row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+      .atl-ext-consent-allow { border: none; border-radius: 9px; background: var(--accent); color: #fff;
+        padding: 7px 16px; font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; }
+      .atl-ext-consent-allow:hover { background: var(--accent-2); }
+      .atl-ext-consent-cancel { border: 1px solid var(--border); border-radius: 9px; background: #faf7f1;
+        color: var(--ink-mid); font: inherit; font-size: 13px; padding: 7px 14px; cursor: pointer; }
+      .atl-ext-consent-cancel:hover { border-color: var(--accent); }
     `;
     const style = el('style');
     style.id = 'atl-ext-styles';
@@ -190,8 +201,12 @@
   async function fetchAgents(force) {
     if (agentCache && !force) return agentCache;
     const r = await api('/external/agents', { method: 'GET' });
-    agentCache = (r.ok && r.data && Array.isArray(r.data.agents)) ? r.data.agents : [];
-    return agentCache;
+    // Cache only SUCCESS. Caching a failure as [] poisons every picker for the
+    // rest of the session — restored cards fetch at module boot, which can race
+    // the backend still binding :8765, and the stuck empty cache then hides all
+    // agents until a manager action happens to force a refetch.
+    if (r.ok && r.data && Array.isArray(r.data.agents)) agentCache = r.data.agents;
+    return agentCache || [];
   }
   function agentsChanged() {
     fetchAgents(true).then(() => {
@@ -212,6 +227,82 @@
     const r = await api('/external/agents', { method: 'POST', body: JSON.stringify(payload) });
     if (r.ok) await fetchAgents(true);
     return r.ok;
+  }
+
+  // ── one-time tools consent (per provider HOST, stored globally) ─────────────
+  // Turning tools ON means every tool result — vault notes, workspace file
+  // contents, web pages — is sent to the agent's provider as conversation
+  // context. That egress must be consented to once per host, by name, before
+  // the first enable; the choice is remembered globally (boards.js GLOBAL_KEYS)
+  // so the user is not re-asked per card or per board.
+  const TOOLS_CONSENT_KEY = 'atelier.ext.tools.consent';
+
+  function agentHost(agent) {
+    const raw = String((agent && agent.base_url) || '');
+    try { return new URL(raw).host || raw; } catch { return raw; }
+  }
+  function toolsConsented(host) {
+    const m = A.store.get(TOOLS_CONSENT_KEY, {});
+    return !!(m && typeof m === 'object' && m[host]);
+  }
+  function recordToolsConsent(host) {
+    const m = A.store.get(TOOLS_CONSENT_KEY, {});
+    const next = (m && typeof m === 'object' && !Array.isArray(m)) ? m : {};
+    next[host] = true;
+    A.store.set(TOOLS_CONSENT_KEY, next);
+  }
+
+  // Consent panel. XSS rule: host + agent name enter the DOM via textContent
+  // only (el() sets textContent). Closing any way other than "Allow" leaves
+  // tools OFF — the toggle was already reset before the panel opened.
+  let consentPanel = null;
+  function openToolsConsent(agent, onAllow) {
+    if (consentPanel) { try { consentPanel.close(); } catch { /* already gone */ } }
+    const host = agentHost(agent) || 'this provider';
+    const wrap = el('div', 'atl-ext-consent');
+    const p1 = el('p', '');
+    p1.append(
+      document.createTextNode('Tools let "' + String(agent.name || 'this agent') + '" write files in the workspace, read and write your vault and memory, and search the web.')
+    );
+    const p2 = el('p', '');
+    p2.append(
+      document.createTextNode('Everything a tool returns, including vault notes and file contents, is sent to '),
+      el('span', 'host', host),
+      document.createTextNode(' as part of the conversation, under that provider\'s terms.')
+    );
+    const row = el('div', 'atl-ext-consent-row');
+    const cancel = el('button', 'atl-ext-consent-cancel', 'Not now');
+    const allow = el('button', 'atl-ext-consent-allow', 'Allow and turn on');
+    cancel.type = 'button'; allow.type = 'button';
+    row.append(cancel, allow);
+    wrap.append(p1, p2, row);
+    const panel = A.ui.openPanel('Send data to ' + host + '?', wrap, { backdrop: true });
+    consentPanel = panel;
+    cancel.addEventListener('click', () => { panel.close(); consentPanel = null; });
+    allow.addEventListener('click', () => {
+      recordToolsConsent(host);
+      panel.close();
+      consentPanel = null;
+      onAllow();
+    });
+  }
+
+  // Persist + reflect a tools_enabled change (shared by the direct toggle path
+  // and the consent panel's Allow).
+  async function applyToolsSetting(inst, agent, on) {
+    const cb = inst.toolsCb;
+    if (cb) { cb.checked = on; cb.disabled = true; }
+    const ok = await setAgentTools(agent, on);
+    if (cb) cb.disabled = false;
+    if (!ok) {
+      if (cb) cb.checked = !on;
+      setNote(inst, 'Could not save the tools setting.', true);
+      updateToolsToggle(inst);
+      return;
+    }
+    // tools_enabled lives on the AGENT, so refresh every card bound to it —
+    // otherwise a sibling card would route its next turn on a stale toggle.
+    instances.forEach((i) => updateToolsToggle(i));
   }
 
   /* =========================================================================
@@ -588,18 +679,14 @@
       const a = currentAgent(inst);
       if (!a) { toolsCb.checked = false; return; }
       const on = toolsCb.checked;
-      toolsCb.disabled = true;
-      const ok = await setAgentTools(a, on);
-      toolsCb.disabled = false;
-      if (!ok) {
-        toolsCb.checked = !on;
-        setNote(inst, 'Could not save the tools setting.', true);
-        updateToolsToggle(inst);
+      if (on && !toolsConsented(agentHost(a))) {
+        // First enable for this host: keep the toggle OFF until the user
+        // explicitly allows sending tool output to the named provider.
+        toolsCb.checked = false;
+        openToolsConsent(a, () => applyToolsSetting(inst, a, true));
         return;
       }
-      // tools_enabled lives on the AGENT, so refresh every card bound to it —
-      // otherwise a sibling card would route its next turn on a stale toggle.
-      instances.forEach((i) => updateToolsToggle(i));
+      await applyToolsSetting(inst, a, on);
     });
 
     picker.addEventListener('change', () => {
