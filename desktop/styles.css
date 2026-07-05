@@ -7,7 +7,7 @@
   --panel: #ffffff;
   --ink: #3c352d;
   --ink-mid: #6f665a;
-  --ink-dim: #a49a8a;
+  --ink-dim: #746a5c;   /* AA: 4.6:1 on the cream canvas, 5.3:1 on white (was #a49a8a at 2.4:1) */
   --accent: #c05c37;          /* terracotta */
   --accent-2: #b8532f;
   --accent-soft: #f0e2d9;

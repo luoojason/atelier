@@ -57,7 +57,7 @@
       vars: {
         '--canvas': '#e7e9ee', '--sidebar': '#eef0f4', '--topbar': '#e9ebf0',
         '--panel': '#ffffff', '--ink': '#2f3440', '--ink-mid': '#5c6472',
-        '--ink-dim': '#9aa2b1', '--active': '#dfe7f2', '--accent-soft': '#e2e9f4',
+        '--ink-dim': '#5f6774', '--active': '#dfe7f2', '--accent-soft': '#e2e9f4',
         '--dot': '#c7ccd6',
       },
     },
@@ -66,7 +66,7 @@
       vars: {
         '--canvas': '#eaeee6', '--sidebar': '#f0f3ea', '--topbar': '#edf0e7',
         '--panel': '#ffffff', '--ink': '#333a30', '--ink-mid': '#5f6a56',
-        '--ink-dim': '#9aa38e', '--active': '#e0ead0', '--accent-soft': '#e6ecdb',
+        '--ink-dim': '#636c59', '--active': '#e0ead0', '--accent-soft': '#e6ecdb',
         '--dot': '#cbd2bf',
       },
     },

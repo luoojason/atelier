@@ -177,7 +177,7 @@
     THEME = {
       ink: v('--ink', '#3c352d'),
       inkMid: v('--ink-mid', '#6f665a'),
-      inkDim: v('--ink-dim', '#a49a8a'),
+      inkDim: v('--ink-dim', '#746a5c'),
       accent: v('--accent', '#c05c37'),
       panel: v('--panel', '#ffffff'),
       border: v('--border', 'rgba(60,48,34,0.11)'),

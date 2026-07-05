@@ -115,7 +115,7 @@
       label: 'Clay',
       vars: {
         '--canvas': '#f1eee6', '--sidebar': '#f7f4ed', '--topbar': '#f4f1ea',
-        '--panel': '#ffffff', '--ink': '#3c352d', '--ink-mid': '#6f665a', '--ink-dim': '#a49a8a',
+        '--panel': '#ffffff', '--ink': '#3c352d', '--ink-mid': '#6f665a', '--ink-dim': '#746a5c',
         '--accent': '#c05c37', '--accent-2': '#b8532f', '--accent-soft': '#f0e2d9', '--active': '#ecd9cd',
         '--border': 'rgba(60, 48, 34, 0.11)', '--border-soft': 'rgba(60, 48, 34, 0.06)',
         '--dot': '#d7d0c2',
@@ -127,7 +127,7 @@
       label: 'Slate',
       vars: {
         '--canvas': '#eceef1', '--sidebar': '#f3f5f7', '--topbar': '#eef1f4',
-        '--panel': '#ffffff', '--ink': '#2b3038', '--ink-mid': '#5c636e', '--ink-dim': '#9aa2ad',
+        '--panel': '#ffffff', '--ink': '#2b3038', '--ink-mid': '#5c636e', '--ink-dim': '#646b76',
         '--accent': '#4f7cac', '--accent-2': '#40679a', '--accent-soft': '#dde6f0', '--active': '#d5dee9',
         '--border': 'rgba(34, 44, 60, 0.12)', '--border-soft': 'rgba(34, 44, 60, 0.06)',
         '--dot': '#c4cbd4',
@@ -139,7 +139,7 @@
       label: 'Forest',
       vars: {
         '--canvas': '#eef1ea', '--sidebar': '#f4f6f0', '--topbar': '#eff2ea',
-        '--panel': '#ffffff', '--ink': '#2c352c', '--ink-mid': '#5d675a', '--ink-dim': '#9aa596',
+        '--panel': '#ffffff', '--ink': '#2c352c', '--ink-mid': '#5d675a', '--ink-dim': '#657061',
         '--accent': '#4a8c5a', '--accent-2': '#3d7a4c', '--accent-soft': '#dcebdd', '--active': '#d6e6d5',
         '--border': 'rgba(40, 55, 40, 0.12)', '--border-soft': 'rgba(40, 55, 40, 0.06)',
         '--dot': '#c7d0c2',
