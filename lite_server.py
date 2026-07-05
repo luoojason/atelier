@@ -466,6 +466,36 @@ def _friendly_turn_error(detail: str) -> str:
     return f"Atelier hit an error and could not finish that turn: {raw}"
 
 
+# The Claude API-key path is metered per token, so it gets the same daily cap
+# the external lane got in spend.py — one provider entry under the real host.
+# Subscription runs are plan-included: never gated, never recorded.
+# Granularity is the TURN: the CLI runs its agentic loop internally, so the
+# gate sits where a user turn starts and the cost lands when the turn's
+# ResultMessage reports total_cost_usd.
+_API_PROVIDER_HOST = "api.anthropic.com"
+
+
+def _record_api_cost(msg) -> None:
+    """Record a finished turn's cost against the Anthropic host (api mode only)."""
+    if _effective_provider() != "api":
+        return
+    usd = getattr(msg, "total_cost_usd", None)
+    if usd:
+        spend.record(_API_PROVIDER_HOST, usd)
+
+
+def _api_cap_message() -> str | None:
+    """None when a turn may start; else the friendly pause message (api mode
+    over today's cap). Checked at the user-facing turn entries; SpawnAgent
+    continuations inside an in-flight turn are allowed by design."""
+    if _effective_provider() != "api":
+        return None
+    ok, spent, cap = spend.allowed(_API_PROVIDER_HOST)
+    if ok:
+        return None
+    return spend.cap_message(_API_PROVIDER_HOST, spent, cap)
+
+
 async def _collect_response(client: ClaudeSDKClient) -> dict:
     """Drain one turn: concatenate assistant TextBlocks, honor a failed result.
 
@@ -480,6 +510,7 @@ async def _collect_response(client: ClaudeSDKClient) -> dict:
                 if isinstance(block, TextBlock):
                     texts.append(block.text)
         elif isinstance(msg, ResultMessage):
+            _record_api_cost(msg)  # tokens were spent whether or not it errored
             if msg.is_error:
                 detail = msg.result or (
                     "; ".join(msg.errors) if msg.errors else "run failed"
@@ -1971,6 +2002,9 @@ async def chat(req: ChatRequest):
     agent call; the tool run() calls are threaded inside the wrapper). The lock
     serializes concurrent /chat calls onto the single conversation.
     """
+    capped = _api_cap_message()
+    if capped:
+        return {"response": capped, "error": True}
     try:
         async with _chat_lock:
             client = await _get_chat_client()
@@ -2035,6 +2069,7 @@ async def _stream_turn(message: str):
                         if isinstance(block, TextBlock):
                             texts.append(block.text)
                 elif isinstance(msg, ResultMessage):
+                    _record_api_cost(msg)
                     if msg.is_error:
                         detail = msg.result or (
                             "; ".join(msg.errors) if msg.errors else "run failed"
@@ -2065,6 +2100,11 @@ async def _stream_turn(message: str):
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     """Streaming variant of /chat: SSE token deltas on the same conversation."""
+    capped = _api_cap_message()
+    if capped:
+        # refuse BEFORE the stream starts: the renderer's no-deltas fallback
+        # retries via /chat, which answers with the same friendly pause.
+        return JSONResponse({"error": capped}, status_code=429)
     return StreamingResponse(
         _stream_turn(req.message),
         media_type="text/event-stream",
@@ -2085,6 +2125,11 @@ async def get_response_compat(req: AgencyResponseRequest):
     cannot pollute the user's chat context, and it is safe to run concurrently
     with /chat. recipient_agent is accepted for API parity but ignored.
     """
+    capped = _api_cap_message()
+    if capped:
+        # a scheduled job on a capped api key pauses like any other turn; the
+        # scheduler records the failure text and the card shows the reason
+        return {"response": capped, "error": True}
     try:
         if req.job_name:
             # r24: a named scheduled job -> a tracked, revealable session.
@@ -3145,6 +3190,9 @@ async def session_message(session_id: str, req: SessionMessageRequest):
         return _unknown_session()
     if sess.status == "running":
         return JSONResponse({"error": "turn in progress"}, status_code=409)
+    capped = _api_cap_message()
+    if capped:
+        return JSONResponse({"error": capped}, status_code=429)
     # +1 leaves room for the assistant reply this turn will append.
     if len(sess.messages) + 1 >= _MAX_SESSION_MESSAGES:
         return JSONResponse({"error": "session ledger full"}, status_code=413)
