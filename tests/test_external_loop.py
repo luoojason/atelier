@@ -372,3 +372,61 @@ def test_route_tools_unsupported_falls_back(tmp_path, monkeypatch):
     monkeypatch.setattr(ea, "forward", _fwd)
     r = c.post(f"/external/agents/{aid}/agent_message", json={"message": "hi"})
     assert r.status_code == 200 and r.json()["response"] == "fell back"
+
+
+def test_route_filters_tools_by_grants(tmp_path, monkeypatch):
+    """An agent granted only 'web' advertises only WebSearch/WebFetch."""
+    c = _client(tmp_path, monkeypatch)
+    ea.upsert({"name": "webonly", "base_url": "http://x/v1", "model": "gpt-4o-mini",
+               "tool_grants": {"files": False, "vault": False, "web": True, "memory": False}})
+    aid = ea.load_agents()[0]["id"]
+
+    seen = {}
+
+    async def _fake(agent, message, history, oai_tools, by_name, **kw):
+        seen["names"] = sorted(t["function"]["name"] for t in oai_tools)
+        return {"response": "ok", "error": None, "steps": []}
+
+    monkeypatch.setattr(external_loop, "run_external_turn", _fake)
+    r = c.post(f"/external/agents/{aid}/agent_message", json={"message": "hi"})
+    assert r.status_code == 200
+    assert seen["names"] == ["WebFetch", "WebSearch"]
+
+
+def test_route_all_grants_revoked_falls_back_to_chat(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    ea.upsert({"name": "none", "base_url": "http://x/v1", "model": "gpt-4o-mini",
+               "tool_grants": {"files": False, "vault": False, "web": False, "memory": False}})
+    aid = ea.load_agents()[0]["id"]
+
+    async def _forward(agent_id, message, history=None):
+        return True, "plain chat answer"
+
+    monkeypatch.setattr(ea, "forward", _forward)
+
+    async def _boom(*a, **kw):
+        raise AssertionError("the tools loop ran with zero granted tools")
+
+    monkeypatch.setattr(external_loop, "run_external_turn", _boom)
+    r = c.post(f"/external/agents/{aid}/agent_message", json={"message": "hi"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["response"] == "plain chat answer"
+    assert body["tools_used"] is False
+
+
+def test_route_default_grants_filter_nothing(tmp_path, monkeypatch):
+    c = _client(tmp_path, monkeypatch)
+    ea.upsert({"name": "all", "base_url": "http://x/v1", "model": "gpt-4o-mini"})
+    aid = ea.load_agents()[0]["id"]
+    seen = {}
+
+    async def _fake(agent, message, history, oai_tools, by_name, **kw):
+        seen["count"] = len(oai_tools)
+        return {"response": "ok", "error": None, "steps": []}
+
+    monkeypatch.setattr(external_loop, "run_external_turn", _fake)
+    assert c.post(f"/external/agents/{aid}/agent_message", json={"message": "hi"}).status_code == 200
+    # no notion token in this env -> the full non-notion light tier
+    expected = len(lite_server._select_light_tool_specs(False))
+    assert seen["count"] == expected

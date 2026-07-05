@@ -106,6 +106,9 @@ def load_agents() -> list[dict]:
                 "model": str(item.get("model") or "").strip()[:_MODEL_MAX],
                 "adapter": adapter if adapter in ADAPTERS else _DEFAULT_ADAPTER,
                 "tools_enabled": bool(item.get("tools_enabled")),
+                "tool_grants": normalize_grants(
+                    item.get("tool_grants") if isinstance(item.get("tool_grants"), dict) else {}
+                ),
             }
         )
     return out
@@ -158,6 +161,9 @@ def sanitize(agent: dict) -> dict:
         "key_hint": _key_hint(key),
         "tools_enabled": bool(agent.get("tools_enabled")),
         "tools_capable": model_tools_capable(agent.get("model") or ""),
+        "tool_grants": normalize_grants(
+            agent.get("tool_grants") if isinstance(agent.get("tool_grants"), dict) else {}
+        ),
     }
 
 
@@ -205,6 +211,17 @@ def upsert(payload: dict) -> tuple[bool, str | dict]:
     else:
         tools_enabled = bool(te)
 
+    # tool_grants: which tool FAMILIES this agent may use when tools are on
+    # (granular consent, Round-2 P2). Same omitted-keeps-stored rule; absent
+    # everywhere -> all granted (the pre-grants behavior).
+    tg = payload.get("tool_grants")
+    if isinstance(tg, dict):
+        tool_grants = normalize_grants(tg)
+    elif existing is not None and isinstance(existing.get("tool_grants"), dict):
+        tool_grants = normalize_grants(existing["tool_grants"])
+    else:
+        tool_grants = dict(DEFAULT_GRANTS)
+
     record = {
         "id": aid,
         "name": name[:_NAME_MAX],
@@ -213,6 +230,7 @@ def upsert(payload: dict) -> tuple[bool, str | dict]:
         "model": str(payload.get("model") or "").strip()[:_MODEL_MAX],
         "adapter": adapter,
         "tools_enabled": tools_enabled,
+        "tool_grants": tool_grants,
     }
     if existing is not None:
         agents = [record if a["id"] == aid else a for a in agents]
@@ -256,6 +274,22 @@ def _completions_url(base_url: str) -> str:
     if not path.endswith("/chat/completions"):
         path = path + "/chat/completions"
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
+
+
+# The grantable tool families (granular consent). Keys are stable API surface;
+# lite_server maps each family to its LIGHT_TOOLS classes.
+GRANT_KEYS = ("files", "vault", "web", "memory")
+DEFAULT_GRANTS = {k: True for k in GRANT_KEYS}
+
+
+def normalize_grants(raw: dict) -> dict:
+    """A full, bool-valued grants dict from arbitrary input; unknown keys are
+    dropped, missing keys default True (grant unless explicitly revoked)."""
+    out = {}
+    for key in GRANT_KEYS:
+        val = raw.get(key)
+        out[key] = True if val is None else bool(val)
+    return out
 
 
 async def forward(agent_id: str, message: str, history=None) -> tuple[bool, str]:

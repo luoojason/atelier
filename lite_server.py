@@ -154,6 +154,21 @@ _NOTION_PROMPT = (
 )
 
 
+# Granular tool grants (Round-2 P2): each LIGHT_TOOLS class belongs to one
+# grantable FAMILY. An external agent's tool_grants decides which families its
+# tools lane advertises. Derived from the class lists so a rename cannot
+# desync; anything unmapped defaults to the most guarded family ("files").
+_TOOL_FAMILIES = {
+    "files": [WriteFile, ReadFile, ListFiles],
+    "vault": [VaultSearch, VaultRead, VaultWrite,
+              NotionSearch, NotionRead, NotionCreatePage, NotionAppend],
+    "web": [WebSearch, WebFetch],
+    "memory": [RememberFact, RecallMemory, CaptureBrief, ReadBrief,
+               StartCampaign, RecordDeliverable, CampaignStatus],
+}
+_FAMILY_OF = {cls: fam for fam, classes in _TOOL_FAMILIES.items() for cls in classes}
+
+
 def _select_light_tool_specs(notion_enabled: bool) -> list:
     """The wrapped light-tier SdkMcpTools, Notion-gated exactly as build_options
     gates the Claude allowlist (Notion tools only when a token is configured).
@@ -3234,6 +3249,8 @@ class ExternalAgentRequest(BaseModel):
     model: str | None = Field(default=None, max_length=200)
     adapter: str | None = None
     tools_enabled: bool | None = None
+    # granular grants; None on an update keeps the stored values (upsert rule)
+    tool_grants: dict[str, bool] | None = None
 
 
 class ExternalMessageRequest(BaseModel):
@@ -3314,6 +3331,21 @@ async def external_agents_agent_message(agent_id: str, req: ExternalMessageReque
 
     notion_on = bool(load_settings().get("notion_token"))
     specs = _select_light_tool_specs(notion_on)
+    # granular grants: drop the families this agent was not granted. Specs wrap
+    # the original class (sdk_tools.wrap_tool keeps it reachable via .base_tool
+    # or the class name); match by tool NAME derived from the class, which both
+    # sides share. All-granted (the default) filters nothing.
+    grants = agent.get("tool_grants") if isinstance(agent.get("tool_grants"), dict) else {}
+    denied = {fam for fam, ok in grants.items() if not ok}
+    if denied:
+        # spec .name is the BARE class name (wrap_tool), e.g. "VaultSearch"
+        denied_names = {
+            cls.__name__ for cls, fam in _FAMILY_OF.items() if fam in denied
+        }
+        specs = [t for t in specs if t.name not in denied_names]
+        if not specs:
+            # every family revoked -> honest plain chat, not an empty tools loop
+            return await _external_chat_fallback(agent_id, req)
     oai_tools = external_tools.openai_tools_for(specs)
     by_name = external_tools.dispatch_table(specs)
 
