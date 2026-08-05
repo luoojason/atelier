@@ -3,6 +3,8 @@
 import json
 import os
 
+import pytest
+
 from shared_tools import vault_core
 
 
@@ -84,3 +86,50 @@ def test_build_graph_skips_sources_and_self_links(tmp_path):
 
 def test_build_graph_empty_vault(tmp_path):
     assert vault_core.build_graph(tmp_path) == {"nodes": [], "edges": []}
+
+
+# ── a MISSING vault root is an error, not an empty vault ────────────────────
+# vault_root() falls through to DEFAULT_VAULT even when nothing is there, so
+# every scan used to answer "no notes" for a vault that was never opened.
+
+
+def test_search_vault_raises_when_root_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("OBSIDIAN_VAULT", str(tmp_path / "nope"))
+    _write_settings(tmp_path, {"obsidian_vault": str(tmp_path / "also-nope")})
+    monkeypatch.setattr(vault_core, "DEFAULT_VAULT", str(tmp_path / "no-default"))
+    with pytest.raises(vault_core.VaultUnavailableError) as exc:
+        vault_core.search_vault("anything")
+    assert "not found" in str(exc.value)
+
+
+def test_search_vault_still_returns_empty_for_a_real_miss(tmp_path, monkeypatch):
+    """The error must be reserved for a missing ROOT — a real vault with no
+    match still returns [] rather than raising."""
+    _mk(tmp_path, "A.md", "nothing relevant here")
+    monkeypatch.setenv("OBSIDIAN_VAULT", str(tmp_path))
+    _write_settings(tmp_path, {})
+    assert vault_core.search_vault("zzz-no-such-term") == []
+
+
+def test_read_note_distinguishes_missing_vault_from_missing_note(tmp_path, monkeypatch):
+    _mk(tmp_path, "A.md", "hello")
+    monkeypatch.setenv("OBSIDIAN_VAULT", str(tmp_path))
+    _write_settings(tmp_path, {})
+    with pytest.raises(FileNotFoundError):
+        vault_core.read_note("NoSuchNote")          # vault fine, note missing
+
+    monkeypatch.setenv("OBSIDIAN_VAULT", str(tmp_path / "gone"))
+    monkeypatch.setattr(vault_core, "DEFAULT_VAULT", str(tmp_path / "no-default"))
+    with pytest.raises(vault_core.VaultUnavailableError):
+        vault_core.read_note("A")                   # vault itself is missing
+
+
+def test_build_graph_raises_when_root_missing(tmp_path):
+    with pytest.raises(vault_core.VaultUnavailableError):
+        vault_core.build_graph(tmp_path / "not-a-vault")
+
+
+def test_vault_unavailable_is_not_a_file_not_found():
+    """Callers already map FileNotFoundError to 'that note is missing'; the
+    missing-vault signal must not be swallowed by those handlers."""
+    assert not issubclass(vault_core.VaultUnavailableError, FileNotFoundError)

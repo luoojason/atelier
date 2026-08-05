@@ -584,12 +584,25 @@
       if (costSheetPanel) { try { costSheetPanel.close(); } catch { /* gone */ } }
       const wrap = el('div', 'atl-recipes-cost');
       const cap = typeof cfg.spend_cap_usd === 'number' ? cfg.spend_cap_usd : 0;
-      const spent = typeof cfg.api_spend_today_usd === 'number' ? cfg.api_spend_today_usd : 0;
+      // null/absent = the server could not read the spend ledger, so today's
+      // total is UNKNOWN. Never render that as $0.00 — the old `: 0` fallback
+      // printed "Today so far: $0.00 of your $5.00 daily cap" while the cap
+      // was in fact unenforceable.
+      const spent = typeof cfg.api_spend_today_usd === 'number' ? cfg.api_spend_today_usd : null;
       wrap.appendChild(el('p', null,
         'This run is metered on your Anthropic API key. Simple asks usually cost cents; research or video runs cost more.'));
-      wrap.appendChild(el('p', null, cap > 0
-        ? 'Today so far: $' + spent.toFixed(2) + ' of your $' + cap.toFixed(2) + ' daily cap. Atelier pauses at the cap.'
-        : 'Your daily spend cap is turned off, so nothing will stop a long run — you can set a cap in Settings.'));
+      let capLine;
+      if (cap <= 0) {
+        capLine = 'Your daily spend cap is turned off, so nothing will stop a long run — you can set a cap in Settings.';
+      } else if (spent === null) {
+        capLine = 'Atelier cannot read today’s spend ledger, so your $' + cap.toFixed(2)
+          + ' daily cap cannot be enforced right now — so runs are paused until it can be read again. '
+          + 'Fix or delete ~/.atelier/spend.json to restore it.';
+      } else {
+        capLine = 'Today so far: $' + spent.toFixed(2) + ' of your $' + cap.toFixed(2)
+          + ' daily cap. Atelier pauses at the cap.';
+      }
+      wrap.appendChild(el('p', null, capLine));
       const row = el('div', 'atl-recipes-cost-row');
       const cancel = el('button', 'atl-recipes-btn ghost', 'Not now');
       const go = el('button', 'atl-recipes-btn', 'Start the run');

@@ -508,6 +508,15 @@
         .then((r) => r.json())
         .then((d) => {
           if (disposed) return;
+          // A missing / unreadable vault root comes back as an explicit error
+          // (503), not an empty graph — draw the reason, because a blank
+          // canvas reads as "your vault has no notes".
+          if (d && d.error) {
+            ctx.fillStyle = cssVar('--ink-dim', '#999');
+            ctx.font = '13px system-ui, sans-serif';
+            ctx.fillText(String(d.error).slice(0, 140), 20, 30);
+            return;
+          }
           nodes = (d.nodes || []).map((n) => Object.assign({}, n));
           edges = (d.edges || []).slice();
           prepare();

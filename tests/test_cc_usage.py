@@ -55,9 +55,15 @@ B_TOKENS = 230
 # (ts index, usd, tokens) per assistant turn, for window-dependent expectations.
 TURNS = [(0, 0.00705, 1300), (1, 0.00495, 1650), (2, B_USD, B_TOKENS)]
 
+# A model with no entry in cc_usage.PRICING: its cost is UNKNOWN, and every
+# usd it touches must be null / excluded rather than fabricated at some other
+# model's rates (which is what the old _SONNET_FALLBACK did).
+UNPRICED = "z-ai/glm-5.2"
+
 EMPTY_DETAIL = {
     "session_id": "",
-    "totals": {"usd": 0.0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+    "totals": {"usd": 0.0, "input": 0, "output": 0, "cache_read": 0,
+               "cache_write": 0, "unpriced_models": []},
     "by_model": [],
     "timeline": [],
 }
@@ -202,6 +208,7 @@ def test_status_counts(seeded, client):
         if _local_dt(seeded["ts"][i]).strftime("%Y-%m") == now_local.strftime("%Y-%m")
     )
     assert body["this_month_usd"] == pytest.approx(round(expected_month, 4))
+    assert body["unpriced_models"] == []  # every fixture model is priced
 
 
 # --------------------------------------------------------------------------- #
@@ -214,7 +221,8 @@ def test_usage_lists_sessions_with_totals(seeded, client):
     assert [s["session_id"] for s in body] == [SESSION_B, SESSION_A]  # mtime desc
     b, a = body
     assert set(a) == {"session_id", "project", "model", "total_tokens",
-                      "total_usd", "started_at", "turns"}
+                      "total_usd", "unpriced_models", "started_at", "turns"}
+    assert a["unpriced_models"] == [] and b["unpriced_models"] == []
     assert a["project"] == "-Users-jasonluo08-Desktop-projA"
     assert a["model"] == SONNET
     assert a["total_tokens"] == A_TOKENS
@@ -250,6 +258,7 @@ def test_usage_detail_totals_and_timeline(seeded, client):
         "output": 300,
         "cache_read": 1000,
         "cache_write": 1500,
+        "unpriced_models": [],
     }
     assert body["by_model"] == [
         {"model": SONNET, "tokens": A_TOKENS, "usd": pytest.approx(A_USD)}
@@ -303,7 +312,8 @@ def test_usage_detail_unknown_id_404_empty_shape(seeded, client):
 
 def test_aggregate_shapes_and_sums(seeded, client):
     body = client.get("/cc/aggregate").json()
-    assert set(body) == {"daily", "by_model", "cache", "peak_hours"}
+    assert set(body) == {"daily", "by_model", "cache", "peak_hours", "unpriced_models"}
+    assert body["unpriced_models"] == []
 
     # daily buckets computed from the same ts the fixture wrote
     expected = {}
@@ -338,7 +348,8 @@ def test_aggregate_shapes_and_sums(seeded, client):
 
 def test_heatmap_shape(seeded, client):
     body = client.get("/cc/heatmap").json()
-    assert set(body) == {"days", "hours"}
+    assert set(body) == {"days", "hours", "unpriced_models"}
+    assert body["unpriced_models"] == []
     assert len(body["hours"]) == 24
     assert sum(body["hours"]) == A_TOKENS + B_TOKENS
     assert sum(d["tokens"] for d in body["days"]) == A_TOKENS + B_TOKENS
@@ -355,15 +366,18 @@ def test_missing_dir_empty_shapes(client):
     # autouse fixture points CLAUDE_PROJECTS_DIR at a nonexistent path
     assert client.get("/cc/status").json() == {
         "active": False, "conversations": 0, "projects": 0,
-        "storage_mb": 0.0, "this_month_usd": 0.0, "this_week_tokens": 0,
+        "storage_mb": 0.0, "this_month_usd": 0.0, "unpriced_models": [],
+        "this_week_tokens": 0,
     }
     assert client.get("/cc/usage").json() == []
     assert client.get("/cc/aggregate").json() == {
         "daily": [], "by_model": [],
         "cache": {"read": 0, "write": 0, "saved_usd": 0.0, "pct": 0.0},
-        "peak_hours": [0] * 24,
+        "peak_hours": [0] * 24, "unpriced_models": [],
     }
-    assert client.get("/cc/heatmap").json() == {"days": [], "hours": [0] * 24}
+    assert client.get("/cc/heatmap").json() == {
+        "days": [], "hours": [0] * 24, "unpriced_models": [],
+    }
 
 
 def test_corrupt_transcript_never_500(monkeypatch, tmp_path, client):
@@ -388,6 +402,90 @@ def test_corrupt_transcript_never_500(monkeypatch, tmp_path, client):
 
     assert client.get("/cc/aggregate").status_code == 200
     assert client.get("/cc/heatmap").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Pricing: current models are priced; unknown models are UNPRICED, not guessed
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def unpriced_seeded(monkeypatch, tmp_path):
+    """One session mixing a priced model with an unpriced one."""
+    import cc_usage
+
+    root = tmp_path / "projects"
+    proj = root / "-Users-jasonluo08-Desktop-projU"
+    proj.mkdir(parents=True)
+    sid = "cccc3333-4444-4555-8666-777788889999"
+    path = proj / f"{sid}.jsonl"
+    t = _ts(1)
+    _write_jsonl(path, [
+        _assistant_line(sid, HAIKU, t, input_tokens=1_000_000, output_tokens=0),
+        _assistant_line(sid, UNPRICED, t, input_tokens=1_000_000, output_tokens=0),
+    ])
+    monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(root))
+    cc_usage._cache.clear()  # the parse cache is keyed on path/mtime/size
+    return sid
+
+
+def test_current_models_are_priced_not_fallen_back():
+    """claude-opus-5 was priced at sonnet-4-6 rates ($3/$15) — ~60% of what
+    this module's own table says an Opus turn costs. It must price as Opus."""
+    import cc_usage
+
+    for model, inp, out in [("claude-opus-5", 5.0, 25.0),
+                            ("claude-sonnet-5", 3.0, 15.0),
+                            ("claude-fable-5", 10.0, 50.0)]:
+        r = cc_usage.rates_for(model)
+        assert r is not None, f"{model} must be priced"
+        assert (r["input"], r["output"]) == (inp, out)
+        # cache columns follow the table's own 1.25x / 2x / 0.1x convention
+        assert r["cache_write_5m"] == pytest.approx(inp * 1.25)
+        assert r["cache_write_1h"] == pytest.approx(inp * 2)
+        assert r["cache_read"] == pytest.approx(inp * 0.1)
+    # a dated build of a known family still resolves via the prefix rule
+    assert cc_usage.rates_for("claude-opus-5-20260701") is cc_usage.PRICING["claude-opus-5"]
+
+
+def test_unknown_model_is_unpriced_not_guessed():
+    """No silent fallback: an unknown model's cost is None, not another
+    model's rates dressed up as a measurement."""
+    import cc_usage
+
+    assert cc_usage.rates_for(UNPRICED) is None
+    assert cc_usage.cost_usd(UNPRICED, {"input_tokens": 1_000_000}) is None
+
+
+def test_unpriced_model_never_folded_into_a_dollar_total(unpriced_seeded, client):
+    sid = unpriced_seeded
+    # 1M input on haiku = $1.00; the unpriced model contributes NO dollars
+    detail = client.get(f"/cc/usage/{sid}").json()
+    by_model = {m["model"]: m for m in detail["by_model"]}
+    assert by_model[HAIKU]["usd"] == pytest.approx(1.0)
+    assert by_model[UNPRICED]["usd"] is None          # not 0.0, not $3.00
+    assert by_model[UNPRICED]["tokens"] == 1_000_000  # tokens ARE known
+    assert detail["totals"]["usd"] == pytest.approx(1.0)
+    assert detail["totals"]["unpriced_models"] == [UNPRICED]
+    assert [ev["usd"] for ev in detail["timeline"]] == [pytest.approx(1.0), None]
+
+    # the flag reaches every endpoint a dollar figure is rendered from
+    status = client.get("/cc/status").json()
+    assert status["unpriced_models"] == [UNPRICED]
+    assert status["this_month_usd"] == pytest.approx(1.0)
+
+    agg = client.get("/cc/aggregate").json()
+    assert agg["unpriced_models"] == [UNPRICED]
+    agg_models = {m["model"]: m for m in agg["by_model"]}
+    assert agg_models[UNPRICED]["usd"] is None
+    assert agg_models[HAIKU]["usd"] == pytest.approx(1.0)
+    assert sum(d["usd"] for d in agg["daily"]) == pytest.approx(1.0)
+
+    assert client.get("/cc/heatmap").json()["unpriced_models"] == [UNPRICED]
+
+    row = next(s for s in client.get("/cc/usage").json() if s["session_id"] == sid)
+    assert row["unpriced_models"] == [UNPRICED]
+    assert row["total_usd"] == pytest.approx(1.0)
 
 
 # --------------------------------------------------------------------------- #

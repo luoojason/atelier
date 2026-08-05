@@ -50,7 +50,19 @@ PRICING_UPDATED = "2026-06-06"
 # cache_write_5m  = ephemeral 5-minute cache creation
 # cache_write_1h  = ephemeral 1-hour cache creation
 # cache_read      = cache read
+#
+# Cache columns follow this table's own convention, which reproduces every
+# pre-existing row exactly: cache_write_5m = 1.25x input, cache_write_1h = 2x
+# input, cache_read = 0.1x input. Only input/output are sourced externally.
 PRICING: dict[str, dict[str, float]] = {
+    # Claude 5 family. Input/output are the published list prices; the cache
+    # columns are derived with the multipliers documented above. NOTE: Sonnet
+    # 5 carries a temporary introductory rate ($2/$10) that is NOT used here —
+    # this table prices at list, the same basis as every other row, so a
+    # month's figure does not silently change basis when the promo ends.
+    "claude-fable-5":                {"input": 10.0,  "output": 50.0,  "cache_write_5m": 12.50, "cache_write_1h": 20.0,  "cache_read": 1.00},
+    "claude-opus-5":                 {"input":  5.0,  "output": 25.0,  "cache_write_5m":  6.25, "cache_write_1h": 10.0,  "cache_read": 0.50},
+    "claude-sonnet-5":               {"input":  3.0,  "output": 15.0,  "cache_write_5m":  3.75, "cache_write_1h":  6.0,  "cache_read": 0.30},
     # Claude 4 family. Opus 4.5+ is $5/$25 (not the old Claude-3 $15/$75 Opus rate).
     "claude-opus-4-8":               {"input":  5.0,  "output": 25.0,  "cache_write_5m":  6.25, "cache_write_1h": 10.0,  "cache_read": 0.50},
     "claude-opus-4-7":               {"input":  5.0,  "output": 25.0,  "cache_write_5m":  6.25, "cache_write_1h": 10.0,  "cache_read": 0.50},
@@ -65,8 +77,6 @@ PRICING: dict[str, dict[str, float]] = {
     "claude-3-opus-20240229":        {"input": 15.0,  "output": 75.0,  "cache_write_5m": 18.75, "cache_write_1h": 30.0,  "cache_read": 1.50},
     "claude-3-haiku-20240307":       {"input":  0.25, "output":  1.25, "cache_write_5m":  0.30, "cache_write_1h":  0.50, "cache_read": 0.03},
 }
-
-_SONNET_FALLBACK = PRICING["claude-sonnet-4-6"]
 
 _warned_stale = False
 _warned_unknown: set[str] = set()
@@ -83,8 +93,16 @@ def _check_staleness() -> None:
         _warned_stale = True
 
 
-def rates_for(model: str) -> dict[str, float]:
-    """Return rate dict for *model*, falling back to sonnet rates with a one-time warning."""
+def rates_for(model: str) -> Optional[dict[str, float]]:
+    """Rate dict for *model*, or **None when the model is not priced**.
+
+    None is the honest answer for a model this table has never heard of, and
+    callers MUST carry it through to the endpoint shape. The previous
+    behavior — silently falling back to sonnet rates behind a log.warning
+    that never reached the UI — printed a dollar figure nobody measured:
+    every ``claude-opus-5`` turn on this machine was billed into the
+    dashboard at 60% of what this module's own table says Opus costs.
+    """
     _check_staleness()
     # Normalize: strip trailing revision suffixes like -20250929 if exact key not found
     if model in PRICING:
@@ -94,9 +112,11 @@ def rates_for(model: str) -> dict[str, float]:
         if model.startswith(key):
             return PRICING[key]
     if model not in _warned_unknown:
-        log.warning("Unknown model %r — using sonnet-4-6 rates as fallback", model)
+        log.warning(
+            "Unknown model %r — its usage is reported as UNPRICED (no dollar "
+            "estimate); add it to cc_usage.PRICING to price it", model)
         _warned_unknown.add(model)
-    return _SONNET_FALLBACK
+    return None
 
 
 def _cache_write_split(usage: dict) -> tuple:
@@ -118,9 +138,15 @@ def _cache_write_split(usage: dict) -> tuple:
     return (usage.get("cache_creation_input_tokens", 0), 0)
 
 
-def cost_usd(model: str, usage: dict) -> float:
-    """Compute total USD cost for a single assistant turn's usage block."""
+def cost_usd(model: str, usage: dict) -> Optional[float]:
+    """USD cost for one assistant turn, or **None when the model is unpriced**.
+
+    None is not zero — it means "this turn's cost is unknown". Never coerce it
+    to 0.0 on the way to a total.
+    """
     r = rates_for(model)
+    if r is None:
+        return None
     inp = usage.get("input_tokens", 0)
     out = usage.get("output_tokens", 0)
     cw_5m, cw_1h = _cache_write_split(usage)
@@ -186,10 +212,18 @@ def parse_usage(path: pathlib.Path) -> dict:
 
     Result shape:
     {
-      "by_model": [{"model": str, "input": int, "output": int, ...tokens..., "usd": float}],
-      "totals": {"input": int, "output": int, "cache_write": int, "cache_read": int, "usd": float},
-      "events": [{"ts": str, "model": str, "usage": {...}, "usd": float}]
+      "by_model": [{"model": str, "input": int, ...tokens..., "usd": float|None}],
+      "totals": {"input": int, "output": int, "cache_write": int, "cache_read": int,
+                 "usd": float, "unpriced_models": [str], "unpriced_tokens": int},
+      "events": [{"ts": str, "model": str, "usage": {...}, "usd": float|None}]
     }
+
+    ``usd`` is None wherever the model is not in PRICING — its cost is
+    unknown, not zero. ``totals["usd"]`` therefore sums the PRICED turns only
+    and is INCOMPLETE whenever ``unpriced_models`` is non-empty; every caller
+    must carry that list through so the UI can say so instead of presenting a
+    partial sum as the whole bill.
+
     Memoized on (path, mtime, size) to avoid re-reading unchanged files.
     """
     key = _cache_key(path)
@@ -200,6 +234,7 @@ def parse_usage(path: pathlib.Path) -> dict:
             return cache_entry[1]
 
     by_model: dict[str, dict] = {}
+    unpriced: set[str] = set()
     events: list[dict] = []
 
     with open(path, encoding="utf-8", errors="replace") as fh:
@@ -225,7 +260,9 @@ def parse_usage(path: pathlib.Path) -> dict:
                 continue
             model = message.get("model") or obj.get("model") or "unknown"
             ts = obj.get("timestamp") or ""
-            turn_usd = cost_usd(model, usage)
+            turn_usd = cost_usd(model, usage)  # None when the model is unpriced
+            if turn_usd is None:
+                unpriced.add(model)
 
             events.append({"ts": ts, "model": model, "usage": usage, "usd": turn_usd})
 
@@ -239,15 +276,31 @@ def parse_usage(path: pathlib.Path) -> dict:
             # win; aimd summed granular + legacy and double-counted.
             agg["cache_write"] += sum(_cache_write_split(usage))
             agg["cache_read"] += usage.get("cache_read_input_tokens", 0)
-            agg["usd"] += turn_usd
+            if turn_usd is not None:
+                agg["usd"] += turn_usd
 
-    totals: dict = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "usd": 0.0}
+    # An unpriced model's dollar figure is unknown — emit null, never the 0.0
+    # accumulator, which would read as "this model cost nothing".
+    for name in unpriced:
+        by_model[name]["usd"] = None
+
+    totals: dict = {
+        "input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "usd": 0.0,
+        # usd covers PRICED turns only; these say what it leaves out.
+        "unpriced_models": [], "unpriced_tokens": 0,
+    }
     for m in by_model.values():
         totals["input"]       += m["input"]
         totals["output"]      += m["output"]
         totals["cache_write"] += m["cache_write"]
         totals["cache_read"]  += m["cache_read"]
-        totals["usd"]         += m["usd"]
+        if m["usd"] is None:
+            totals["unpriced_models"].append(m["model"])
+            totals["unpriced_tokens"] += (
+                m["input"] + m["output"] + m["cache_read"] + m["cache_write"])
+        else:
+            totals["usd"] += m["usd"]
+    totals["unpriced_models"].sort()
 
     result = {"by_model": list(by_model.values()), "totals": totals, "events": events}
     with _cache_lock:
@@ -341,7 +394,8 @@ def _window_events(window_days: int):
             dt = _parse_ts(ev.get("ts") or "")
             if dt is None or dt < cutoff:
                 continue
-            yield dt, ev.get("model") or "unknown", ev.get("usage") or {}, ev.get("usd", 0.0)
+            # usd is None for an unpriced model — do NOT default it to 0.0.
+            yield dt, ev.get("model") or "unknown", ev.get("usage") or {}, ev.get("usd")
 
 
 # ---- fixed empty shapes (the never-500 degradation targets) ---------------- #
@@ -353,6 +407,7 @@ def empty_status() -> dict:
         "projects": 0,
         "storage_mb": 0.0,
         "this_month_usd": 0.0,
+        "unpriced_models": [],
         "this_week_tokens": 0,
     }
 
@@ -360,7 +415,8 @@ def empty_status() -> dict:
 def empty_session_detail(session_id: str = "") -> dict:
     return {
         "session_id": session_id,
-        "totals": {"usd": 0.0, "input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
+        "totals": {"usd": 0.0, "input": 0, "output": 0, "cache_read": 0,
+                   "cache_write": 0, "unpriced_models": []},
         "by_model": [],
         "timeline": [],
     }
@@ -372,11 +428,12 @@ def empty_aggregate() -> dict:
         "by_model": [],
         "cache": {"read": 0, "write": 0, "saved_usd": 0.0, "pct": 0.0},
         "peak_hours": [0] * 24,
+        "unpriced_models": [],
     }
 
 
 def empty_heatmap() -> dict:
-    return {"days": [], "hours": [0] * 24}
+    return {"days": [], "hours": [0] * 24, "unpriced_models": []}
 
 
 # ---- endpoint shapes -------------------------------------------------------- #
@@ -398,6 +455,7 @@ def status_summary() -> dict:
     total_bytes = 0
     active = False
     month_usd = 0.0
+    unpriced_month: set[str] = set()
     week_tokens = 0
 
     for project, path, st in _iter_transcripts():
@@ -416,7 +474,11 @@ def status_summary() -> dict:
             if dt is None:
                 continue
             if dt >= month_start:
-                month_usd += ev.get("usd", 0.0)
+                usd = ev.get("usd")
+                if usd is None:
+                    unpriced_month.add(ev.get("model") or "unknown")
+                else:
+                    month_usd += usd
             if dt >= week_cutoff:
                 week_tokens += _event_tokens(ev.get("usage") or {})
 
@@ -425,7 +487,10 @@ def status_summary() -> dict:
         "conversations": conversations,
         "projects": len(projects),
         "storage_mb": round(total_bytes / (1024 * 1024), 1),
+        # PRICED turns only. Non-empty unpriced_models means this figure is
+        # incomplete — the UI must say so rather than present it as the bill.
         "this_month_usd": round(month_usd, 4),
+        "unpriced_models": sorted(unpriced_month),
         "this_week_tokens": week_tokens,
     }
 
@@ -441,7 +506,8 @@ def recent_sessions(limit: int = 20) -> list:
     for project, path, st in entries[: max(0, limit)]:
         parsed = _safe_parse(path) or {
             "by_model": [],
-            "totals": {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "usd": 0.0},
+            "totals": {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0,
+                       "usd": 0.0, "unpriced_models": [], "unpriced_tokens": 0},
             "events": [],
         }
         totals = parsed["totals"]
@@ -467,7 +533,9 @@ def recent_sessions(limit: int = 20) -> list:
                 totals["input"] + totals["output"]
                 + totals["cache_read"] + totals["cache_write"]
             ),
+            # PRICED turns only; unpriced_models names what it omits.
             "total_usd": round(totals["usd"], 6),
+            "unpriced_models": list(totals.get("unpriced_models") or []),
             "started_at": started,
             "turns": len(events),
         })
@@ -496,12 +564,14 @@ def session_detail(session_id: str) -> Optional[dict]:
             "output": t["output"],
             "cache_read": t["cache_read"],
             "cache_write": t["cache_write"],
+            "unpriced_models": list(t.get("unpriced_models") or []),
         },
         "by_model": [
             {
                 "model": m["model"],
                 "tokens": m["input"] + m["output"] + m["cache_read"] + m["cache_write"],
-                "usd": round(m["usd"], 6),
+                # null, not 0.0: this model has no published rate here.
+                "usd": None if m["usd"] is None else round(m["usd"], 6),
             }
             for m in parsed["by_model"]
         ],
@@ -509,7 +579,7 @@ def session_detail(session_id: str) -> Optional[dict]:
             {
                 "ts": ev.get("ts") or "",
                 "tokens": _event_tokens(ev.get("usage") or {}),
-                "usd": round(ev.get("usd", 0.0), 6),
+                "usd": None if ev.get("usd") is None else round(ev["usd"], 6),
             }
             for ev in parsed["events"]
         ],
@@ -532,30 +602,39 @@ def aggregate_summary(window_days: int = 30) -> dict:
     input_tokens = 0
     saved_usd = 0.0
 
+    unpriced: set[str] = set()
+
     for dt, model, usage, usd in _window_events(window_days):
         tokens = _event_tokens(usage)
         day = daily.setdefault(dt.date().isoformat(), [0, 0.0])
         day[0] += tokens
-        day[1] += usd
         agg = by_model.setdefault(model, [0, 0.0])
         agg[0] += tokens
-        agg[1] += usd
+        if usd is None:
+            unpriced.add(model)
+        else:
+            day[1] += usd
+            agg[1] += usd
         hours[dt.hour] += tokens
         cr = usage.get("cache_read_input_tokens", 0)
         cache_read_tokens += cr
         cache_write_tokens += sum(_cache_write_split(usage))
         input_tokens += usage.get("input_tokens", 0)
         r = rates_for(model)
-        saved_usd += cr * (r["input"] - r["cache_read"]) / 1_000_000
+        if r is not None:
+            saved_usd += cr * (r["input"] - r["cache_read"]) / 1_000_000
 
     prompt_tokens = input_tokens + cache_read_tokens + cache_write_tokens
     return {
+        # Every usd below covers PRICED turns only; unpriced_models says what
+        # is missing so the charts can render it distinctly.
         "daily": [
             {"date": d, "tokens": v[0], "usd": round(v[1], 6)}
             for d, v in sorted(daily.items())
         ],
         "by_model": [
-            {"model": m, "tokens": v[0], "usd": round(v[1], 6)}
+            {"model": m, "tokens": v[0],
+             "usd": None if m in unpriced else round(v[1], 6)}
             for m, v in sorted(by_model.items(), key=lambda kv: kv[1][0], reverse=True)
         ],
         "cache": {
@@ -565,18 +644,27 @@ def aggregate_summary(window_days: int = 30) -> dict:
             "pct": round(cache_read_tokens / prompt_tokens * 100, 1) if prompt_tokens else 0.0,
         },
         "peak_hours": hours,
+        "unpriced_models": sorted(unpriced),
     }
 
 
 def heatmap_summary(window_days: int = 90) -> dict:
-    """GET /cc/heatmap shape: per-day tokens/usd + tokens per local hour-of-day."""
+    """GET /cc/heatmap shape: per-day tokens/usd + tokens per local hour-of-day.
+
+    Per-day ``usd`` sums PRICED turns only; ``unpriced_models`` names the
+    models whose cost is unknown and therefore absent from those sums.
+    """
     days: dict[str, list] = {}
     hours = [0] * 24
-    for dt, _model, usage, usd in _window_events(window_days):
+    unpriced: set[str] = set()
+    for dt, model, usage, usd in _window_events(window_days):
         tokens = _event_tokens(usage)
         day = days.setdefault(dt.date().isoformat(), [0, 0.0])
         day[0] += tokens
-        day[1] += usd
+        if usd is None:
+            unpriced.add(model)
+        else:
+            day[1] += usd
         hours[dt.hour] += tokens
     return {
         "days": [
@@ -584,4 +672,5 @@ def heatmap_summary(window_days: int = 90) -> dict:
             for d, v in sorted(days.items())
         ],
         "hours": hours,
+        "unpriced_models": sorted(unpriced),
     }

@@ -25,6 +25,21 @@ _ISOLATED_KEYS = ("ATELIER_VERSIONS_DIR", "OBSIDIAN_VAULT", "ATELIER_SETTINGS_PA
                   "ATELIER_SESSIONS_PATH", "ATELIER_SPEND_PATH")
 
 
+def _reset_spend_state():
+    """Clear spend.py's 'ledger unknown' latch, if spend.py is importable.
+
+    Imported lazily and best-effort: several test modules are runnable as
+    plain scripts and must not gain a hard import dependency here.
+    """
+    try:
+        import spend
+    except Exception:  # noqa: BLE001 - repo root may not be on sys.path yet
+        return
+    reset = getattr(spend, "_reset_ledger_state", None)
+    if callable(reset):
+        reset()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_versions_env(tmp_path):
     saved = {key: os.environ.get(key) for key in _ISOLATED_KEYS}
@@ -36,6 +51,11 @@ def _isolate_versions_env(tmp_path):
     # The spend ledger (#20/#25) records real dollars; no test may read or
     # write the user's actual ~/.atelier/spend.json.
     os.environ["ATELIER_SPEND_PATH"] = str(tmp_path / "atelier-spend.json")
+    # spend.py latches a process-global "today's total is unknown" flag when a
+    # ledger read/write fails (so an unreadable ledger can never be reported
+    # as $0.00). It is per-process, so a test that trips it would leave every
+    # later test seeing spent_today() -> None. Clear it per test.
+    _reset_spend_state()
     try:
         yield
     finally:

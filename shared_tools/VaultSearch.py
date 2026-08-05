@@ -3,7 +3,7 @@
 from agency_swarm.tools import BaseTool
 from pydantic import Field
 
-from shared_tools.vault_core import search_vault
+from shared_tools.vault_core import VaultUnavailableError, search_vault
 
 
 class VaultSearch(BaseTool):
@@ -27,7 +27,16 @@ class VaultSearch(BaseTool):
     )
 
     def run(self) -> str:
-        hits = search_vault(self.query, self.limit)
+        try:
+            hits = search_vault(self.query, self.limit)
+        except VaultUnavailableError as exc:
+            # NOT "no notes matched": the vault was never scanned. Say so, or
+            # the agent concludes the vault is empty and moves on.
+            return (
+                f"ERROR: the vault could not be searched — {exc} "
+                f"No search was performed, so this is NOT evidence that the "
+                f"vault lacks notes about {self.query!r}."
+            )
         if not hits:
             return f"No vault notes found for query: {self.query!r}"
         lines = [f"Found {len(hits)} note(s) for {self.query!r}:", ""]

@@ -23,6 +23,18 @@ DEFAULT_VAULT = "/Users/jasonluo08/Desktop/AI Brain"
 _SKIP_DIRS = {"Sources", ".obsidian", ".git", ".trash"}
 
 
+class VaultUnavailableError(RuntimeError):
+    """The vault root does not exist / is not a readable directory.
+
+    This is deliberately NOT a FileNotFoundError: callers already treat that
+    as "this particular note is missing", and the whole point here is that a
+    misconfigured vault must not read as a vault that simply has nothing in
+    it. An agent told "no notes matched" cannot tell that apart from "your
+    vault is not where you think it is" — so scans raise this instead of
+    quietly yielding nothing.
+    """
+
+
 def _settings_obsidian_vault():
     """The ``obsidian_vault`` path from the Atelier settings file, or None.
 
@@ -54,15 +66,44 @@ def vault_root() -> Path:
     return Path(DEFAULT_VAULT).expanduser()
 
 
+def _require_readable(root) -> Path:
+    """Return *root* as a Path, or raise VaultUnavailableError.
+
+    ``vault_root()`` falls through to DEFAULT_VAULT even when nothing exists,
+    so "the configured path" and "a real directory" are two different claims —
+    this is where the second one gets checked.
+    """
+    path = Path(root)
+    try:
+        ok = path.is_dir()
+    except OSError as exc:  # unreadable mount, permission error, bad path
+        raise VaultUnavailableError(
+            f"Obsidian vault at {path} could not be read ({exc}). "
+            f"Set the vault path in Settings."
+        ) from exc
+    if not ok:
+        raise VaultUnavailableError(
+            f"Obsidian vault not found at {path} — this is a missing or "
+            f"misconfigured vault path, NOT an empty vault. Set the correct "
+            f"vault path in Settings (or the OBSIDIAN_VAULT env var)."
+        )
+    return path
+
+
 def _is_skipped(rel_parts) -> bool:
     """True if any path component names a skipped directory."""
     return any(part in _SKIP_DIRS for part in rel_parts)
 
 
 def _iter_notes(root: Path):
-    """Yield (path, relative_path_str) for every non-skipped .md file."""
-    if not root.exists():
-        return
+    """Yield (path, relative_path_str) for every non-skipped .md file.
+
+    Raises VaultUnavailableError when *root* is not a readable directory.
+    Returning an empty iterator there (the old behavior) made "your vault
+    path is wrong" indistinguishable from "your vault is empty" at every
+    call site, including the agent-facing search tool.
+    """
+    _require_readable(root)
     for path in sorted(root.rglob("*.md")):
         rel = path.relative_to(root)
         # rel.parts includes the filename; only directory parts should be checked.
@@ -130,9 +171,13 @@ def search_vault(query: str, limit: int = 5):
     Matching is case-insensitive substring over the whole note (title + body).
     Directories in _SKIP_DIRS (notably Sources/) are skipped. Results are ordered
     with title matches first, then body matches, and capped at `limit`.
+
+    Raises VaultUnavailableError when the vault root is missing or unreadable.
+    An empty list from this function therefore means "the vault was scanned
+    and nothing matched" — never "the vault could not be found".
     """
     q = (query or "").strip().lower()
-    root = vault_root()
+    root = _require_readable(vault_root())
     title_hits = []
     body_hits = []
     for path, rel in _iter_notes(root):
@@ -161,12 +206,16 @@ def read_note(path_or_title: str) -> str:
       1. Absolute path, if it exists and is a .md under the vault.
       2. Path relative to the vault root.
       3. First note whose filename stem or frontmatter title matches (case-insensitive).
-    Raises FileNotFoundError when nothing matches.
+
+    Raises FileNotFoundError when nothing matches, and VaultUnavailableError
+    when the vault root itself is missing — otherwise every read against a
+    misconfigured vault reports as "note not found", which sends the caller
+    looking for the wrong problem.
     """
     ident = (path_or_title or "").strip()
     if not ident:
         raise FileNotFoundError("No note identifier provided.")
-    root = vault_root()
+    root = _require_readable(vault_root())
     root_res = root.resolve()
 
     def _inside_vault(candidate: Path) -> bool:

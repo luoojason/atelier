@@ -303,12 +303,23 @@
       c.appendChild(el('div', 'cca-tile-value', value));
       grid.appendChild(c);
     };
+    // this_month_usd covers PRICED turns only; unpriced_models names the
+    // models whose cost is unknown and therefore NOT in that figure. Marking
+    // it keeps a partial sum from reading as the whole bill.
+    const unpriced = Array.isArray(d.unpriced_models) ? d.unpriced_models : [];
     tile('Conversations', fmtNum(d.conversations));
     tile('Projects', fmtNum(d.projects));
     tile('Tokens this week', fmtNum(d.this_week_tokens));
-    tile('Estimated value this month', fmtUsd(d.this_month_usd), true);
+    tile('Estimated value this month',
+      fmtUsd(d.this_month_usd) + (unpriced.length ? '+' : ''), true);
     tile('Storage', fmtMb(d.storage_mb));
     host.appendChild(grid);
+    if (unpriced.length) {
+      host.appendChild(el('div', 'cca-note',
+        'Excludes usage from ' + unpriced.length + ' model'
+        + (unpriced.length === 1 ? '' : 's') + ' with no pricing, whose cost is '
+        + 'unknown: ' + unpriced.map(shortModel).join(', ')));
+    }
   }
 
   /* ── (b) token / cost over time (two small-multiple lines, one axis each) ─ */
@@ -501,9 +512,26 @@
       });
     };
     const topTok = rows.slice().sort((a, b) => num(b.tokens) - num(a.tokens)).slice(0, 8);
-    const topUsd = rows.slice().sort((a, b) => num(b.usd) - num(a.usd)).slice(0, 8);
     hbar(tokHost, topTok, 'tokens', t.accent, fmtNum, 'tokens');
+
+    // usd === null means this model has no published rate, so its cost is
+    // UNKNOWN. Plotting it would draw a $0 bar — a figure nobody measured —
+    // so unpriced models are kept out of the cost chart and named beneath it.
+    const priced = rows.filter((r) => typeof r.usd === 'number');
+    const unpriced = rows.filter((r) => typeof r.usd !== 'number').map((r) => r.model);
+    if (!priced.length) {
+      note(usdHost, unpriced.length
+        ? 'Cost unknown — no pricing for ' + unpriced.map(shortModel).join(', ')
+        : 'No model cost recorded.');
+      return;
+    }
+    const topUsd = priced.slice().sort((a, b) => num(b.usd) - num(a.usd)).slice(0, 8);
     hbar(usdHost, topUsd, 'usd', t.cat2, fmtUsd, '');
+    if (unpriced.length) {
+      usdHost.appendChild(el('div', 'cca-note',
+        'Excludes ' + unpriced.length + ' model' + (unpriced.length === 1 ? '' : 's')
+        + ' with no pricing (cost unknown): ' + unpriced.map(shortModel).join(', ')));
+    }
   }
 
   /* ── (e) peak hours histogram (top-3 full accent) ──────────────────────── */
@@ -723,7 +751,17 @@
       row.appendChild(wrap);
 
       row.appendChild(el('span', 'cca-lb-tok', fmtNum(s.total_tokens)));
-      row.appendChild(el('span', 'cca-lb-usd', fmtUsd(s.total_usd)));
+      // total_usd covers priced turns only; a trailing '+' marks a session
+      // that also burned tokens on a model with no pricing (cost unknown),
+      // so the number is a floor rather than the session's cost.
+      const lbUnpriced = Array.isArray(s.unpriced_models) ? s.unpriced_models : [];
+      const usdCell = el('span', 'cca-lb-usd',
+        fmtUsd(s.total_usd) + (lbUnpriced.length ? '+' : ''));
+      if (lbUnpriced.length) {
+        usdCell.title = 'Excludes unpriced model(s), cost unknown: '
+          + lbUnpriced.join(', ');
+      }
+      row.appendChild(usdCell);
       list.appendChild(row);
     });
     host.appendChild(list);

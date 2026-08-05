@@ -76,11 +76,91 @@ def test_stale_ledger_date_resets(tmp_path):
     assert spend.spent_today("h") == 0.0
 
 
-def test_corrupt_ledger_never_raises(tmp_path):
+def test_corrupt_ledger_never_raises_but_reports_unknown(tmp_path):
+    """A corrupt ledger is UNKNOWN spend, not $0.00.
+
+    CHANGED (was ``test_corrupt_ledger_never_raises``): the old test asserted
+    the defect — corrupt ledger -> spent_today() == 0.0 -> record(1.0) ->
+    total 1.0 — i.e. one bad read silently reset the day's accounting and the
+    reset was then persisted as truth. The property it was really protecting
+    (a guardrail must not crash the turn) is kept and asserted below; what
+    changed is that "we cannot read the ledger" no longer reports as a
+    measured zero.
+    """
+    ledger = tmp_path / "spend.json"
+    ledger.write_text("{not json")
+
+    # never raises, but never invents a number either
+    assert spend.spent_today("h") is None
+
+    spend.record("h", 1.0)          # must not raise
+    assert spend.spent_today("h") is None
+
+    # and the unreadable ledger is NOT overwritten with a fresh empty one
+    assert ledger.read_text() == "{not json"
+
+
+def test_corrupt_ledger_fails_the_cap_closed(tmp_path):
     (tmp_path / "spend.json").write_text("{not json")
+    ok, spent, cap = spend.allowed("api.openai.com", {"spend_cap_usd": 5})
+    assert ok is False and spent is None and cap == 5.0
+    msg = spend.cap_message("api.openai.com", spent, cap)
+    assert "cannot read" in msg and "cannot be enforced" in msg
+    # a disabled cap has no decision to get wrong -> still allowed
+    ok, spent, _cap = spend.allowed("api.openai.com", {"spend_cap_usd": 0})
+    assert ok is True and spent is None
+
+
+def test_binary_ledger_is_unknown_not_zero(tmp_path):
+    """read_text() decodes, so a torn/binary file raises UnicodeDecodeError
+    before json.loads is ever reached — it must land as unknown, not crash."""
+    (tmp_path / "spend.json").write_bytes(b"\x00\xff\xfe torn")
+    assert spend.spent_today("h") is None
+
+
+def test_transient_bad_read_does_not_erase_the_day(tmp_path):
+    """The money bug: one unreadable read used to become the persisted truth."""
+    ledger = tmp_path / "spend.json"
+    spend.record("api.openai.com", 40.0)
+    assert spend.spent_today("api.openai.com") == pytest.approx(40.0)
+
+    ledger.write_text("{torn")            # transient corruption
+    spend.record("api.openai.com", 0.10)  # must NOT rewrite a fresh ledger
+
+    assert ledger.read_text() == "{torn"          # the $40 was not clobbered
+    assert spend.spent_today("api.openai.com") is None
+    ok, _spent, _cap = spend.allowed("api.openai.com", {"spend_cap_usd": 5})
+    assert ok is False
+
+
+def test_unwritable_ledger_never_reports_zero(tmp_path, monkeypatch):
+    """An unwritable ~/.atelier meant the ledger never accumulated and
+    spent_today() returned 0.0 forever, so the cap could never trip."""
+    blocked = tmp_path / "blocked"
+    blocked.write_text("a file where the ledger dir should be")
+    monkeypatch.setenv("ATELIER_SPEND_PATH", str(blocked / "spend.json"))
+    spend._reset_ledger_state()
+
+    spend.record("api.openai.com", 3.0)   # write cannot land; must not raise
+    spend.record("api.openai.com", 3.0)
+    assert spend.spent_today("api.openai.com") is None
+    ok, _spent, _cap = spend.allowed("api.openai.com", {"spend_cap_usd": 5})
+    assert ok is False
+
+
+def test_garbage_provider_row_is_unknown(tmp_path):
+    (tmp_path / "spend.json").write_text(
+        json.dumps({"date": spend._today(), "providers": {"h": "lots"}})
+    )
+    assert spend.spent_today("h") is None
+
+
+def test_missing_ledger_is_a_genuine_zero(tmp_path):
+    """A fresh install has no ledger — that IS zero spend, not unknown."""
+    assert not (tmp_path / "spend.json").exists()
     assert spend.spent_today("h") == 0.0
-    spend.record("h", 1.0)  # must not raise
-    assert spend.spent_today("h") == 1.0
+    ok, spent, _cap = spend.allowed("h", {"spend_cap_usd": 5})
+    assert ok is True and spent == 0.0
 
 
 def test_metered_classification():

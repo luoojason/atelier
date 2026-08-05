@@ -3,7 +3,7 @@
 from agency_swarm.tools import BaseTool
 from pydantic import Field
 
-from shared_tools.vault_core import read_note
+from shared_tools.vault_core import VaultUnavailableError, read_note
 
 
 class VaultRead(BaseTool):
@@ -23,5 +23,12 @@ class VaultRead(BaseTool):
     def run(self) -> str:
         try:
             return read_note(self.note)
+        except VaultUnavailableError as exc:
+            # Distinct from "note not found": nothing was looked in at all.
+            return (
+                f"ERROR: the vault could not be opened — {exc} "
+                f"No lookup was performed, so this says nothing about whether "
+                f"the note {self.note!r} exists."
+            )
         except FileNotFoundError as exc:
             return f"Error: {exc}"

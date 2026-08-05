@@ -1331,7 +1331,10 @@ async def config():
         # 0.0 = disabled
         "spend_cap_usd": spend.cap_usd(settings),
         # today's metered spend on the core agent's api path (0.0 on
-        # subscription, where nothing records) — the pre-run cost sheet's data
+        # subscription, where nothing records) — the pre-run cost sheet's
+        # data. NULL when the spend ledger could not be read or written:
+        # today's total is then UNKNOWN, not zero, and the cost sheet must say
+        # the cap cannot be enforced instead of printing "$0.00 of your cap".
         "api_spend_today_usd": spend.spent_today(_API_PROVIDER_HOST),
     }
 
@@ -1828,9 +1831,18 @@ async def set_vault_path(req: VaultPathRequest):
 
 @app.get("/vault/graph")
 async def vault_graph():
-    """The vault as an Obsidian-style link graph. Never 500 — degrades to empty."""
+    """The vault as an Obsidian-style link graph. Never 500.
+
+    A MISSING vault root is reported as an error, not as an empty graph: "your
+    vault path is wrong" and "your vault has no notes" draw the same picture
+    otherwise. Other failures still degrade to empty.
+    """
     try:
         return vault_core.build_graph(vault_core.vault_root())
+    except vault_core.VaultUnavailableError as exc:
+        return JSONResponse(
+            {"error": str(exc), "nodes": [], "edges": []}, status_code=503
+        )
     except Exception:  # noqa: BLE001 - a bad vault yields an empty graph, not a 500
         return {"nodes": [], "edges": []}
 
@@ -1840,6 +1852,10 @@ async def vault_note(path: str):
     """Read one vault note's markdown by relative path/title (containment-guarded)."""
     try:
         text = vault_core.read_note(path)
+    except vault_core.VaultUnavailableError as exc:
+        # The vault itself is missing — reporting "note not found" here would
+        # send the user hunting for a note in a vault that was never opened.
+        return JSONResponse({"error": str(exc)}, status_code=503)
     except FileNotFoundError:
         return JSONResponse({"error": "note not found"}, status_code=404)
     except Exception:  # noqa: BLE001
